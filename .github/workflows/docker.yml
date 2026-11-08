@@ -23,7 +23,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: nanernunes/overlite
+          images: yetlabs/overlite
           # v1.2.3 publishes 1.2.3, 1.2, and latest.
           tags: |
             type=semver,pattern={{version}}

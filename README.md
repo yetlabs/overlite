@@ -1,11 +1,13 @@
 <p align="center">
-  <img src="assets/logo/overlite.svg" alt="Overlite" width="240">
+  <img src="assets/logo/overlite-mark.svg" alt="" width="160">
 </p>
 
+<h1 align="center">Overlite</h1>
+
 <p align="center">
-  <a href="https://github.com/nanernunes/overlite/actions/workflows/ci.yml"><img src="https://github.com/nanernunes/overlite/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/nanernunes/overlite/releases/latest"><img src="https://img.shields.io/github/v/release/nanernunes/overlite?label=release" alt="release"></a>
-  <a href="https://hub.docker.com/r/nanernunes/overlite"><img src="https://img.shields.io/docker/v/nanernunes/overlite?label=docker&sort=semver" alt="docker"></a>
+  <a href="https://github.com/yetlabs/overlite/actions/workflows/ci.yml"><img src="https://github.com/yetlabs/overlite/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/yetlabs/overlite/releases/latest"><img src="https://img.shields.io/github/v/release/yetlabs/overlite?label=release" alt="release"></a>
+  <a href="https://hub.docker.com/r/yetlabs/overlite"><img src="https://img.shields.io/docker/v/yetlabs/overlite?label=docker&sort=semver" alt="docker"></a>
 </p>
 
 **Speak PostgreSQL, store SQLite.** overlite is a lightweight server that talks
@@ -41,7 +43,7 @@ psql "postgresql://postgres@localhost:5432/postgres?sslmode=disable"
 ### Docker
 
 ```sh
-$ docker run --rm -p 5432:5432 -v "$(pwd)/data:/data" nanernunes/overlite postgres.db
+$ docker run --rm -p 5432:5432 -v "$(pwd)/data:/data" yetlabs/overlite postgres.db
 ```
 
 Mount the **directory**, not the file. SQLite writes recent commits to
@@ -60,7 +62,7 @@ mount for SELinux to allow writing to it.
 ```yaml
 services:
   overlite:
-    image: nanernunes/overlite
+    image: yetlabs/overlite
     command: postgres.db
     ports:
       - "5432:5432"

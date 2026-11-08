@@ -20,7 +20,7 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: nanernunes/overlite
+          repository: yetlabs/overlite
           # No short-description on purpose: the tagline is set in the Docker
           # Hub UI, and passing one here would overwrite it on every sync.
           enable-url-completion: true
