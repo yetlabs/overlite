@@ -1,0 +1,19 @@
+[package]
+name = "overlite-hba"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "pg_hba rules: parsing and matching"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+overlite-core.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

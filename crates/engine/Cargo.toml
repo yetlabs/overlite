@@ -1,0 +1,25 @@
+[package]
+name = "overlite-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The SQLite storage engine behind overlite"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+overlite-core.workspace = true
+chrono.workspace = true
+fancy-regex.workspace = true
+base64.workspace = true
+hex.workspace = true
+md-5.workspace = true
+log.workspace = true
+rand.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+rust-stemmers.workspace = true
+sha2.workspace = true

@@ -1,0 +1,126 @@
+//! The black-box suite: every test drives the real binary over the wire.
+//! One binary, so that all modules share a single compile and link.
+
+// A failed step in this suite is a failed test: the harness has no other way out.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// What a test compares is exact, its fixtures are small, and speed is not the point.
+#![allow(clippy::float_cmp, clippy::naive_bytecount, clippy::large_stack_arrays)]
+#![allow(clippy::used_underscore_binding)]
+
+#[macro_use]
+mod common;
+
+mod advisory;
+mod alter;
+mod alteractions;
+mod array;
+mod auth;
+mod binaryshape;
+mod binarytime;
+mod blank;
+mod boolcast;
+mod boolparam;
+mod boolstorage;
+mod booltext;
+mod bytea;
+mod cancel;
+mod canonical_writes;
+mod castfilter;
+mod casts;
+mod catalog;
+mod catalog_depend;
+mod catalog_mirror;
+mod catalog_rls;
+mod catalog_summary;
+mod catalogbool;
+mod cli;
+mod cluster;
+mod collate;
+mod columnifexists;
+mod comment;
+mod comments;
+mod compat;
+mod compliance;
+mod concurrency;
+mod copy;
+mod ctid;
+mod currentschema;
+mod cursors;
+mod datetime;
+mod dbeaver_compat;
+mod describe_sqlstate;
+mod describedtypes;
+mod distinct_on_star;
+mod django_schema;
+mod django_semantics;
+mod django_silent;
+mod django_syntax;
+mod dml_join;
+mod dropconstraint;
+mod dropdatabase;
+mod enums;
+mod escapes;
+mod extended;
+mod framing;
+mod fts;
+mod functiondef;
+mod functions;
+mod harness;
+mod hba;
+mod hstore;
+mod index_using;
+mod information_schema;
+mod insert_source;
+mod json;
+mod jsonexists;
+mod labels;
+mod leading_comment;
+mod login;
+mod membership;
+mod multistatement;
+mod notify;
+mod numeric;
+mod offset;
+mod overlap;
+mod panics;
+mod paramtypes;
+mod parity_bytes;
+mod parity_diff;
+mod parity_numeric;
+mod parity_regex;
+mod parity_shutdown;
+mod pgcatalog;
+mod pgdump;
+mod portal_fetch;
+mod postgres;
+mod precision;
+mod privileges;
+mod psql_compat;
+mod regexescapes;
+mod regressions;
+mod remaining;
+mod returning_schema;
+mod rls;
+mod rls_cache;
+mod roleadmin;
+mod rolepw;
+mod roles;
+mod schema;
+mod schema_move;
+mod schema_quoted;
+mod schema_singlefile;
+mod searchpath;
+mod searchpath_tenants;
+mod sequences;
+mod serial;
+mod session_user;
+mod setops;
+mod smallwins;
+mod sqlstate;
+mod srf;
+mod storageformat;
+mod timestamp_text;
+mod timestamptz;
+mod tls;
+mod tx;
+mod utility;

@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # release.yml and docker.yml call this workflow, so a tag cannot publish
+  # anything these checks would have caught.
+  workflow_call:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # The same command a developer runs: clippy, the suites, and rustfmt.
+      - run: make check

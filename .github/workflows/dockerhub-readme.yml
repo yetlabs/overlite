@@ -1,0 +1,26 @@
+name: dockerhub-readme
+
+# Docker Hub has no idea what is in the repo, so the Overview tab stays empty
+# unless something pushes the README into it. Tying that to a tag would mean a
+# typo fix needs a release, so it follows the README instead.
+on:
+  push:
+    branches: [master]
+    paths: [README.md]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The token needs read/write/delete here — pushing an image only needs
+      # read/write.
+      - uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: nanernunes/overlite
+          # No short-description on purpose: the tagline is set in the Docker
+          # Hub UI, and passing one here would overwrite it on every sync.
+          enable-url-completion: true

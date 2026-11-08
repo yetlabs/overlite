@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # A tag that fails the checks publishes nothing.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  # SQLite is C, so each platform builds on its own runner; one last job uploads
+  # everything, so the builds do not race to create the same release.
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu,  name: overlite-linux-amd64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: overlite-linux-arm64 }
+          - { os: macos-latest,     target: x86_64-apple-darwin,       name: overlite-darwin-amd64 }
+          - { os: macos-latest,     target: aarch64-apple-darwin,      name: overlite-darwin-arm64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    name: overlite-windows-amd64.exe }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   name: overlite-windows-arm64.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build
+        shell: bash
+        env:
+          OVERLITE_VERSION: ${{ github.ref_name }}
+          # Takes effect with an explicit --target, which leaves proc-macros alone.
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          set -eu
+          cargo build --release --target "${{ matrix.target }}"
+          mkdir dist
+          # A bare binary rather than an archive: one file to download and run,
+          # with no unpack step. The name carries no version — the tag already
+          # says which release this is, and a fixed asset name is what GitHub's
+          # releases/latest/download/ URL can resolve.
+          built="target/${{ matrix.target }}/release/overlite"
+          [ -f "$built" ] || built="$built.exe"
+          cp "$built" "dist/${{ matrix.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -l
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
