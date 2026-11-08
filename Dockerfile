@@ -12,8 +12,11 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported architecture $TARGETARCH"; exit 1 ;; \
     esac; \
     echo "$t" > /target-triple; echo "$p" > /gcc-prefix; \
+    # pg_query (Postgres' grammar, C) generates its bindings with bindgen, which
+    # loads libclang.
+    apt-get update -qq && apt-get install -y -qq libclang-dev >/dev/null; \
     if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
-      apt-get update -qq && apt-get install -y -qq "gcc-$g" "libc6-dev-$TARGETARCH-cross" >/dev/null; \
+      apt-get install -y -qq "gcc-$g" "libc6-dev-$TARGETARCH-cross" >/dev/null; \
       # This libm.a is a linker script naming a host path the cross sysroot lacks.
       sed -i "s|/usr/lib/$p/||g" "/usr/$p/lib/libm.a"; \
     fi; \
