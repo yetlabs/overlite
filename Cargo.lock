@@ -1065,6 +1065,7 @@ dependencies = [
  "overlite-hba",
  "pbkdf2",
  "pg_query",
+ "prost",
  "rand 0.8.8",
  "rcgen",
  "regex",

@@ -10,6 +10,7 @@
 pub(crate) mod emit;
 pub(crate) mod labels;
 pub(crate) mod params;
+pub(crate) mod parse;
 
 #[cfg(test)]
 mod diff;
@@ -26,8 +27,8 @@ pub(crate) static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("OVER
 /// The reason it is not translated: a parse error, more than one statement, or the
 /// first node outside the slice.
 pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
-    let parsed = pg_query::parse(sql, 0).map_err(|_| "parse error")?;
-    let [raw] = parsed.protobuf.stmts.as_slice() else {
+    let parsed = parse::parse(sql)?;
+    let [raw] = parsed.stmts.as_slice() else {
         return Err("not one statement");
     };
     let stmt = raw

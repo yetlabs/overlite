@@ -13,8 +13,8 @@ use pg_query::protobuf::{self as pb, SubLinkType};
 
 /// The tables and the parameter columns of a statement, None when it does not parse.
 pub(crate) fn param_columns(sql: &str) -> Option<(Vec<NamedTable>, Vec<ParamColumn>)> {
-    let parsed = pg_query::parse(sql, 0).ok()?;
-    let [raw] = parsed.protobuf.stmts.as_slice() else {
+    let parsed = crate::ast::parse::parse(sql).ok()?;
+    let [raw] = parsed.stmts.as_slice() else {
         return None;
     };
     let mut w = Walker::default();
