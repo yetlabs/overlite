@@ -20,8 +20,8 @@ pub(crate) mod fts;
 pub(crate) mod functions;
 pub(crate) mod json;
 pub(crate) mod labels;
-mod like;
-mod null_order;
+pub(crate) mod like;
+pub(crate) mod null_order;
 mod offset;
 pub(crate) mod operators;
 pub(crate) mod row_lock;
@@ -89,11 +89,56 @@ use overlite_core::text::find_from;
 /// Where NULLs sort and what LIKE matches are settled after either: a plain lookup
 /// with an ORDER BY or a LIKE takes the fast path and still needs them, and each is
 /// one scan of the tokens, made only when its word is there.
+///
+/// A statement off the fast path goes to the AST path when it covers the statement
+/// (crate::ast), else to the text passes, and the result is kept per thread by the
+/// statement's text: a client repeats its statements, and each thread is one client's.
 pub fn rewrite(sql: &str) -> String {
     if needs_no_rewrite(sql) {
         return rewrite_like(&rewrite_null_order(sql));
     }
-    rewrite_like(&rewrite_null_order(&rewrite_full(sql)))
+    cached(sql, || {
+        let full = crate::ast::ENABLED
+            .then(|| crate::ast::translate(sql))
+            .flatten()
+            .unwrap_or_else(|| rewrite_full(sql));
+        rewrite_like(&rewrite_null_order(&full))
+    })
+}
+
+/// How many translations a thread keeps; past it the cache starts over.
+const CACHE_ENTRIES: usize = 4096;
+/// A statement longer than this is translated every time: a bulk INSERT is seldom
+/// sent twice, and would pin its text.
+const CACHE_MAX_LEN: usize = 16 * 1024;
+
+/// Whether the translation cache is on: OVERLITE_REWRITE_CACHE=0 turns it off.
+static CACHE_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("OVERLITE_REWRITE_CACHE").map_or(true, |v| v != "0"));
+
+thread_local! {
+    static CACHE: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// f's translation of sql, from this thread's cache when it has it. The translation
+/// depends on the text alone (no pass reads session state), so the text is the key.
+fn cached(sql: &str, f: impl FnOnce() -> String) -> String {
+    if !*CACHE_ON || sql.len() > CACHE_MAX_LEN {
+        return f();
+    }
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(sql).cloned()) {
+        return hit;
+    }
+    let out = f();
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= CACHE_ENTRIES {
+            c.clear();
+        }
+        c.insert(sql.to_string(), out.clone());
+    });
+    out
 }
 
 /// Runs every pass. A pass reads the statement as text, so one that finds its words by
@@ -673,13 +718,20 @@ pub(crate) mod tests {
                     "SELECT 'ação', nome FROM clientes WHERE cidade = 'São Paulo'",
                     r#"SELECT 'ação' AS "?column?", nome FROM clientes WHERE cidade = 'São Paulo'"#,
                 ),
-                // Only ASCII is an operand character: the scan stops inside the word.
-                ("SELECT coração::text", r#"SELECT coraçãCAST(o AS text) AS "coração""#),
+                // The AST path reads the whole name; the text passes' scan stops at the
+                // first non-ASCII byte (below).
+                ("SELECT coração::text", r#"SELECT CAST("coração" AS text) AS "coração""#),
                 (
                     "INSERT INTO t VALUES (E'çã', ARRAY['é','ü'])",
                     "INSERT INTO t VALUES ('çã', json_array('é','ü'))",
                 ),
             ],
+        );
+        // Only ASCII is an operand character to the text passes: the scan stops inside
+        // the word. The AST path above is what fixes it.
+        assert_eq!(
+            rewrite_full("SELECT coração::text"),
+            r#"SELECT coraçãCAST(o AS text) AS "coração""#
         );
     }
 }

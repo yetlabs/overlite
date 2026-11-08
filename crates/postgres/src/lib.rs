@@ -26,6 +26,7 @@
 //! );
 //! ```
 
+mod ast;
 mod auth;
 mod ddl;
 mod error;

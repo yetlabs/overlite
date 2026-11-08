@@ -118,6 +118,14 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   The order matters, and comments in `rewrite_full` say why where it does. `tokens`
   is the crate's shared tokenizer (`code_tokens`): words, literals and quoted names,
   punctuation, each with its depth, comments left out.
+- `ast` (spike, docs/adr/0001-sql-ast.md): a statement parsed by Postgres' grammar
+  (pg_query) and printed as SQLite SQL, for a slice of SELECT, INSERT, UPDATE and
+  DELETE; `rewrite` takes it when it covers the statement and runs `rewrite_full`
+  otherwise, and keeps each thread's translations by statement text. `labels` gives
+  unnamed result columns Postgres' names, `params` the column each `$n` meets by
+  scope, and `diff` holds the two routes to the same output over
+  tests/fixtures/ast-corpus. `OVERLITE_AST=0` and `OVERLITE_REWRITE_CACHE=0` turn
+  each off.
 - `types`: OIDs, and per type the rewrites and the text and binary encodings:
   arrays, numeric, hstore, timestamps, booleans, parameter types.
 

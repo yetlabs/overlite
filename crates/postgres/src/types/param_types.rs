@@ -222,7 +222,11 @@ impl Session {
         if oids.iter().all(|o| !o.is_unspecified()) {
             return;
         }
-        let (tables, refs) = statement_params(sql);
+        // The tree knows each column's scope; the text reader is the fallback.
+        let (tables, refs) = crate::ast::ENABLED
+            .then(|| crate::ast::params::param_columns(sql))
+            .flatten()
+            .unwrap_or_else(|| statement_params(sql));
         if tables.is_empty() || refs.is_empty() {
             return;
         }

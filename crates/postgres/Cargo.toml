@@ -20,6 +20,7 @@ hex.workspace = true
 hmac.workspace = true
 log.workspace = true
 md-5.workspace = true
+pg_query.workspace = true
 pbkdf2.workspace = true
 rand.workspace = true
 rcgen.workspace = true
