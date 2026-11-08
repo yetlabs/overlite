@@ -1,0 +1,58 @@
+name: libclang
+description: >
+  What pg_query's build script needs besides a C compiler: libclang, which bindgen
+  loads to read libpg_query's header, and on Windows the MSVC environment in which
+  both cc and that clang find the compiler, headers and libraries.
+
+inputs:
+  llvm-version:
+    description: The LLVM release installed where the runner image has none for its architecture.
+    default: "20.1.8"
+
+runs:
+  using: composite
+  steps:
+    # Ubuntu: the distribution's libclang, found by clang-sys under /usr/lib/llvm-*.
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libclang-dev
+
+    # macOS: Xcode's libclang, which clang-sys finds through xcode-select, serves
+    # both architectures. Nothing to install.
+
+    # Windows: libclang.dll has to match the build script's architecture, since the
+    # build script loads it: x64 LLVM on windows-latest (the image ships it), the
+    # woa64 build of LLVM on windows-11-arm, where an x64 DLL cannot be loaded.
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        LLVM_VERSION: ${{ inputs.llvm-version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $preinstalled = 'C:\Program Files\LLVM\bin'
+        if ($env:RUNNER_ARCH -eq 'X64' -and (Test-Path "$preinstalled\libclang.dll")) {
+          $bin = $preinstalled
+        } else {
+          $flavor = if ($env:RUNNER_ARCH -eq 'ARM64') { 'woa64' } else { 'win64' }
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-$flavor.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm.exe"
+          # NSIS: /S is silent, /D the directory, last and unquoted.
+          Start-Process -Wait -FilePath "$env:RUNNER_TEMP\llvm.exe" -ArgumentList '/S', '/D=C:\llvm'
+          $bin = 'C:\llvm\bin'
+        }
+        if (-not (Test-Path "$bin\libclang.dll")) { throw "no libclang.dll in $bin" }
+        # LIBCLANG_PATH makes clang-sys look there only, so another LLVM on the
+        # image cannot be picked up instead. bindgen asks the clang beside it
+        # (CLANG_PATH) for its include directories, stdbool.h among them.
+        "LIBCLANG_PATH=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "CLANG_PATH=$bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        & "$bin\clang.exe" --version
+
+    # cc runs cl.exe and bindgen's clang reads the MSVC headers: INCLUDE, LIB and
+    # PATH as the Developer Command Prompt of the runner's architecture sets them.
+    - if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}

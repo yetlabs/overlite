@@ -17,5 +17,47 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # pg_query compiles Postgres' parser (C) and generates its bindings with
+      # bindgen, which needs libclang.
+      - uses: ./.github/actions/libclang
       # The same command a developer runs: clippy, the suites, and rustfmt.
       - run: make check
+
+  # The release builds on these runners too, so a break there shows up before a
+  # tag. macOS runs the whole check, the wire suite included.
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/libclang
+      # pg_dump, for the wire tests that drive it (they skip without it).
+      - run: |
+          brew install libpq
+          echo "$(brew --prefix libpq)/bin" >> "$GITHUB_PATH"
+      - run: make check
+
+  # Windows builds every target, the wire suite's included, and runs the unit
+  # tests and doctests; the wire suite itself has not been made to run there.
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/libclang
+      - name: build
+        shell: bash
+        run: cargo build --release --workspace --all-targets
+      - name: unit tests
+        shell: bash
+        run: |
+          cargo test --release --workspace --lib --bins
+          cargo test --release --workspace --doc

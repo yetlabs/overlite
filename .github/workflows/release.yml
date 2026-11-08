@@ -12,7 +12,8 @@ jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
-  # SQLite is C, so each platform builds on its own runner; one last job uploads
+  # SQLite and Postgres' parser (pg_query) are C, so each platform builds on its
+  # own runner (macOS builds both architectures); one last job uploads
   # everything, so the builds do not race to create the same release.
   build:
     needs: test
@@ -31,6 +32,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # libclang for pg_query's bindgen, and on Windows the MSVC environment of
+      # the runner's architecture, which is the target's on every row.
+      - uses: ./.github/actions/libclang
       - name: build
         shell: bash
         env:
