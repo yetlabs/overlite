@@ -6,6 +6,7 @@ mod aliases;
 pub(crate) mod arrays;
 pub(crate) mod blank;
 mod bool_cast;
+pub(crate) mod cache;
 pub(crate) mod casts;
 pub(crate) mod catalog;
 mod catalog_bool;
@@ -91,54 +92,19 @@ use overlite_core::text::find_from;
 /// one scan of the tokens, made only when its word is there.
 ///
 /// A statement off the fast path goes to the AST path when it covers the statement
-/// (crate::ast), else to the text passes, and the result is kept per thread by the
-/// statement's text: a client repeats its statements, and each thread is one client's.
+/// (crate::ast), else to the text passes, and the result is kept in the process's
+/// translation cache (`cache`), which says what a translation depends on.
 pub fn rewrite(sql: &str) -> String {
     if needs_no_rewrite(sql) {
         return rewrite_like(&rewrite_null_order(sql));
     }
-    cached(sql, || {
-        let full = crate::ast::ENABLED
-            .then(|| crate::ast::translate(sql))
-            .flatten()
-            .unwrap_or_else(|| rewrite_full(sql));
-        rewrite_like(&rewrite_null_order(&full))
-    })
-}
-
-/// How many translations a thread keeps; past it the cache starts over.
-const CACHE_ENTRIES: usize = 4096;
-/// A statement longer than this is translated every time: a bulk INSERT is seldom
-/// sent twice, and would pin its text.
-const CACHE_MAX_LEN: usize = 16 * 1024;
-
-/// Whether the translation cache is on: OVERLITE_REWRITE_CACHE=0 turns it off.
-static CACHE_ON: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("OVERLITE_REWRITE_CACHE").map_or(true, |v| v != "0"));
-
-thread_local! {
-    static CACHE: std::cell::RefCell<std::collections::HashMap<String, String>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// f's translation of sql, from this thread's cache when it has it. The translation
-/// depends on the text alone (no pass reads session state), so the text is the key.
-fn cached(sql: &str, f: impl FnOnce() -> String) -> String {
-    if !*CACHE_ON || sql.len() > CACHE_MAX_LEN {
-        return f();
-    }
-    if let Some(hit) = CACHE.with(|c| c.borrow().get(sql).cloned()) {
-        return hit;
-    }
-    let out = f();
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() >= CACHE_ENTRIES {
-            c.clear();
+    cache::cached(sql, || {
+        let post = |s: &str| rewrite_like(&rewrite_null_order(s));
+        match crate::ast::ENABLED.then(|| crate::ast::translate(sql)).flatten() {
+            Some(ast) => post(&ast),
+            None => post(&rewrite_full(sql)),
         }
-        c.insert(sql.to_string(), out.clone());
-    });
-    out
+    })
 }
 
 /// Runs every pass. A pass reads the statement as text, so one that finds its words by

@@ -15,6 +15,7 @@ use overlite_core::sync::MutexExt;
 use rusqlite::Connection;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 
 /// How a collation compares.
@@ -33,14 +34,26 @@ fn registry() -> &'static Mutex<HashMap<String, CollationSpec>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Moves on each change of the registry. A translation that asked
+/// [`collation_known`] (a `COLLATE` clause) holds while it stays put, so the
+/// translation cache keeps it beside each entry.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Records a created collation, for every connection's next need of it.
 pub fn register_collation(name: &str, spec: CollationSpec) {
     registry().locked().insert(name.to_string(), spec);
+    GENERATION.fetch_add(1, AtomicOrdering::Release);
 }
 
 /// Forgets a dropped collation.
 pub fn forget_collation(name: &str) {
     registry().locked().remove(name);
+    GENERATION.fetch_add(1, AtomicOrdering::Release);
+}
+
+/// The registry's generation: it changes whenever a collation is created or dropped.
+pub fn collations_generation() -> u64 {
+    GENERATION.load(AtomicOrdering::Acquire)
 }
 
 /// The spec of a locale as CREATE COLLATION's locale gives it, or an ICU or libc

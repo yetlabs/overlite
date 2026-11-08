@@ -385,7 +385,15 @@ fn time_the_statement_mix() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(usize::MAX);
-    let stmts: Vec<String> = corpus().into_iter().map(|(_, s)| s).take(take).collect();
+    // OVERLITE_MIX_DML=1 keeps the statements the cache keeps (that read or write
+    // rows); DDL is translated every time.
+    let dml = std::env::var_os("OVERLITE_MIX_DML").is_some();
+    let stmts: Vec<String> = corpus()
+        .into_iter()
+        .map(|(_, s)| s)
+        .filter(|s| !dml || crate::rewrite::cache::cacheable(s))
+        .take(take)
+        .collect();
     let text = |s: &str| {
         if needs_no_rewrite(s) {
             return rewrite_like(&rewrite_null_order(s));
@@ -399,9 +407,12 @@ fn time_the_statement_mix() {
         let full = crate::ast::translate(s).unwrap_or_else(|| rewrite_full(s));
         rewrite_like(&rewrite_null_order(&full))
     };
-    // Warm the cache once, as a client's second round would find it.
-    for s in &stmts {
-        black_box(crate::rewrite::rewrite(s));
+    // Warm the cache, as a client's third round would find it: a statement is kept
+    // the second time it is translated.
+    for _ in 0..2 {
+        for s in &stmts {
+            black_box(crate::rewrite::rewrite(s));
+        }
     }
     let time = |f: &dyn Fn(&str) -> String| {
         let t0 = Instant::now();
@@ -420,4 +431,9 @@ fn time_the_statement_mix() {
             stmts.len()
         );
     }
+    eprintln!(
+        "cache (entries, bytes, hits, misses): {:?}; fast path {}",
+        crate::rewrite::cache::CACHE.usage(),
+        stmts.iter().filter(|s| needs_no_rewrite(s)).count()
+    );
 }

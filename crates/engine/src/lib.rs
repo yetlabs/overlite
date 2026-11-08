@@ -37,7 +37,9 @@ mod storage;
 
 pub use blank::{blank_comments, blank_literals, code_only};
 pub use builtins::casts::{CastType, assign as assign_value, assignment_type, cast, interval_parts};
-pub use builtins::collation::{CollationSpec, collation_known, forget_collation, register_collation, spec_of_locale};
+pub use builtins::collation::{
+    CollationSpec, collation_known, collations_generation, forget_collation, register_collation, spec_of_locale,
+};
 pub use builtins::dates::{session_offset_at, session_zone, session_zone_is_utc, set_session_zone, take_zone_change};
 pub use builtins::hstore::hstore_in;
 pub use builtins::json::{Json, json_decode_first, json_marshal, json_unmarshal};

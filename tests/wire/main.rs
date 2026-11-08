@@ -122,5 +122,6 @@ mod storageformat;
 mod timestamp_text;
 mod timestamptz;
 mod tls;
+mod translation_cache;
 mod tx;
 mod utility;

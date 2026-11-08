@@ -13,7 +13,7 @@ pub(crate) mod params;
 pub(crate) mod parse;
 
 #[cfg(test)]
-mod diff;
+pub(crate) mod diff;
 
 use std::sync::LazyLock;
 
