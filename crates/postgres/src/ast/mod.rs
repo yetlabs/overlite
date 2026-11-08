@@ -7,10 +7,12 @@
 //! SQL over the corpus in tests/fixtures/ast-corpus, and lists where they differ on
 //! purpose.
 
+pub(crate) mod compare;
 pub(crate) mod emit;
 pub(crate) mod labels;
 pub(crate) mod params;
 pub(crate) mod parse;
+pub(crate) mod shadow;
 pub(crate) mod shape;
 
 #[cfg(test)]

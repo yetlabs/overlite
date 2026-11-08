@@ -101,7 +101,11 @@ pub fn rewrite(sql: &str) -> String {
     cache::cached(sql, || {
         let post = |s: &str| rewrite_like(&rewrite_null_order(s));
         match crate::ast::ENABLED.then(|| crate::ast::translate(sql)).flatten() {
-            Some(ast) => post(&ast),
+            Some(ast) => {
+                let out = post(&ast);
+                crate::ast::shadow::check(sql, &out, || post(&rewrite_full(sql)));
+                out
+            }
             None => post(&rewrite_full(sql)),
         }
     })
