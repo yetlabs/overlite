@@ -638,6 +638,11 @@ impl Emitter {
         if s.on_conflict_clause.is_some() {
             return Err("ON CONFLICT");
         }
+        // OVERRIDING SYSTEM or USER VALUE decides what an identity column gets; the
+        // printer has no way to say it, so it is not dropped but left to the passes.
+        if s.r#override > pb::OverridingKind::OverridingNotSet as i32 {
+            return Err("OVERRIDING");
+        }
         self.push("INSERT INTO ");
         let r = s.relation.as_ref().ok_or("INSERT target")?;
         self.range_var(r, false)?;
