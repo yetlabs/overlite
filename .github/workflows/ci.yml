@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
   # release.yml and docker.yml call this workflow, so a tag cannot publish
   # anything these checks would have caught.

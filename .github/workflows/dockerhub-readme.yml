@@ -5,7 +5,7 @@ name: dockerhub-readme
 # typo fix needs a release, so it follows the README instead.
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths: [README.md]
   workflow_dispatch:
 
