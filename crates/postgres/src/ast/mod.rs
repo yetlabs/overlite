@@ -1,5 +1,6 @@
-//! The AST path (spike, docs/adr/0001-sql-ast.md): a statement parsed by Postgres' own
-//! grammar (libpg_query, through the pg_query crate) and printed as SQLite SQL.
+//! The AST path (docs/adr/0001-sql-ast.md, on by default since stage 1): a statement
+//! parsed by Postgres' own grammar (libpg_query, which the pg_query crate builds and
+//! links) and printed as SQLite SQL.
 //!
 //! It covers a slice of the language. [`translate`] answers None for anything outside
 //! it, and `rewrite` then runs the text passes as before, so the slice can grow one node
@@ -12,6 +13,7 @@ pub(crate) mod emit;
 pub(crate) mod labels;
 pub(crate) mod params;
 pub(crate) mod parse;
+pub(crate) mod record;
 pub(crate) mod shadow;
 pub(crate) mod shape;
 

@@ -453,6 +453,7 @@ impl Session {
         if is_blank_statement(&sql) {
             return self.c.send(MSG_EMPTY_QUERY, &[]);
         }
+        crate::ast::record::statement(&sql);
         let sql = match statement_text(&sql) {
             Ok(sql) => sql,
             Err(e) => return self.fail_tx_send(&e),

@@ -1,4 +1,4 @@
-.PHONY: test build run fmt lint doc check clean
+.PHONY: test build run fmt lint doc check clean ast-corpus
 
 # The release workflow sets VERSION to the tag.
 VERSION ?=
@@ -30,3 +30,11 @@ check: lint doc test
 
 clean:
 	cargo clean
+
+# Records every statement the wire suite sends (its panics test bends them at random,
+# so not that one) and adds those the AST corpus lacks to
+# tests/fixtures/ast-corpus/wire.hex, for the differential test in `make check`.
+ast-corpus:
+	rm -f target/wire-statements.hex
+	OVERLITE_RECORD_STATEMENTS=$(CURDIR)/target/wire-statements.hex cargo test --release --test wire -- --skip panics::
+	OVERLITE_RECORDED=$(CURDIR)/target/wire-statements.hex cargo test --release -p overlite-postgres --lib grow_the_corpus -- --ignored --nocapture

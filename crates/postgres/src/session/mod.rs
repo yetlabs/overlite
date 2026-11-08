@@ -511,6 +511,7 @@ impl Session {
         if is_blank_statement(&raw) {
             return self.put_prepared(name, Prepared::routed(Route::Blank));
         }
+        crate::ast::record::statement(&raw);
         let raw = match statement_text(&raw) {
             Ok(raw) => raw.into_owned(),
             Err(e) => {

@@ -271,3 +271,45 @@ fn time_the_statement_mix() {
         stmts.iter().filter(|s| needs_no_rewrite(s)).count()
     );
 }
+
+/// Adds to tests/fixtures/ast-corpus/wire.hex every statement recorded in the file
+/// OVERLITE_RECORDED names (OVERLITE_RECORD_STATEMENTS, `record.rs`) that no source of
+/// the corpus holds yet, in the order first sent, up to 4 KiB each. `make ast-corpus`
+/// records the wire suite and runs this.
+#[test]
+#[ignore = "rewrites a fixture: make ast-corpus"]
+fn grow_the_corpus() {
+    use std::collections::HashSet;
+    use std::io::Write;
+    let Some(recorded) = std::env::var_os("OVERLITE_RECORDED") else {
+        panic!("OVERLITE_RECORDED names no file");
+    };
+    let recorded = std::fs::read_to_string(recorded).unwrap_or_default();
+    let mut known: HashSet<Vec<u8>> = CORPUS
+        .iter()
+        .flat_map(|(_, lines)| lines.lines())
+        .filter_map(|l| hex::decode(l.trim()).ok())
+        .collect();
+    let mut added = Vec::new();
+    for line in recorded.lines() {
+        let Ok(bytes) = hex::decode(line.trim()) else { continue };
+        let Ok(raw) = std::str::from_utf8(&bytes) else { continue };
+        let keep = raw.len() <= 4096 && statement_text(raw).is_ok_and(|s| !s.trim().is_empty());
+        if keep && known.insert(bytes.clone()) {
+            added.push(hex::encode(&bytes));
+        }
+    }
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/ast-corpus/wire.hex");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("{path}: {e}"));
+    for line in &added {
+        writeln!(f, "{line}").unwrap_or_else(|e| panic!("{path}: {e}"));
+    }
+    eprintln!(
+        "{} statements recorded, {} new to the corpus",
+        recorded.lines().count(),
+        added.len()
+    );
+}
