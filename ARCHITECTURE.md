@@ -1,8 +1,10 @@
 # Architecture
 
 overlite speaks the PostgreSQL wire protocol on the front and stores everything in
-SQLite files on the back. There is no planner and no SQL parser: a statement is
-classified by looking at its text, translated by text rewrites, and run by SQLite.
+SQLite files on the back. There is no planner. A statement is classified by looking at its
+text and run by SQLite; it is translated from Postgres' parse tree where the AST path
+covers it (`ast`, a slice of DML that grows by stages: docs/adr/0001-sql-ast.md) and by
+text rewrites elsewhere.
 
 ## Crates
 
@@ -118,14 +120,28 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   The order matters, and comments in `rewrite_full` say why where it does. `tokens`
   is the crate's shared tokenizer (`code_tokens`): words, literals and quoted names,
   punctuation, each with its depth, comments left out.
-- `ast` (spike, docs/adr/0001-sql-ast.md): a statement parsed by Postgres' grammar
-  (pg_query) and printed as SQLite SQL, for a slice of SELECT, INSERT, UPDATE and
-  DELETE; `rewrite` takes it when it covers the statement and runs `rewrite_full`
-  otherwise, and keeps each thread's translations by statement text. `labels` gives
-  unnamed result columns Postgres' names, `params` the column each `$n` meets by
-  scope, and `diff` holds the two routes to the same output over
-  tests/fixtures/ast-corpus. `OVERLITE_AST=0` and `OVERLITE_REWRITE_CACHE=0` turn
-  each off.
+- `ast` (docs/adr/0001-sql-ast.md, stage 1): a statement parsed by Postgres' grammar
+  (libpg_query, called directly by `parse`, without the pg_query crate's summary walk)
+  and printed as SQLite SQL (`emit`), for a slice of SELECT, INSERT, UPDATE and DELETE;
+  `rewrite` takes it when it covers the statement and runs `rewrite_full` otherwise.
+  `shape` remembers, by the statement with its literals' values left out, what the
+  slice does not cover, so that such a statement is not parsed again only to be
+  refused. `labels` gives unnamed result columns Postgres' names, `params` the column
+  each `$n` meets by scope, `compare` holds the two routes' outputs side by side, which
+  the differential test (`diff`, over tests/fixtures/ast-corpus, in `make check`) and
+  OVERLITE_AST_SHADOW (`shadow`: one translation in n compared on a live server, a
+  difference logged) use. `record` keeps every statement clients send when
+  OVERLITE_RECORD_STATEMENTS names a file, which `make ast-corpus` uses to grow the
+  corpus from the wire suite. `OVERLITE_AST=0` turns the AST path off.
+- `rewrite::cache`: the translation cache, one per process: what `rewrite` made of a
+  statement's text, in 256 shards each behind its own lock, bounded by statements
+  (16384) and bytes (64 MiB), least recently used out first, a text kept the second
+  time it is seen. It keeps only statements that read or write rows; each entry
+  carries the generation of the collation registry it was made under, the one piece
+  of state a translation reads. Everything else that depends on the session or the
+  schema (search_path, TimeZone, the catalog's types, labels) is applied after
+  `rewrite` on every execution; the module lists it and tests/wire/translation_cache.rs
+  holds it. `OVERLITE_REWRITE_CACHE=0` turns it off.
 - `types`: OIDs, and per type the rewrites and the text and binary encodings:
   arrays, numeric, hstore, timestamps, booleans, parameter types.
 
@@ -178,7 +194,9 @@ one run inside an implicit transaction. Each statement takes this route through
    stores to its columns' modifiers, and an INSERT into a table under RLS is checked by
    `try_rls_insert`.
 5. `rewrite_for_exec` injects RLS filters (`apply_rls`), expands session identity,
-   sequence calls, advisory locks and enum columns into literals, and calls `rewrite`.
+   sequence calls, advisory locks and enum columns into literals, and calls `rewrite`,
+   which answers from the translation cache or translates (the AST path, else the
+   text passes).
 6. `Session::exec` arms the canceler and hands the text to `DbSession`. `execute` runs
    function DDL, then the `resolve` passes and function inlining, and prepares, binds
    and steps the statement. Nothing is cached: a statement is prepared and finalized

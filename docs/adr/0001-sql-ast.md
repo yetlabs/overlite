@@ -1,6 +1,6 @@
 # 0001: Translate SQL from a parse tree, not from text
 
-Status: proposed (spike on branch `ast-spike`)
+Status: accepted; stages 0 and 1 landed on main (below), stage 1's week of the owner's apps pending
 Date: 2026-11-08
 
 ## Context
@@ -264,6 +264,131 @@ cover, which `rewrite_full` can count per pass in a test build.
    Exit: `rewrite_full` is empty and deleted with `holding_literals`, `tokens.rs`, and the
    blanking scanners where nothing reads raw text any more; `needs_no_rewrite` becomes "the
    printer would print it unchanged" or goes, if the cache makes it moot (measure).
+
+## Stage 0 result: builds
+
+Measured 2026-11-08 on the same machine (Apple M-series, 16 cores; podman's VM, 8 CPUs,
+8 GiB, for Linux).
+
+| target | how | result |
+|---|---|---|
+| aarch64-apple-darwin | `cargo build --release --target`, `+crt-static` as release.yml | built (Xcode's libclang), ran |
+| x86_64-apple-darwin | the same, cross on arm64 | built, ran under Rosetta, AST path answered |
+| linux/arm64 image | `docker build --platform linux/arm64` (podman) | built, `static-pie linked`, AST path answered |
+| linux/amd64 image | `docker build --platform linux/amd64`, cross from arm64 | built, `static-pie linked`, x86-64, AST path answered under emulation |
+| x86_64-pc-windows-gnu | cross in `rust:1` with mingw-w64, libclang-dev and clang | built (`overlite.exe`, pg_query symbols in it); not run |
+| x86_64-pc-windows-msvc, aarch64-pc-windows-msvc | GitHub runners only | not built here: no MSVC on this machine |
+
+- The Dockerfile's builder installs libclang-dev. Its cross build needs nothing more:
+  bindgen passes `--target`, and the cross gcc's sysroot (`libc6-dev-*-cross`) supplies
+  the headers.
+- The mingw build first failed with `'stdbool.h' file not found`: libclang loaded from
+  Debian's multiarch path does not find its own resource directory, and for a Linux
+  target gcc's include directory hides that. bindgen asks a `clang` executable for its
+  include paths when it finds one, which is why the Windows runners set `CLANG_PATH`
+  next to `LIBCLANG_PATH`.
+- libpg_query's parse entry redirects stderr through a pipe around each parse
+  (`pg_query_parse.c`), which would be unsafe in a threaded server, but only under
+  `#ifndef DEBUG`, and `pg_query_internal.h` defines DEBUG: it is compiled out, and
+  that is also why the Windows code, which has no `pipe()`/`fcntl`, compiles.
+- CI (`.github/actions/libclang`, used by ci.yml and release.yml): libclang-dev on
+  Ubuntu; nothing on macOS; on Windows the image's x64 LLVM, or the `woa64` LLVM
+  release on windows-11-arm (the build script is arm64 there and cannot load an x64
+  libclang.dll), with `LIBCLANG_PATH`/`CLANG_PATH`, then the MSVC developer
+  environment of the runner's architecture. ci.yml now also runs `make check` on
+  macOS and builds every target and runs the unit tests on windows-latest and
+  windows-11-arm. None of this has run on GitHub yet: stage 0's exit, release.yml green
+  on every target, is still to be seen on the first tag. If windows-11-arm cannot build
+  libpg_query with MSVC, squawk remains the fallback, as decided above.
+
+## Stage 1 result
+
+On main, the AST path on by default (`OVERLITE_AST=0` turns it off).
+
+**The cache.** The spike's cache was per thread, emptied when full, and keyed by text
+alone. It is now one cache per process (`rewrite/cache.rs`): 256 shards behind their
+own locks, least recently used out first, bounded at 16384 statements and 64 MiB; a
+statement is kept the second time it is seen (a Bloom filter per shard), so texts
+sent once, as a client interpolating its values sends them, neither pay for being
+kept nor push out those that repeat. Measured in-process (`time_the_cache`, every
+thread doing nothing but lookups, the worst case for a lock), ns per hit:
+
+| threads | per thread | one lock | 256 shards |
+|---|---|---|---|
+| 1 | 84 / 90 / 91 | 81 / 83 / 88 | 100 / 98 / 98 |
+| 4 | 121 / 99 / 97 | 1252 / 1256 / 1230 | 152 / 151 / 148 |
+| 16 | 148 / 146 / 142 | 3010 / 2889 / 2865 | 528 / 507 / 519 |
+
+One lock is ruled out; the shards cost 10-20 ns more than a cache per thread at the
+loads a server sees (a statement spends tens of µs elsewhere), and in exchange memory
+is bounded once rather than per connection, and a new connection finds its
+application's statements translated.
+
+What a translation depends on, found by reading every pass: the text, which already
+holds what the session expands before `rewrite` (enum columns, sequences, identity,
+RLS); the collations CREATE COLLATION made (`rewrite_collate` asks the engine), now
+held by a generation each entry keeps; and the clock, in a table's DDL only (a
+DEFAULT `'today'::date` is folded). Only statements that read or write rows are
+cached, so DDL is translated every time. search_path, the session's TimeZone and the
+catalog's types are applied after `rewrite` on every execution.
+tests/wire/translation_cache.rs runs one text across each change; its collation case
+fails when the cache ignores the generation, as the spike's did.
+
+**The −3%.** The spike's explanation was wrong: for `lookup2` both routes print the
+same SQL, labels and NULLS FIRST included. pgbench's simple protocol writes `:id` into
+the text, so every statement is new, the cache never hits, and every statement pays
+the parse: libpg_query's parse and protobuf encode 5.9 µs, prost's decode 1.6 µs, and
+the pg_query crate's summary walk 0.8 µs that nothing reads, against 7.7-8.0 µs for the
+text passes. Fixed by calling libpg_query directly (`ast/parse.rs`, the same entry and
+prost types, no summary), by not caching statements seen once, and, for statements
+outside the slice, by remembering their shape (the text with literal values left
+out, `ast/shape.rs`) so the next of that shape is not parsed only to be refused.
+
+pgbench as above (4 clients, 8 s, each binary on its own fresh copy of the table, main
+then HEAD in each round), main 8256d68 against stage 1; tps per round:
+
+| script, mode | main | stage 1 | |
+|---|---|---|---|
+| lookup (fast path), simple | 112672 / 112985 / 112886 | 112855 / 112936 / 112671 | ±0% |
+| lookup (fast path), prepared | 94078 / 94581 / 94346 | 94842 / 94607 / 94759 | +0.4% |
+| lookup2 (AST slice), simple | 71929 / 72874 / 72892 | 72639 / 72876 / 72595 | +0.2% |
+| lookup2 (AST slice), prepared | 59730 / 59309 / 59531 | 70431 / 70212 / 69885 | +17.9% |
+| mix, simple | 13104 / 13146 / 13167 | 13244 / 13134 / 13186 | +0.4% |
+| mix, prepared | 10987 / 10962 / 10997 | 13063 / 13054 / 13061 | +18.9% |
+
+The mix is six statements per transaction: the fast-path lookup, lookup2, a count with
+BETWEEN and LIKE (AST slice), and three the slice leaves to the text passes (`=
+ANY(ARRAY[...])`, `string_agg`, `json_build_object`).
+
+The statement mix in-process (`time_the_statement_mix`, µs per statement, three
+rounds; "text passes" is what main runs):
+
+| mix | text passes | AST path, no cache | `rewrite()`, cache warm |
+|---|---|---|---|
+| first 3000 statements | 10.0 / 9.9 / 10.1 | 11.4 / 11.1 / 11.5 | 4.25 / 4.20 / 4.21 |
+| all 8066 | 26.4 / 26.2 / 26.4 | 27.6 / 27.3 / 27.2 | 8.36 / 8.51 / 8.30 |
+| first 3000 that read or write rows | 20.2 / 20.6 / 19.3 | 18.5 / 18.4 / 18.6 | 0.23 / 0.23 / 0.22 |
+| all 5643 that read or write rows | 29.0 / 28.7 / 28.1 | 26.8 / 26.4 / 26.6 | 0.28 / 0.26 / 0.26 |
+
+With DDL in the mix the warm figure is DDL's own translation, which is not cached;
+over the statements that are, the whole corpus now fits and stays at 0.3 µs, where
+the spike's cache started over and stayed at 28 µs.
+
+**The corpus.** `make ast-corpus` records every statement the wire suite sends
+(OVERLITE_RECORD_STATEMENTS, at Query and at Parse; the panics test, which bends
+statements at random, left out) and adds what the corpus lacks to `wire.hex`: 7384
+statements, 15450 in all. The differential test, in `make check`, over them: fast path
+3620, left to the text passes 8425, translated 3405: identical 1934, identical but
+parentheses 1431, intended 40 (21 NOT IN, 11 set members, 5 labels, 2 parenthesized
+columns, 1 quoted name), unexplained 0. The new statements found one printer bug,
+fixed: `INSERT ... OVERRIDING SYSTEM VALUE` lost its clause; it is now left to the
+text passes.
+
+**Exit criteria.** The numbers above or better on main: met. A week of the owner's
+apps with no difference logged: not done, it needs the week. The means is in place:
+`OVERLITE_AST_SHADOW=n` translates one statement in n through the text passes too and
+logs a warning with both outputs for any difference the differential test would not
+explain (off by default, since the line holds the statement and its literals).
 
 ## Risks
 
