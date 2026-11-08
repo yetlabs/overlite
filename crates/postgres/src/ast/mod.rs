@@ -11,6 +11,7 @@ pub(crate) mod emit;
 pub(crate) mod labels;
 pub(crate) mod params;
 pub(crate) mod parse;
+pub(crate) mod shape;
 
 #[cfg(test)]
 pub(crate) mod diff;
@@ -40,6 +41,19 @@ pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
 }
 
 /// The statement as SQLite SQL, when the AST path covers all of it.
+///
+/// A statement whose shape (`shape::of`: the text with its literals' values left out)
+/// the AST path has already left to the text passes is not parsed again: a client
+/// writing its values into the text sends one shape with ever new texts, which the
+/// translation cache cannot hold, and each would pay a parse only to be refused.
 pub(crate) fn translate(sql: &str) -> Option<String> {
-    try_translate(sql).ok()
+    let shape = shape::of(sql);
+    if shape::OUTSIDE.holds(shape) {
+        return None;
+    }
+    let out = try_translate(sql).ok();
+    if out.is_none() {
+        shape::OUTSIDE.insert(shape);
+    }
+    out
 }

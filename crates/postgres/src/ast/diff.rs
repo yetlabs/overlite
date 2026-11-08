@@ -369,8 +369,9 @@ fn parameter_columns_over_the_corpus() {
 }
 
 /// The statement mix of the corpus through `rewrite`'s two routes, in alternating
-/// rounds: the text passes alone, the AST path without the cache (every statement
-/// parsed), and the AST path with it. `cargo test --release -p overlite-postgres --lib
+/// rounds: the text passes alone, the AST path without the translation cache (every
+/// statement parsed but those whose shape it already left to the text passes), and
+/// `rewrite()` with the cache warm. `cargo test --release -p overlite-postgres --lib
 /// time_the_statement_mix -- --ignored --nocapture`.
 #[test]
 #[ignore = "a measurement, not a check"]
@@ -426,7 +427,7 @@ fn time_the_statement_mix() {
         let b = time(&ast);
         let c = time(&|s| crate::rewrite::rewrite(s));
         eprintln!(
-            "round {round}: {} statements, us per statement: text passes {a:.1}, AST path uncached {b:.1}, \
+            "round {round}: {} statements, us per statement: text passes {a:.1}, AST path without the cache {b:.1}, \
              rewrite() with cache warm {c:.2}",
             stmts.len()
         );
