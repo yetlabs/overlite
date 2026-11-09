@@ -8,23 +8,20 @@
 //! FORCE) is not subject. With RLS on and no permissive policy, access is denied.
 
 use crate::auth::functions::Inline;
-use crate::auth::grants::index_word;
 use crate::auth::privileges::{Privilege, lowercase, tables_after, truthy};
 use crate::ddl::alter::split_qualified_ref;
 use crate::ddl::sequences::{is_ident_part, is_ident_start};
-use crate::ddl::words::{Word, ddl_words};
+use crate::ddl::tree::{self, Role};
 use crate::error::{Error, Result, errf};
 use crate::rewrite::rewrite;
-use crate::rewrite::strings::end_of_string_literal;
-use crate::rewrite::tokens::{CodeTok, CodeTokKind, code_tokens};
 use crate::session::Session;
-use crate::session::utility::{first_word_upper, second_word_upper, unquote_ident};
+use crate::session::utility::{first_word_upper, second_word_upper};
 use overlite_core::text::{
-    eq_fold, quote_ident, quote_literal, quoted, slice, split_words, text_from_bytes, trim_chars, trim_end_chars,
-    trim_start_chars,
+    end_of_string_literal, eq_fold, quote_literal, quoted, slice, text_from_bytes, trim_chars, trim_end_chars,
 };
 use overlite_core::{Command, ResultSet, SqlState, Value};
 use overlite_engine::code_only;
+use pg_query::NodeEnum;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -80,16 +77,149 @@ impl PolicyCommand {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct PolicyDef {
+/// An RLS statement, read from its node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RlsPlan {
+    /// ALTER TABLE's row-level security actions, in order.
+    Table {
+        table: String,
+        actions: Vec<RlsAction>,
+    },
+    Create(PolicyDef),
+    Alter(AlterPolicy),
+    Drop {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
+}
+
+/// What an ALTER TABLE does to row-level security.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RlsAction {
+    Enable,
+    Disable,
+    Force,
+    NoForce,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PolicyDef {
     name: String,
     table: String,
     command: PolicyCommand,
-    roles: String,
+    roles: Vec<Role>,
     using: String,
     check: String,
-    /// "1" or "0"
-    permissive: String,
+    permissive: bool,
+}
+
+/// ALTER POLICY: None in a clause is a clause not given.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AlterPolicy {
+    name: String,
+    table: String,
+    rename: Option<String>,
+    roles: Option<Vec<Role>>,
+    using: Option<String>,
+    check: Option<String>,
+}
+
+/// The roles of a policy statement's TO.
+fn roles_of(list: &[pg_query::protobuf::Node]) -> Vec<Role> {
+    list.iter().filter_map(tree::role_spec).map(tree::role).collect()
+}
+
+/// An RLS statement's plan. A policy's expressions are kept as the client wrote them,
+/// between the parentheses the tree's clause stands in.
+pub(crate) fn rls_plan(sql: &str, n: &NodeEnum) -> Option<RlsPlan> {
+    use pg_query::protobuf::{AlterTableType as A, ObjectType};
+    match n {
+        NodeEnum::AlterTableStmt(a) => {
+            let actions: Vec<RlsAction> = a
+                .cmds
+                .iter()
+                .filter_map(|c| match &c.node {
+                    Some(NodeEnum::AlterTableCmd(c)) => match A::try_from(c.subtype).ok()? {
+                        A::AtEnableRowSecurity => Some(RlsAction::Enable),
+                        A::AtDisableRowSecurity => Some(RlsAction::Disable),
+                        A::AtForceRowSecurity => Some(RlsAction::Force),
+                        A::AtNoForceRowSecurity => Some(RlsAction::NoForce),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            (!actions.is_empty()).then(|| RlsPlan::Table {
+                table: a.relation.as_ref().map(tree::reference).unwrap_or_default(),
+                actions,
+            })
+        }
+        NodeEnum::CreatePolicyStmt(c) => {
+            let toks = tree::tokens(sql);
+            Some(RlsPlan::Create(PolicyDef {
+                name: c.policy_name.clone(),
+                table: tree::reference(c.table.as_ref()?),
+                command: PolicyCommand::parse(&c.cmd_name)?,
+                roles: roles_of(&c.roles),
+                using: c
+                    .qual
+                    .is_some()
+                    .then(|| tree::parenthesized_after(sql, &toks, &["using"]))
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_string(),
+                check: c
+                    .with_check
+                    .is_some()
+                    .then(|| tree::parenthesized_after(sql, &toks, &["with", "check"]))
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_string(),
+                permissive: c.permissive,
+            }))
+        }
+        NodeEnum::AlterPolicyStmt(a) => {
+            let toks = tree::tokens(sql);
+            Some(RlsPlan::Alter(AlterPolicy {
+                name: a.policy_name.clone(),
+                table: tree::reference(a.table.as_ref()?),
+                rename: None,
+                roles: (!a.roles.is_empty()).then(|| roles_of(&a.roles)),
+                using: a
+                    .qual
+                    .is_some()
+                    .then(|| tree::parenthesized_after(sql, &toks, &["using"]).map(str::to_string))
+                    .flatten(),
+                check: a
+                    .with_check
+                    .is_some()
+                    .then(|| tree::parenthesized_after(sql, &toks, &["with", "check"]).map(str::to_string))
+                    .flatten(),
+            }))
+        }
+        NodeEnum::RenameStmt(r) if tree::object(r.rename_type) == ObjectType::ObjectPolicy => {
+            Some(RlsPlan::Alter(AlterPolicy {
+                name: r.subname.clone(),
+                table: tree::reference(r.relation.as_ref()?),
+                rename: Some(r.newname.clone()),
+                ..Default::default()
+            }))
+        }
+        NodeEnum::DropStmt(d) if tree::object(d.remove_type) == ObjectType::ObjectPolicy => {
+            // One policy, its table's name and its own: [schema,] table, policy.
+            let [o] = d.objects.as_slice() else { return None };
+            let Some(NodeEnum::List(l)) = &o.node else { return None };
+            let mut parts = tree::strings(&l.items);
+            let name = parts.pop()?;
+            Some(RlsPlan::Drop {
+                name,
+                table: tree::reference_of(&parts),
+                if_exists: d.missing_ok,
+            })
+        }
+        _ => None,
+    }
 }
 
 impl Session {
@@ -100,66 +230,49 @@ impl Session {
         if !is_rls_ddl(sql) {
             return None;
         }
-        if eq_fold(&first_word_upper(sql), "ALTER") && eq_fold(&second_word_upper(sql), "TABLE") {
-            return Some(self.alter_table_rls(sql).map(|()| Command::from("ALTER TABLE")));
-        }
-        match first_word_upper(sql).as_str() {
-            "CREATE" => Some(self.create_policy(sql).map(|()| Command::from("CREATE POLICY"))),
-            "DROP" => Some(self.drop_policy(sql).map(|()| Command::from("DROP POLICY"))),
-            _ => Some(self.alter_policy(sql).map(|()| Command::from("ALTER POLICY"))),
-        }
+        let plan = tree::statement(sql, |n| rls_plan(sql, n).ok_or_else(|| tree::parse_failure(sql)));
+        Some(plan.and_then(|plan| {
+            match plan {
+                RlsPlan::Table { table, actions } => {
+                    // Who may do this is settled by check_alter_table, before any route.
+                    let table = self.stored_name(&table);
+                    let r = self.alter_table_rls_write(&table, &actions);
+                    self.rls_changed();
+                    r.map(|()| Command::from("ALTER TABLE"))
+                }
+                RlsPlan::Create(p) => self.create_policy(p).map(|()| Command::from("CREATE POLICY")),
+                RlsPlan::Alter(a) => self.alter_policy(a).map(|()| Command::from("ALTER POLICY")),
+                RlsPlan::Drop { name, table, if_exists } => self
+                    .drop_policy(&name, &table, if_exists)
+                    .map(|()| Command::from("DROP POLICY")),
+            }
+        }))
     }
 
-    fn alter_table_rls(&mut self, sql: &str) -> Result<()> {
-        let f = split_words(sql);
-        let mut rest = &f[2..]; // after ALTER TABLE
-        if rest.len() >= 2 && eq_fold(rest[0], "if") && eq_fold(rest[1], "exists") {
-            rest = &rest[2..];
-        }
-        if rest.is_empty() {
-            return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in ALTER TABLE"));
-        }
-        if eq_fold(rest[0], "only") && rest.len() > 1 {
-            rest = &rest[1..];
-        }
-        // Who may do this is settled by check_alter_table, before any route.
-        let table = self.stored_name(trim_end_chars(rest[0], ";"));
-        let r = self.alter_table_rls_write(sql, &table);
-        self.rls_changed();
-        r
-    }
-
-    fn alter_table_rls_write(&mut self, sql: &str, table: &str) -> Result<()> {
+    fn alter_table_rls_write(&mut self, table: &str, actions: &[RlsAction]) -> Result<()> {
         let q = format!(
             "INSERT OR IGNORE INTO _overlite_rls (tablename, enabled, forced) VALUES ({}, 0, 0)",
             quote_literal(table)
         );
         self.exec(&q, &[])?;
-        // The action is the word before ROW LEVEL SECURITY; the rest is names.
-        let toks = code_tokens(sql);
-        let row = toks.iter().rposition(|t| t.is_word(sql, "row")).unwrap_or(0);
-        let word = |back: usize| row.checked_sub(back).and_then(|i| toks.get(i));
-        let is = |t: Option<&CodeTok>, w: &str| t.is_some_and(|t| t.is_word(sql, w));
-        let set = if is(word(1), "disable") {
-            "enabled = 0"
-        } else if is(word(1), "force") && is(word(2), "no") {
-            "forced = 0"
-        } else if is(word(1), "force") {
-            "forced = 1"
-        } else {
-            "enabled = 1" // enable
-        };
-        let q = format!(
-            "UPDATE _overlite_rls SET {} WHERE lower(tablename) = lower({})",
-            set,
-            quote_literal(table)
-        );
-        self.exec(&q, &[])?;
+        for action in actions {
+            let set = match action {
+                RlsAction::Enable => "enabled = 1",
+                RlsAction::Disable => "enabled = 0",
+                RlsAction::Force => "forced = 1",
+                RlsAction::NoForce => "forced = 0",
+            };
+            let q = format!(
+                "UPDATE _overlite_rls SET {} WHERE lower(tablename) = lower({})",
+                set,
+                quote_literal(table)
+            );
+            self.exec(&q, &[])?;
+        }
         Ok(())
     }
 
-    fn create_policy(&mut self, sql: &str) -> Result<()> {
-        let p = parse_policy(sql)?;
+    fn create_policy(&mut self, p: PolicyDef) -> Result<()> {
         let table = self.stored_name(&p.table);
         let cur = self.current_role.clone();
         if !self.role_bypasses(&cur) {
@@ -177,8 +290,8 @@ impl Session {
             quote_literal(&p.name),
             quote_literal(&table),
             quote_literal(p.command.as_str()),
-            quote_literal(&p.roles),
-            p.permissive,
+            quote_literal(&self.created_policy_roles(&p.roles)),
+            i32::from(p.permissive),
             quote_literal(&p.using),
             quote_literal(&p.check)
         );
@@ -188,8 +301,7 @@ impl Session {
 
     /// ALTER POLICY name ON table RENAME TO new, or [TO roles] [USING (expr)] [WITH
     /// CHECK (expr)]: what a clause names changes, and only that.
-    fn alter_policy(&mut self, sql: &str) -> Result<()> {
-        let a = parse_alter_policy(sql)?;
+    fn alter_policy(&mut self, a: AlterPolicy) -> Result<()> {
         let table = self.stored_name(&a.table);
         let (_, bare) = split_qualified_ref(&a.table);
         if self.table_ddl(&table).is_empty() {
@@ -270,13 +382,23 @@ impl Session {
     /// The role list of ALTER POLICY as a policy row holds it. A name that is no role
     /// is refused as in Postgres: a restrictive policy kept from the role it was meant
     /// for would open what it guards. The connected user counts, known or not.
-    fn policy_roles(&mut self, spec: &str) -> Result<String> {
+    fn policy_roles(&mut self, spec: &[Role]) -> Result<String> {
         let mut out = Vec::new();
-        for role in normalize_role_list(spec).split(',') {
+        for role in spec {
+            let role = match role {
+                Role::Public => return Ok(String::new()),
+                Role::Current => {
+                    out.push(self.current_role.to_lowercase());
+                    continue;
+                }
+                Role::Session => {
+                    out.push(self.session_user.to_lowercase());
+                    continue;
+                }
+                Role::Named(n) => n.to_lowercase(),
+            };
+            let role = role.as_str();
             match role {
-                "public" => return Ok(String::new()),
-                "current_user" | "current_role" => out.push(self.current_role.to_lowercase()),
-                "session_user" => out.push(self.session_user.to_lowercase()),
                 _ if eq_fold(role, &self.auth_user) || eq_fold(role, &self.session_user) => out.push(role.to_string()),
                 _ if eq_fold(role, &self.current_role) || self.role_exists(role) => out.push(role.to_string()),
                 _ => {
@@ -290,24 +412,27 @@ impl Session {
         Ok(out.join(","))
     }
 
-    fn drop_policy(&mut self, sql: &str) -> Result<()> {
-        let words = ddl_words(sql)?;
-        let mut rest = words.get(2..).unwrap_or(&[]); // after DROP POLICY
-        let if_exists = rest.len() >= 2 && rest[0].is("if") && rest[1].is("exists");
-        if if_exists {
-            rest = &rest[2..];
+    /// The roles of a new policy as its row holds them: names in lower case, none for
+    /// PUBLIC alone, CURRENT_USER and SESSION_USER the roles they stand for.
+    fn created_policy_roles(&self, roles: &[Role]) -> String {
+        if roles == [Role::Public] {
+            return String::new();
         }
-        let Some(name) = rest.first().and_then(Word::name).map(str::to_string) else {
-            return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in DROP POLICY"));
-        };
-        let reference: Vec<String> = rest
+        let names: Vec<String> = roles
             .iter()
-            .skip_while(|w| !w.is("on"))
-            .skip(1)
-            .take_while(|w| w.name().is_some() || **w == Word::Punct('.'))
-            .map(|w| w.name().map_or(".".to_string(), quote_ident))
+            .map(|r| match r {
+                Role::Public => "public".to_string(),
+                Role::Current => self.current_role.to_lowercase(),
+                Role::Session => self.session_user.to_lowercase(),
+                Role::Named(n) => n.to_lowercase(),
+            })
             .collect();
-        let table = self.stored_name(&reference.concat());
+        names.join(",")
+    }
+
+    fn drop_policy(&mut self, name: &str, table: &str, if_exists: bool) -> Result<()> {
+        let name = name.to_string();
+        let table = self.stored_name(table);
         let cur = self.current_role.clone();
         if !self.role_bypasses(&cur) {
             let roles = self.effective_roles();
@@ -861,168 +986,6 @@ fn rls_violation(bare: &str) -> Error {
     )
 }
 
-/// Parses CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE] [FOR cmd]
-/// [TO roles] [USING (expr)] [WITH CHECK (expr)].
-fn parse_policy(sql: &str) -> Result<PolicyDef> {
-    let f = split_words(sql);
-    if f.len() < 5 || !eq_fold(f[3], "on") {
-        return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in CREATE POLICY"));
-    }
-    let mut p = PolicyDef {
-        name: unquote_ident(f[2]),
-        table: trim_end_chars(f[4], ";").to_string(),
-        command: PolicyCommand::All,
-        permissive: "1".to_string(),
-        ..Default::default()
-    };
-    // Clauses are looked for in the code: an expression's literals can spell them.
-    let code = code_only(sql);
-    let low = code.to_ascii_lowercase();
-    if index_word(&low, "restrictive").is_some() {
-        p.permissive = "0".to_string();
-    }
-    if let Some(i) = index_word(&low, "for") {
-        let word = first_word_of(&sql[i + "for".len()..]);
-        p.command = PolicyCommand::parse(&word)
-            .ok_or_else(|| Error::with_state(SqlState::SYNTAX_ERROR, format!("syntax error at or near \"{word}\"")))?;
-    }
-    if let Some(i) = index_word(&low, "using")
-        && let Some(op) = code[i..].find('(')
-    {
-        let (inner, _) = balanced_paren(sql, i + op);
-        p.using = inner.trim().to_string();
-    }
-    if let Some(i) = low.find("with check")
-        && let Some(op) = code[i..].find('(')
-    {
-        let (inner, _) = balanced_paren(sql, i + op);
-        p.check = inner.trim().to_string();
-    }
-    if let Some(i) = index_word(&low, "to") {
-        let rest = &sql[i + "to".len()..];
-        let rest_low = &low[i + "to".len()..];
-        let mut end = rest.len();
-        for kw in ["using", "with check", "with", "for"] {
-            if let Some(k) = index_word(rest_low, kw)
-                && k < end
-            {
-                end = k;
-            }
-        }
-        p.roles = normalize_role_list(&rest[..end]);
-    }
-    Ok(p)
-}
-
-/// ALTER POLICY, as written. None in a clause is a clause not given.
-#[derive(Debug, Default)]
-struct AlterPolicy {
-    name: String,
-    table: String,
-    rename: Option<String>,
-    roles: Option<String>,
-    using: Option<String>,
-    check: Option<String>,
-}
-
-/// Parses ALTER POLICY by its tokens, so that a name or an expression can hold any
-/// keyword. On a security statement what is not understood must not pass for done,
-/// so anything but the grammar, in its order, is a syntax error.
-fn parse_alter_policy(sql: &str) -> Result<AlterPolicy> {
-    let toks = code_tokens(sql);
-    let text = |i: usize| toks.get(i).map_or("", |t| &sql[t.span.clone()]);
-    let word = |i: usize, w: &str| toks.get(i).is_some_and(|t| t.is_word(sql, w));
-    let punct = |i: usize, p: &str| toks.get(i).is_some_and(|t| t.is_punct(sql, p));
-    let syntax = |i: usize| match toks.get(i) {
-        Some(_) => errf!(SqlState::SYNTAX_ERROR, "syntax error at or near \"{}\"", text(i)),
-        None => errf!(SqlState::SYNTAX_ERROR, "syntax error at end of input"),
-    };
-    let is_name = |i: usize| {
-        toks.get(i)
-            .is_some_and(|t| t.kind == CodeTokKind::Word || sql[t.span.clone()].starts_with('"'))
-    };
-
-    if !is_name(2) {
-        return Err(syntax(2));
-    }
-    if !word(3, "on") {
-        return Err(syntax(3));
-    }
-    if !is_name(4) {
-        return Err(syntax(4));
-    }
-    let mut a = AlterPolicy {
-        name: unquote_ident(text(2)),
-        table: text(4).to_string(),
-        ..Default::default()
-    };
-    let mut i = 5;
-    if punct(i, ".") {
-        if !is_name(i + 1) {
-            return Err(syntax(i + 1));
-        }
-        a.table = sql[toks[4].span.start..toks[i + 1].span.end].to_string();
-        i += 2;
-    }
-    if word(i, "rename") {
-        if !word(i + 1, "to") {
-            return Err(syntax(i + 1));
-        }
-        if !is_name(i + 2) {
-            return Err(syntax(i + 2));
-        }
-        a.rename = Some(unquote_ident(text(i + 2)));
-        i += 3;
-    } else {
-        if word(i, "to") {
-            i += 1;
-            let start = toks.get(i).map_or(sql.len(), |t| t.span.start);
-            while i < toks.len() && !word(i, "using") && !word(i, "with") {
-                i += 1;
-            }
-            let end = toks.get(i).map_or(sql.len(), |t| t.span.start);
-            let spec = sql[start..end].trim();
-            if spec.is_empty() {
-                return Err(syntax(i));
-            }
-            a.roles = Some(spec.to_string());
-        }
-        // One expression in parentheses, the token after them its end.
-        let expr = |i: &mut usize| -> Result<String> {
-            if !punct(*i, "(") {
-                return Err(syntax(*i));
-            }
-            let (inner, after) = balanced_paren(sql, toks[*i].span.start);
-            let close = toks
-                .iter()
-                .position(|t| t.span.end == after && sql[t.span.clone()] == *")");
-            let Some(close) = close else {
-                return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error at end of input"));
-            };
-            if inner.trim().is_empty() {
-                return Err(syntax(close));
-            }
-            *i = close + 1;
-            Ok(inner.trim().to_string())
-        };
-        if word(i, "using") {
-            i += 1;
-            a.using = Some(expr(&mut i)?);
-        }
-        if word(i, "with") {
-            if !word(i + 1, "check") {
-                return Err(syntax(i + 1));
-            }
-            i += 2;
-            a.check = Some(expr(&mut i)?);
-        }
-    }
-    if i < toks.len() {
-        return Err(syntax(i));
-    }
-    Ok(a)
-}
-
 fn policy_role_match(pol_roles: &str, role_set: &HashSet<String>) -> bool {
     let pol_roles = pol_roles.trim();
     if pol_roles.is_empty() {
@@ -1055,11 +1018,13 @@ fn combine_rls(perm: &[String], restr: &[String]) -> String {
 /// Whether the statement is an upsert with a DO UPDATE action (as opposed to DO
 /// NOTHING).
 fn has_do_update(sql: &str) -> bool {
-    let low = sql.to_lowercase();
-    match top_level_on_conflict(&low) {
-        Some(c) => code_only(&low[c..]).contains("do update"),
-        None => false,
-    }
+    tree::read(sql, |n| match n {
+        NodeEnum::InsertStmt(i) => {
+            Some(i.on_conflict_clause.as_ref()?.action == pg_query::protobuf::OnConflictAction::OnconflictUpdate as i32)
+        }
+        _ => None,
+    })
+    .unwrap_or(false)
 }
 
 /// Extracts the target table token, an explicit column list (if any), and the
@@ -1345,30 +1310,6 @@ pub(crate) fn balanced_paren(s: &str, open: usize) -> (String, usize) {
         i += 1;
     }
     (s[open + 1..].to_string(), s.len())
-}
-
-fn first_word_of(s: &str) -> String {
-    let s = trim_start_chars(s, " \t\n");
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && !(b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'(') {
-        i += 1;
-    }
-    trim_end_chars(&s[..i], ";").to_string()
-}
-
-fn normalize_role_list(spec: &str) -> String {
-    let mut out = Vec::new();
-    for r in spec.split(',') {
-        let r = trim_end_chars(r, ";").trim();
-        let r = r.strip_prefix("GROUP ").unwrap_or(r);
-        let r = r.strip_prefix("group ").unwrap_or(r);
-        let r = trim_chars(r.trim(), "\"");
-        if !r.is_empty() {
-            out.push(r.to_lowercase());
-        }
-    }
-    out.join(",")
 }
 
 pub(crate) fn text_or_empty(v: &Value) -> String {

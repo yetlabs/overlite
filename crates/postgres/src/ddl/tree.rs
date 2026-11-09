@@ -191,3 +191,67 @@ pub(crate) fn quoted_names(sql: &str) -> std::collections::HashSet<String> {
     }
     out
 }
+
+/// One token of a statement, by Postgres' scanner: where it is, how deep in
+/// parentheses, and whether the scanner read it as a keyword (a quoted name never is).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Token {
+    pub start: usize,
+    pub end: usize,
+    pub depth: u32,
+    pub keyword: bool,
+}
+
+/// sql's tokens, comments left out: where a clause of the tree begins and ends in the
+/// client's text, for what is kept as written (a policy's expression, a default).
+pub(crate) fn tokens(sql: &str) -> Vec<Token> {
+    let Ok(scanned) = pg_query::scan_tokens(sql) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scanned.len());
+    let mut depth = 0u32;
+    for t in scanned {
+        let (Ok(start), Ok(end)) = (usize::try_from(t.start), usize::try_from(t.end)) else {
+            continue;
+        };
+        let Some(text) = sql.get(start..end) else { continue };
+        if text.starts_with("/*") || text.starts_with("--") {
+            continue;
+        }
+        let keyword = t.keyword_kind != 0 && !text.starts_with('"');
+        if text == ")" || text == "]" {
+            depth = depth.saturating_sub(1);
+        }
+        out.push(Token {
+            start,
+            end,
+            depth,
+            keyword,
+        });
+        if text == "(" || text == "[" {
+            depth += 1;
+        }
+    }
+    out
+}
+
+/// The text inside the parentheses that follow the keywords words (in order, at the
+/// top level of the statement), trimmed: `USING (expr)`'s expr.
+pub(crate) fn parenthesized_after<'a>(sql: &'a str, toks: &[Token], words: &[&str]) -> Option<&'a str> {
+    let text = |t: &Token| &sql[t.start..t.end];
+    for i in 0..toks.len() {
+        let matches = words.iter().enumerate().all(|(k, w)| {
+            toks.get(i + k)
+                .is_some_and(|t| t.depth == 0 && t.keyword && text(t).eq_ignore_ascii_case(w))
+        });
+        if !matches {
+            continue;
+        }
+        let open = toks.get(i + words.len()).filter(|t| text(t) == "(")?;
+        let close = toks[i + words.len() + 1..]
+            .iter()
+            .find(|t| t.depth == open.depth && text(t) == ")")?;
+        return Some(sql[open.end..close.start].trim());
+    }
+    None
+}

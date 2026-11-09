@@ -376,23 +376,7 @@ pub(crate) fn rewrite_escape_strings(sql: &str) -> String {
     normalize_literals(sql).map_or_else(|_| sql.to_string(), Cow::into_owned)
 }
 
-/// Returns the index just past the single-quoted string literal that starts at
-/// i (with '' treated as an escaped quote).
-pub(crate) fn end_of_string_literal(sql: &str, i: usize) -> usize {
-    let s = sql.as_bytes();
-    let mut j = i + 1;
-    while j < s.len() {
-        if s[j] == b'\'' {
-            if j + 1 < s.len() && s[j + 1] == b'\'' {
-                j += 2;
-                continue;
-            }
-            return j + 1;
-        }
-        j += 1;
-    }
-    j
-}
+pub(crate) use overlite_core::text::end_of_string_literal;
 
 /// Applies f to every stretch of sql that lies outside a single-quoted string
 /// literal, copying the literals through verbatim.

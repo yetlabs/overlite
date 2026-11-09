@@ -125,3 +125,39 @@ fn role_ddl_reads_its_names_and_options() {
     must_exec(&alice, "ALTER ROLE CURRENT_USER PASSWORD 'a2'");
     connect_as(&addr, "alice", "a2");
 }
+
+// Policies read their names, roles and actions from the tree: a quoted name with a
+// space was a syntax error, a policy TO CURRENT_USER matched no one, and of two row
+// level security actions in one ALTER TABLE only the last was done.
+#[test]
+fn policies_read_their_names_roles_and_actions() {
+    let (addr, admin) = setup();
+    must_exec(&admin, "CREATE TABLE docs (owner text, v text)");
+    must_exec(&admin, "INSERT INTO docs VALUES ('alice', 'a1'), ('bob', 'b1')");
+    must_exec(&admin, "GRANT SELECT ON docs TO alice");
+    must_exec(&admin, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY");
+    must_exec(
+        &admin,
+        r#"CREATE POLICY "Own rows" ON docs TO alice USING (owner = current_user)"#,
+    );
+    let alice = connect_as(&addr, "alice", "a");
+    assert_eq!(strings(&alice, "SELECT v FROM docs"), ["a1"]);
+    must_exec(&admin, r#"DROP POLICY "Own rows" ON docs"#);
+    assert!(strings(&alice, "SELECT v FROM docs").is_empty());
+
+    must_exec(&alice, "CREATE TABLE notes (v text)");
+    must_exec(&alice, "INSERT INTO notes VALUES ('a'), ('b')");
+    must_exec(
+        &alice,
+        "ALTER TABLE notes ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY",
+    );
+    must_exec(&alice, "CREATE POLICY pa ON notes USING (v = 'a')");
+    assert_eq!(strings(&alice, "SELECT v FROM notes"), ["a"]);
+
+    must_exec(&alice, "CREATE TABLE n2 (v text)");
+    must_exec(&alice, "INSERT INTO n2 VALUES ('x')");
+    must_exec(&alice, "ALTER TABLE n2 ENABLE ROW LEVEL SECURITY");
+    must_exec(&alice, "ALTER TABLE n2 FORCE ROW LEVEL SECURITY");
+    must_exec(&alice, "CREATE POLICY mine ON n2 TO CURRENT_USER USING (true)");
+    assert_eq!(strings(&alice, "SELECT v FROM n2"), ["x"]);
+}
