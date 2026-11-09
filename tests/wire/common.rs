@@ -287,8 +287,7 @@ pub fn signal_and_wait(server: &Server, sig: i32) -> (std::result::Result<(), St
     let mut guard = lock(&server.0.child);
     let child = guard.as_mut().expect("the server already exited");
     let t0 = Instant::now();
-    // SAFETY: kill takes any pid and signal, and reports a bad one by its result.
-    assert_eq!(unsafe { libc::kill(child.id() as i32, sig) }, 0, "kill");
+    deliver(child, sig);
     loop {
         if let Some(status) = child.try_wait().expect("wait") {
             let took = t0.elapsed();
@@ -308,6 +307,22 @@ pub fn signal_and_wait(server: &Server, sig: i32) -> (std::result::Result<(), St
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[cfg(unix)]
+fn deliver(child: &Child, sig: i32) {
+    // SAFETY: kill takes any pid and signal, and reports a bad one by its result.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, sig) }, 0, "kill");
+}
+
+/// Windows has no kill(2) to send a process SIGTERM or SIGINT. The wire suite runs
+/// on Unix only; on Windows it is compiled, so it has to build there.
+#[cfg(not(unix))]
+fn deliver(child: &Child, sig: i32) {
+    panic!(
+        "cannot send signal {sig} to {}: no kill(2) on this platform",
+        child.id()
+    );
 }
 
 /// Opens the files with no server and reports what survived.
