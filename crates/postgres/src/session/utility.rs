@@ -1,12 +1,12 @@
 //! Statements clients expect to succeed but SQLite can't run, classifiers for
 //! transaction control and savepoints, and the debug query log.
 
-use crate::ddl::words::{Word, ddl_words, syntax_error_at};
+use crate::ddl::tree;
 use crate::error::{Error, Result, errf};
 use crate::session::{Session, TxState};
 use overlite_core::text::{eq_fold, quote_literal, split_words, trim_end_chars, trim_start_chars};
 use overlite_core::{Column, Command, ResultSet, SqlState, Value};
-use overlite_engine::code_only;
+use pg_query::NodeEnum;
 
 /// Logs the SQL of an executed query (OVERLITE_DEBUG=all).
 pub(crate) fn log_query(phase: &str, sql: &str) {
@@ -84,15 +84,42 @@ pub(crate) fn intercept_utility(sql: &str) -> Option<ResultSet> {
 /// Reports whether an ALTER statement is one we accept without effect (SQLite
 /// can't apply it). ALTER TABLE ADD COLUMN etc. return false and pass to SQLite.
 pub(crate) fn alter_is_noop(sql: &str) -> bool {
-    let up = code_only(sql).to_uppercase();
-    match second_word_upper(sql).as_str() {
-        "SCHEMA" => true,
-        "DATABASE" => false,
-        // VALIDATE CONSTRAINT: a constraint here held for every row when it was added.
-        "TABLE" => up.contains(" OWNER TO ") || up.contains(" ADD CONSTRAINT ") || up.contains(" VALIDATE CONSTRAINT "),
-        // A function's owner decides what its SECURITY DEFINER body may read: GRANT's.
-        "FUNCTION" | "ROUTINE" | "PROCEDURE" => false,
-        _ => up.contains(" OWNER TO "),
+    tree::read(sql, |n| Some(alter_is_noop_node(n))).unwrap_or(false)
+}
+
+/// `alter_is_noop` of a node: ALTER SCHEMA anything; an ALTER TABLE that changes an
+/// owner, adds a named constraint or validates one (a constraint here held for every row
+/// when it was added); and OWNER TO of anything but a database or a function, whose
+/// owner decides what its SECURITY DEFINER body may read (GRANT's).
+fn alter_is_noop_node(n: &NodeEnum) -> bool {
+    use pg_query::protobuf::{AlterTableType as A, ObjectType as O};
+    let routine_or_db = |t: i32| {
+        matches!(
+            tree::object(t),
+            O::ObjectDatabase | O::ObjectFunction | O::ObjectRoutine | O::ObjectProcedure
+        )
+    };
+    match n {
+        NodeEnum::RenameStmt(r) => tree::object(r.rename_type) == O::ObjectSchema,
+        NodeEnum::AlterOwnerStmt(a) => !routine_or_db(a.object_type),
+        NodeEnum::AlterTableStmt(a) => {
+            let table = tree::object(a.objtype) == O::ObjectTable;
+            a.cmds.iter().any(|c| match &c.node {
+                Some(NodeEnum::AlterTableCmd(c)) => match A::try_from(c.subtype) {
+                    Ok(A::AtChangeOwner) => true,
+                    Ok(A::AtValidateConstraint) => table,
+                    // Named: ADD UNIQUE without CONSTRAINT is the rebuild's (ddl/alter.rs).
+                    Ok(A::AtAddConstraint) => {
+                        table
+                            && matches!(c.def.as_deref().and_then(|d| d.node.as_ref()),
+                                Some(NodeEnum::Constraint(k)) if !k.conname.is_empty())
+                    }
+                    _ => false,
+                },
+                _ => false,
+            })
+        }
+        _ => false,
     }
 }
 
@@ -253,23 +280,20 @@ impl Session {
     }
 
     fn run_schema_ddl(&mut self, sql: &str) -> Result<Command> {
-        let mut words = ddl_words(sql)?;
-        if words.last() == Some(&Word::Punct(';')) {
-            words.pop();
-        }
-        // After the verb and SCHEMA.
-        let rest = words.get(2..).unwrap_or(&[]);
-        match words.first() {
-            Some(verb) if verb.is("create") => {
-                let (name, if_not_exists) = parse_create_schema(rest)?;
+        let plan = tree::statement(sql, |n| schema_plan(n).ok_or_else(|| tree::parse_failure(sql)))?;
+        match plan {
+            SchemaPlan::Create { name, if_not_exists } => {
                 if name.to_ascii_lowercase().starts_with("pg_") {
                     return Err(errf!(SqlState::RESERVED_NAME, "unacceptable schema name \"{name}\""));
                 }
                 self.db.create_schema(&name, if_not_exists)?;
                 Ok(Command::from("CREATE SCHEMA"))
             }
-            Some(verb) if verb.is("drop") => {
-                let (names, if_exists, cascade) = parse_drop_schema(rest)?;
+            SchemaPlan::Drop {
+                names,
+                if_exists,
+                cascade,
+            } => {
                 for name in &names {
                     if !self.schema_exists(name)? {
                         if !if_exists {
@@ -284,22 +308,12 @@ impl Session {
                 self.rls_changed();
                 Ok(Command::from("DROP SCHEMA"))
             }
-            _ => {
-                let Some(name) = rest.first().and_then(Word::name) else {
-                    return Err(syntax_error_at(rest.first()));
-                };
-                if !self.schema_exists(name)? {
+            SchemaPlan::Alter { name, rename } => {
+                if !self.schema_exists(&name)? {
                     return Err(errf!(SqlState::INVALID_SCHEMA_NAME, "schema \"{name}\" does not exist"));
                 }
-                // ALTER SCHEMA x RENAME TO y
-                if rest.get(1).is_some_and(|w| w.is("rename")) {
-                    if !rest.get(2).is_some_and(|w| w.is("to")) {
-                        return Err(syntax_error_at(rest.get(2)));
-                    }
-                    let Some(to) = rest.get(3).and_then(Word::name) else {
-                        return Err(syntax_error_at(rest.get(3)));
-                    };
-                    self.db.rename_schema(name, to)?;
+                if let Some(to) = rename {
+                    self.db.rename_schema(&name, &to)?;
                     self.rls_changed();
                 }
                 Ok(Command::from("ALTER SCHEMA")) // OWNER TO: nothing to keep
@@ -316,41 +330,51 @@ impl Session {
     }
 }
 
-/// `[IF NOT EXISTS] name [AUTHORIZATION role]`, or `AUTHORIZATION role`, which is the
-/// name as well.
-fn parse_create_schema(rest: &[Word]) -> Result<(String, bool)> {
-    let if_not_exists = rest.len() >= 3 && rest[0].is("if") && rest[1].is("not") && rest[2].is("exists");
-    let rest = &rest[if if_not_exists { 3 } else { 0 }..];
-    let at = usize::from(rest.first().is_some_and(|w| w.is("authorization")));
-    match rest.get(at).and_then(Word::name) {
-        Some(name) => Ok((name.to_string(), if_not_exists)),
-        None => Err(syntax_error_at(rest.get(at))),
-    }
+/// A schema's DDL, read from its node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SchemaPlan {
+    /// CREATE SCHEMA: named, or AUTHORIZATION role alone, which names it.
+    Create { name: String, if_not_exists: bool },
+    Drop {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// ALTER SCHEMA ... RENAME TO, or OWNER TO (rename None).
+    Alter { name: String, rename: Option<String> },
 }
 
-/// `[IF EXISTS] name [, ...] [CASCADE | RESTRICT]`.
-fn parse_drop_schema(rest: &[Word]) -> Result<(Vec<String>, bool, bool)> {
-    let if_exists = rest.len() >= 2 && rest[0].is("if") && rest[1].is("exists");
-    let rest = &rest[if if_exists { 2 } else { 0 }..];
-    let (names, cascade) = match rest.last() {
-        Some(w) if w.is("cascade") => (&rest[..rest.len() - 1], true),
-        Some(w) if w.is("restrict") => (&rest[..rest.len() - 1], false),
-        _ => (rest, false),
-    };
-    let mut out = Vec::new();
-    for at in (0..names.len()).step_by(2) {
-        match names[at].name() {
-            Some(name) => out.push(name.to_string()),
-            None => return Err(syntax_error_at(names.get(at))),
+pub(crate) fn schema_plan(n: &NodeEnum) -> Option<SchemaPlan> {
+    use pg_query::protobuf::{DropBehavior, ObjectType};
+    match n {
+        NodeEnum::CreateSchemaStmt(c) => {
+            let name = if c.schemaname.is_empty() {
+                c.authrole.as_ref()?.rolename.clone()
+            } else {
+                c.schemaname.clone()
+            };
+            Some(SchemaPlan::Create {
+                name,
+                if_not_exists: c.if_not_exists,
+            })
         }
-        if names.get(at + 1).is_some_and(|w| *w != Word::Punct(',')) {
-            return Err(syntax_error_at(names.get(at + 1)));
+        NodeEnum::DropStmt(d) if tree::object(d.remove_type) == ObjectType::ObjectSchema => Some(SchemaPlan::Drop {
+            names: d.objects.iter().filter_map(tree::string).map(str::to_string).collect(),
+            if_exists: d.missing_ok,
+            cascade: d.behavior == DropBehavior::DropCascade as i32,
+        }),
+        NodeEnum::RenameStmt(r) if tree::object(r.rename_type) == ObjectType::ObjectSchema => Some(SchemaPlan::Alter {
+            name: r.subname.clone(),
+            rename: Some(r.newname.clone()),
+        }),
+        NodeEnum::AlterOwnerStmt(a) if tree::object(a.object_type) == ObjectType::ObjectSchema => {
+            Some(SchemaPlan::Alter {
+                name: tree::string(a.object.as_deref()?)?.to_string(),
+                rename: None,
+            })
         }
+        _ => None,
     }
-    if out.is_empty() {
-        return Err(syntax_error_at(None));
-    }
-    Ok((out, if_exists, cascade))
 }
 
 pub(crate) fn unquote_ident(s: &str) -> String {
