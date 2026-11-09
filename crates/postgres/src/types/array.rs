@@ -15,7 +15,7 @@ use crate::types::{
 };
 use overlite_core::text::{eq_fold, text_from_bytes, text_to_bytes};
 use overlite_core::{Oid, Value, format_float};
-use overlite_engine::{Json, assign_value, code_only, json_decode_first, json_marshal};
+use overlite_engine::{Json, assign_value, code_only, json_decode_first, json_marshal, pg_array_text};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -270,39 +270,6 @@ fn parse_pg_array_at(c: &[char], mut i: usize) -> Option<(Vec<Json>, usize)> {
             _ => return None,
         }
     }
-}
-
-fn pg_array_text(arr: &[Json]) -> String {
-    let parts: Vec<String> = arr.iter().map(pg_array_elem).collect();
-    ["{", &parts.join(","), "}"].concat()
-}
-
-fn pg_array_elem(e: &Json) -> String {
-    match e {
-        Json::Null => "NULL".to_string(),
-        Json::Bool(x) => {
-            if *x {
-                "t".to_string()
-            } else {
-                "f".to_string()
-            }
-        }
-        Json::Number(x) => x.clone(),
-        Json::Num(x) => format_float(*x),
-        Json::Str(x) => quote_pg_array_elem(x),
-        Json::Arr(x) => pg_array_text(x),
-        Json::Obj(_) => quote_pg_array_elem(""),
-    }
-}
-
-/// Double-quotes an element when it would otherwise be ambiguous (empty, contains
-/// a delimiter/quote/space, or looks like NULL).
-fn quote_pg_array_elem(s: &str) -> String {
-    if s.is_empty() || eq_fold(s, "null") || s.contains(['{', '}', ',', '"', '\\', ' ']) {
-        let s = s.replace('\\', "\\\\").replace('"', "\\\"");
-        return ["\"", &s, "\""].concat();
-    }
-    s.to_string()
 }
 
 // --- input rewrites ---------------------------------------------------------

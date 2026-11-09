@@ -213,6 +213,28 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
         }
         Ok(Value::Text(vector_arg(&a[0])?.render()))
     })?;
+    // tsquery's operators: `&&` and `||` join two queries ('&', '|'), `!!` negates one
+    // ('!', the third argument unread); an empty query leaves the other as it is.
+    scalar(conn, "overlite_tsquery_op", 3, |a| {
+        if a[0].is_null() || a[1].is_null() {
+            return Ok(Value::Null);
+        }
+        let op = a[0].to_string();
+        let x = query_arg(&a[1])?.root;
+        let root = if op == "!" {
+            x.map(|n| query::Node::Not(Box::new(n)))
+        } else {
+            if a[2].is_null() {
+                return Ok(Value::Null);
+            }
+            match (x, query_arg(&a[2])?.root) {
+                (Some(l), Some(r)) if op == "&" => Some(query::Node::And(Box::new(l), Box::new(r))),
+                (Some(l), Some(r)) => Some(query::Node::Or(Box::new(l), Box::new(r))),
+                (l, r) => l.or(r),
+            }
+        };
+        Ok(Value::Text(TsQuery { root }.render()))
+    })?;
     scalar(conn, "tsquery_in", 1, |a| {
         if any_null(a) {
             return Ok(Value::Null);

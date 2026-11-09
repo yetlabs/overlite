@@ -875,6 +875,9 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         scalar(conn, name, -1, null)?;
     }
     scalar(conn, "pg_encoding_to_char", 1, |_| text("UTF8"))?;
+    scalar(conn, "overlite_array_text", 1, |a| {
+        Ok(crate::builtins::arrays::array_text(&a[0]))
+    })?;
     scalar(conn, "array_to_string", -1, |a| {
         Ok(crate::builtins::arrays::array_to_string(a))
     })?;
@@ -960,6 +963,9 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     // ARRAY(subquery), whose value is the JSON array the rewrite builds: the call
     // marks the result column an array.
     scalar(conn, "overlite_array", 1, |a| Ok(a[0].clone()))?;
+    scalar(conn, "overlite_array_slice", 3, |a| {
+        Ok(crate::builtins::arrays::array_slice(a))
+    })?;
     // `a || b` of arrays, or of an array and an element, by which side is which.
     scalar(conn, "overlite_array_cat", 3, |a| {
         Ok(crate::builtins::arrays::array_cat(&a[0], &a[1], &a[2].to_string()))

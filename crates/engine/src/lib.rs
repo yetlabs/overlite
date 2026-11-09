@@ -37,6 +37,7 @@ mod storage;
 mod table_types;
 
 pub use blank::{blank_comments, blank_literals, code_only};
+pub use builtins::arrays::pg_array_text;
 pub use builtins::casts::{CastType, assign as assign_value, assignment_type, cast, interval_parts};
 pub use builtins::collation::{
     CollationSpec, collation_known, collations_generation, forget_collation, register_collation, spec_of_locale,

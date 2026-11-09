@@ -1,7 +1,7 @@
 //! Arrays are stored as JSON arrays in TEXT cells (see `types::array` in the postgres crate).
 //! These back the Postgres array functions over that representation.
 
-use crate::builtins::json::{json_quote, json_unmarshal_raw_array};
+use crate::builtins::json::{Json, json_decode_first, json_quote, json_unmarshal_raw_array};
 use crate::builtins::ranges::arg_str;
 use overlite_core::text::{eq_fold, slice, split_words, trim_chars};
 use overlite_core::{Value, lazy_regex};
@@ -260,6 +260,76 @@ pub(crate) fn array_to_string(a: &[Value]) -> Value {
     };
     let parts: Vec<&str> = items.iter().filter_map(|(i, _)| i.as_deref().or(null)).collect();
     Value::Text(parts.join(sep))
+}
+
+/// Postgres' text form of an array (array_out): `{a,"b c",NULL}`, each element quoted
+/// where it would otherwise be read another way, a boolean `t` or `f`.
+#[must_use]
+pub fn pg_array_text(arr: &[Json]) -> String {
+    let parts: Vec<String> = arr.iter().map(pg_array_elem).collect();
+    ["{", &parts.join(","), "}"].concat()
+}
+
+fn pg_array_elem(e: &Json) -> String {
+    match e {
+        Json::Null => "NULL".to_string(),
+        Json::Bool(x) => if *x { "t" } else { "f" }.to_string(),
+        Json::Number(x) => x.clone(),
+        Json::Num(x) => overlite_core::format_float(*x),
+        Json::Str(x) => quote_pg_array_elem(x),
+        Json::Arr(x) => pg_array_text(x),
+        Json::Obj(_) => quote_pg_array_elem(""),
+    }
+}
+
+/// Double-quotes an element when it would otherwise be ambiguous (empty, holding a
+/// delimiter, a quote or a space, or spelled like NULL).
+fn quote_pg_array_elem(s: &str) -> String {
+    if s.is_empty() || s.eq_ignore_ascii_case("null") || s.contains(['{', '}', ',', '"', '\\', ' ']) {
+        let s = s.replace('\\', "\\\\").replace('"', "\\\"");
+        return ["\"", &s, "\""].concat();
+    }
+    s.to_string()
+}
+
+/// overlite_array_text: an array, stored as a JSON array, in Postgres' text form, as a
+/// cast to text writes it; what is no JSON array as it is.
+pub(crate) fn array_text(v: &Value) -> Value {
+    match v {
+        Value::Null => Value::Null,
+        Value::Text(s) => match json_decode_first(s) {
+            Some(Json::Arr(a)) => Value::Text(pg_array_text(&a)),
+            _ => v.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// overlite_array_slice(a, lo, hi): the elements of a JSON array from lo to hi, counted
+/// from 1, as `a[lo:hi]` takes them (a bound NULL is open); NULL for what is no JSON
+/// array.
+pub(crate) fn array_slice(a: &[Value]) -> Value {
+    // An array in Postgres' text form too (string_to_array's).
+    let Some(Value::Text(s)) = a.first().map(array_as_json) else {
+        return Value::Null;
+    };
+    let Some(Json::Arr(items)) = json_decode_first(&s) else {
+        return Value::Null;
+    };
+    let bound = |v: Option<&Value>| match v {
+        Some(Value::Int(i)) => Some(*i),
+        Some(Value::Float(f)) => Some(f.round() as i64),
+        Some(Value::Text(t)) => t.trim().parse().ok(),
+        _ => None,
+    };
+    let lo = bound(a.get(1)).unwrap_or(1);
+    let hi = bound(a.get(2)).unwrap_or(i64::MAX);
+    let kept: Vec<Json> = (1i64..)
+        .zip(items)
+        .filter(|(p, _)| *p >= lo && *p <= hi)
+        .map(|(_, j)| j)
+        .collect();
+    Value::Text(crate::builtins::json::json_marshal(&Json::Arr(kept)))
 }
 
 #[cfg(test)]
