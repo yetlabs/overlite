@@ -8,10 +8,10 @@
 
 use crate::error::{Result, errf};
 use crate::session::Session;
-use crate::session::utility::unquote_ident;
 use overlite_core::SqlState;
-use overlite_core::text::{eq_fold, split_words, trim_end_chars};
+use overlite_core::text::{eq_fold, split_words};
 use overlite_engine::{session_zone, set_session_zone};
+use pg_query::NodeEnum;
 use std::collections::HashMap;
 
 /// A change of the TimeZone a statement asks for.
@@ -24,17 +24,39 @@ pub(crate) struct ZoneChange {
 }
 
 /// SET [SESSION | LOCAL] TIME ZONE value, SET [SESSION | LOCAL] timezone {TO | =}
-/// value, and RESET timezone. None for any other statement.
+/// value, and RESET timezone, read from the node. None for any other statement.
 pub(crate) fn zone_change(sql: &str) -> Option<ZoneChange> {
-    if !crate::ast::classify::read(sql, crate::ast::classify::time_zone).unwrap_or(true) {
+    if !crate::ast::classify::read(sql, crate::ast::classify::time_zone).unwrap_or(false) {
         return None;
     }
-    zone_change_text(sql)
+    crate::ddl::tree::read(sql, zone_change_of)
 }
 
-/// The change of zone sql asks for, read from its text.
+fn zone_change_of(n: &NodeEnum) -> Option<ZoneChange> {
+    use pg_query::protobuf::VariableSetKind as K;
+    let NodeEnum::VariableSetStmt(v) = n else {
+        return None;
+    };
+    let zone = match K::try_from(v.kind).ok()? {
+        K::VarSetValue => match v.args.first()?.node.as_ref()? {
+            // An INTERVAL: not a zone this server reads, named as written.
+            NodeEnum::TypeCast(c) => Some(["INTERVAL ", &crate::ddl::tree::arg_text(c.arg.as_deref()?)?].concat()),
+            _ => Some(crate::ddl::tree::arg_text(v.args.first()?)?),
+        },
+        K::VarSetDefault | K::VarReset => None,
+        _ => return None,
+    };
+    Some(ZoneChange {
+        local: v.is_local,
+        zone,
+    })
+}
+
+/// The change of zone sql asks for, read from its text: the classifier the tree's
+/// is held to in ast/diff.rs, which goes with the other text classifiers.
+#[cfg(test)]
 pub(crate) fn zone_change_text(sql: &str) -> Option<ZoneChange> {
-    let text = trim_end_chars(sql.trim(), ";");
+    let text = overlite_core::text::trim_end_chars(sql.trim(), ";");
     let f = split_words(text);
     let mut i = 1;
     let head = f.first()?;
@@ -83,6 +105,7 @@ pub(crate) fn zone_change_text(sql: &str) -> Option<ZoneChange> {
 }
 
 /// The zone a SET names: a quoted or bare name, or DEFAULT and LOCAL for the default.
+#[cfg(test)]
 fn zone_value(words: &[&str]) -> Option<String> {
     let joined = words.join(" ");
     let v = joined.trim();
@@ -92,7 +115,7 @@ fn zone_value(words: &[&str]) -> Option<String> {
     if let Some(inner) = v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
         return Some(inner.replace("''", "'"));
     }
-    Some(unquote_ident(v))
+    Some(crate::session::utility::unquote_ident(v))
 }
 
 /// The zone the startup parameters ask for: TimeZone itself, or `-c TimeZone=x` in

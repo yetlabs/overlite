@@ -242,12 +242,15 @@ fn sql_execute_checks_privileges() {
     for (name, sql) in [
         ("q", "SELECT * FROM secret"),
         ("w", "INSERT INTO secret VALUES (2)"),
-        ("a", "ALTER TABLE secret ADD COLUMN y text"),
-        ("d", "DROP TABLE secret"),
     ] {
         must_exec(&alice, &format!("PREPARE {name} AS {sql}"));
         let err = alice.exec(&format!("EXECUTE {name}"), &[]).unwrap_err();
         assert_sqlstate(&err, "42501");
+    }
+    // Postgres prepares only what reads or writes rows: DDL is its syntax error.
+    for sql in ["ALTER TABLE secret ADD COLUMN y text", "DROP TABLE secret"] {
+        let err = alice.exec(&format!("PREPARE a AS {sql}"), &[]).unwrap_err();
+        assert_sqlstate(&err, "42601");
     }
     let n: i64 = admin.query_row("SELECT count(*) FROM secret", &[]).scan().unwrap();
     assert_eq!(n, 1);

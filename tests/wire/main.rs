@@ -74,6 +74,7 @@ mod fts;
 mod function_privileges;
 mod functiondef;
 mod functions;
+mod handler_trees;
 mod harness;
 mod hba;
 mod hstore;

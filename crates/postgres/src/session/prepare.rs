@@ -3,82 +3,114 @@
 //! pg_dump prepares a per-enum label query and executes it for each enum type).
 //! This is separate from the wire Extended-Query prepared statements.
 
-use crate::ddl::sequences::{is_ident_part, read_paren_args, split_top_level};
+use crate::ddl::tree;
 use crate::error::Error;
 use crate::error::Result;
-use crate::rewrite::distinct_on::index_top_level_word;
-use crate::rewrite::strings::end_of_string_literal;
-use crate::session::utility::{first_word_upper, log_query_error, unquote_ident};
+use crate::session::utility::log_query_error;
 use crate::session::{Session, quote_name};
 use overlite_core::SqlState;
-use overlite_core::text::{split_words, trim_start_chars};
+use overlite_core::text::end_of_string_literal;
+use pg_query::NodeEnum;
+
+/// PREPARE, EXECUTE or DEALLOCATE, read from the node; the texts are the client's:
+/// a prepared query after its AS, each argument of EXECUTE between its commas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SqlPrepare {
+    Prepare {
+        name: String,
+        query: String,
+    },
+    Execute {
+        name: String,
+        args: Vec<String>,
+    },
+    /// None for DEALLOCATE ALL.
+    Deallocate(Option<String>),
+    /// PREPARE TRANSACTION, which two-phase commit would need.
+    Transaction,
+}
+
+pub(crate) fn sql_prepare_plan(sql: &str, n: &NodeEnum) -> Option<SqlPrepare> {
+    let text = |t: &tree::Token| &sql[t.start..t.end];
+    match n {
+        NodeEnum::PrepareStmt(p) => {
+            let toks = tree::tokens(sql);
+            let at = toks
+                .iter()
+                .position(|t| t.depth == 0 && t.keyword && text(t).eq_ignore_ascii_case("as"))?;
+            let query = sql[toks.get(at + 1)?.start..].trim();
+            Some(SqlPrepare::Prepare {
+                name: p.name.clone(),
+                query: query.strip_suffix(';').unwrap_or(query).trim_end().to_string(),
+            })
+        }
+        NodeEnum::ExecuteStmt(e) => {
+            let mut args = Vec::new();
+            if !e.params.is_empty() {
+                let toks = tree::tokens(sql);
+                let open = toks.iter().position(|t| t.depth == 0 && text(t) == "(")?;
+                let mut start = toks[open].end;
+                for t in &toks[open + 1..] {
+                    if t.depth == 1 && text(t) == "," {
+                        args.push(sql[start..t.start].trim().to_string());
+                        start = t.end;
+                    } else if t.depth == 0 && text(t) == ")" {
+                        args.push(sql[start..t.start].trim().to_string());
+                        break;
+                    }
+                }
+            }
+            Some(SqlPrepare::Execute {
+                name: e.name.clone(),
+                args,
+            })
+        }
+        NodeEnum::DeallocateStmt(d) => Some(SqlPrepare::Deallocate((!d.isall).then(|| d.name.clone()))),
+        NodeEnum::TransactionStmt(_) => Some(SqlPrepare::Transaction),
+        _ => None,
+    }
+}
 
 impl Session {
     /// Handles PREPARE/EXECUTE/DEALLOCATE in the simple-query path; None when it
     /// did not recognize the statement.
     #[must_use = "the error inside is the answer to the statement"]
     pub(crate) fn try_sql_prepare(&mut self, sql: &str) -> Option<Result<()>> {
-        if !crate::ast::classify::read(sql, crate::ast::classify::sql_prepare).unwrap_or(true) {
+        if !crate::ast::classify::read(sql, crate::ast::classify::sql_prepare).unwrap_or(false) {
             return None;
         }
-        match first_word_upper(sql).as_str() {
-            "PREPARE" => Some(self.handle_prepare(sql)),
-            "EXECUTE" => Some(self.handle_execute_sql(sql)),
-            "DEALLOCATE" => {
-                let f = split_words(sql);
-                if let Some(word) = f.iter().skip(1).find(|w| !w.eq_ignore_ascii_case("prepare"))
-                    && !word.eq_ignore_ascii_case("all")
-                    && self.sql_prepared.remove(&unquote_ident(word)).is_none()
+        Some(match tree::read(sql, |n| sql_prepare_plan(sql, n))? {
+            SqlPrepare::Prepare { name, query } => {
+                self.sql_prepared.insert(name, query);
+                self.c.send_command_complete("PREPARE")
+            }
+            SqlPrepare::Execute { name, args } => self.handle_execute_sql(&name, &args),
+            SqlPrepare::Deallocate(name) => {
+                if let Some(name) = name
+                    && self.sql_prepared.remove(&name).is_none()
                 {
-                    let message = format!("prepared statement {} does not exist", quote_name(&unquote_ident(word)));
+                    let message = format!("prepared statement {} does not exist", quote_name(&name));
                     return Some(self.fail_send(&Error::with_state(SqlState::INVALID_SQL_STATEMENT_NAME, message)));
                 }
-                Some(self.c.send_command_complete("DEALLOCATE"))
+                self.c.send_command_complete("DEALLOCATE")
             }
-            _ => None,
-        }
-    }
-
-    /// Stores "PREPARE name [(types)] AS <query>".
-    fn handle_prepare(&mut self, sql: &str) -> Result<()> {
-        let rest = sql["prepare".len()..].trim();
-        let name = read_ident(rest);
-        if name.is_empty() {
-            return self.c.send_error(SqlState::SYNTAX_ERROR, "syntax error in PREPARE");
-        }
-        // The query begins after the top-level " AS " (any argument-type list is in
-        // parens, so the first depth-0 AS is the separator).
-        let Some(as_) = index_top_level_word(sql, "prepare".len(), "as") else {
-            return self.c.send_error(SqlState::SYNTAX_ERROR, "PREPARE requires AS <query>");
-        };
-        self.sql_prepared
-            .insert(name, sql[as_ + "as".len()..].trim().to_string());
-        self.c.send_command_complete("PREPARE")
+            SqlPrepare::Transaction => self.c.send_error(SqlState::SYNTAX_ERROR, "PREPARE requires AS <query>"),
+        })
     }
 
     /// Runs a prepared statement, substituting its $N parameters with the EXECUTE
     /// arguments.
-    fn handle_execute_sql(&mut self, sql: &str) -> Result<()> {
-        let rest = sql["execute".len()..].trim();
-        let name = read_ident(rest);
-        let query = match self.sql_prepared.get(&name) {
+    fn handle_execute_sql(&mut self, name: &str, args: &[String]) -> Result<()> {
+        let query = match self.sql_prepared.get(name) {
             Some(q) => q.clone(),
             None => {
                 return self.c.send_error(
                     SqlState::INVALID_SQL_STATEMENT_NAME,
-                    &("prepared statement ".to_string() + &quote_name(&name) + " does not exist"),
+                    &("prepared statement ".to_string() + &quote_name(name) + " does not exist"),
                 );
             }
         };
-        let mut args: Vec<String> = Vec::new();
-        if let Some(i) = rest.find('(')
-            && let Some((inner, _)) = read_paren_args(rest, i)
-        {
-            for a in split_top_level(&inner) {
-                args.push(a.trim().to_string());
-            }
-        }
-        let final_ = substitute_params(&query, &args);
+        let final_ = substitute_params(&query, args);
 
         if let Err(e) = self.check_privileges(&final_) {
             self.mark_tx_failed();
@@ -131,24 +163,4 @@ fn substitute_params(query: &str, args: &[String]) -> String {
         i += ch.len_utf8();
     }
     b
-}
-
-/// Reads a leading (optionally "quoted") identifier from s.
-fn read_ident(s: &str) -> String {
-    let s = trim_start_chars(s, " \t\r\n");
-    if s.is_empty() {
-        return String::new();
-    }
-    let b = s.as_bytes();
-    if b[0] == b'"' {
-        if let Some(j) = s[1..].find('"') {
-            return s[1..=j].to_string();
-        }
-        return String::new();
-    }
-    let mut j = 0;
-    while j < b.len() && is_ident_part(b[j]) {
-        j += 1;
-    }
-    s[..j].to_string()
 }
