@@ -51,7 +51,7 @@ const INTENDED: &[Intended] = &[
                     n.push(t);
                 }
             }
-            n.len() < without_parens(new).len() && without_parens(old) == n
+            n.len() < without_parens(new).len() && same_but_labels(&without_parens(old), &n)
         },
     ),
     (
@@ -63,11 +63,22 @@ const INTENDED: &[Intended] = &[
         },
     ),
     (
-        "label: an expression whose operand is a cast or a column is ?column? (FigureColname); the \
-         text path labeled it by its operand",
+        "label: FigureColname names an expression over a cast or a column ?column?, and a CASE case; \
+         the text path labeled it by its operand",
+        |old, new| same_but_labels(&without_parens(old), &without_parens(new)),
+    ),
+    (
+        "a LIKE's pattern is the whole expression: the text path cut a CASE at its first word",
         |old, new| {
-            let (o, n) = (without_parens(old), without_parens(new));
-            o.len() == n.len() && o.iter().zip(&n).all(|(o, n)| o == n || *n == "\"?column?\"")
+            let cut = |t: &[String]| {
+                t.windows(4).any(|w| {
+                    matches!(w[0].as_str(), "overlite_like_glob" | "overlite_ilike_pattern")
+                        && w[1] == "("
+                        && w[2] == "case"
+                        && w[3] == ","
+                })
+            };
+            cut(old) && !cut(new)
         },
     ),
     (
@@ -211,6 +222,15 @@ fn same_cast_types(mut t: Vec<String>) -> Vec<String> {
         }
     }
     t
+}
+
+/// Whether two token lists differ at most where the second has a label FigureColname
+/// gives and the text path did not: `?column?` or `case`.
+fn same_but_labels(o: &[&String], n: &[&String]) -> bool {
+    o.len() == n.len()
+        && o.iter()
+            .zip(n)
+            .all(|(o, n)| o == n || *n == "\"?column?\"" || *n == "case")
 }
 
 fn without_parens(t: &[String]) -> Vec<&String> {
