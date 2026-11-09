@@ -23,9 +23,11 @@ use std::rc::Rc;
 pub(crate) type Unsupported = &'static str;
 
 /// The refusals that depend on the catalog, not on the statement's shape: `%` whose
-/// operands' types are not known, and a boolean column that may hold text.
+/// operands' types are not known, a json operator over what is not known to be json,
+/// and a boolean column that may hold text.
 pub(crate) const TYPE_REFUSAL_OPERANDS: Unsupported = "% of operands of unknown type";
 pub(crate) const TYPE_REFUSAL_BOOLEAN: Unsupported = "boolean column holding text";
+pub(crate) const TYPE_REFUSAL_JSON: Unsupported = "json operator on what is not known to be json";
 
 type Out = Result<(), Unsupported>;
 
@@ -185,6 +187,7 @@ fn print(stmt: &NodeEnum, labels: Option<&[Option<String>]>, typer: Option<Typer
         typer,
         params: Vec::new(),
         in_form: false,
+        in_arrow: false,
     };
     match stmt {
         NodeEnum::SelectStmt(s) => e.select(s, true)?,
@@ -264,6 +267,8 @@ struct Emitter<'a> {
     /// Inside a numeric written in the form a numeric column has: nothing in it is
     /// written in it again.
     in_form: bool,
+    /// Inside a chain of `->`, whose outermost carries the JSONB collation.
+    in_arrow: bool,
     /// The outermost SELECT's list is still to come: an item whose type only Postgres
     /// knows (MIN, MAX, COALESCE, SUM of numerics, DATE_TRUNC, a scalar subquery...) is
     /// cast to it there, so that the protocol sends it as one.
@@ -1514,8 +1519,15 @@ impl Emitter<'_> {
                     return self.expr(r, Prec::Unary);
                 };
                 let l = node(l)?;
+                if matches!(op, "~" | "~*" | "!~" | "!~*") {
+                    return self.regex(op, l, r);
+                }
                 if self.typed() {
                     return self.typed_op(a, op, l, r);
+                }
+                // `%` is pg_trgm's on text: only the environment tells it from a remainder.
+                if op == "%" {
+                    return Err("operator");
                 }
                 let p = binary_prec(op).ok_or("operator")?;
                 self.expr(l, p)?;
@@ -1615,6 +1627,41 @@ impl Emitter<'_> {
         }
     }
 
+    /// The POSIX regular expression operators, as SQLite's REGEXP over the engine's
+    /// regexp(): `~*` and `!~*` with the pattern's `(?i)`, as rewrite_match_operators
+    /// writes them for the text passes.
+    fn regex(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+        self.note_param(l, Ty::TEXT);
+        self.note_param(r, Ty::TEXT);
+        let not = op.starts_with('!');
+        if not {
+            self.push("NOT (");
+        }
+        self.expr(l, Prec::Compare)?;
+        self.push(" REGEXP ");
+        if op.ends_with('*') {
+            match r {
+                NodeEnum::AConst(k) if matches!(k.val, Some(Val::Sval(_))) => {
+                    let Some(Val::Sval(p)) = &k.val else {
+                        return Err("pattern");
+                    };
+                    self.push(&quote_literal(&["(?i)", &p.sval].concat()));
+                }
+                _ => {
+                    self.push("('(?i)' || ");
+                    self.expr(r, Prec::Concat)?;
+                    self.push(")");
+                }
+            }
+        } else {
+            self.expr(r, Prec::Compare)?;
+        }
+        if not {
+            self.push(")");
+        }
+        Ok(())
+    }
+
     /// A binary operator with the environment: by its operands' types.
     fn typed_op(&mut self, a: &pb::AExpr, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
         match op {
@@ -1637,6 +1684,7 @@ impl Emitter<'_> {
                 self.push(" || ");
                 self.expr(r, Prec::Unary)
             }
+            "->" | "->>" | "#>" | "#>>" | "@>" | "<@" | "?" | "?|" | "?&" => self.json_op(a, op, l, r),
             "%" => {
                 // pg_trgm's similarity on text, a remainder on numbers: only the types tell.
                 let (tl, tr) = (self.ty(l), self.ty(r));
@@ -1657,6 +1705,86 @@ impl Emitter<'_> {
                 Err(TYPE_REFUSAL_OPERANDS)
             }
             _ => Err("operator"),
+        }
+    }
+
+    /// The json and jsonb operators, where the environment knows the left side is one
+    /// (hstore has `->` and `?` too, arrays and ranges `@>`), as the text passes write
+    /// them: `->` SQLite's, a chain of them in the JSONB collation, which compares and
+    /// sorts jsonb as jsonb; `->>` SQLite's, made to give text by the engine; `#>` and
+    /// `#>>` overlite_jsonb_path; `@>` and `<@` json_contains; `?`, `?|` and `?&`
+    /// jsonb_exists, jsonb_exists_any and jsonb_exists_all.
+    fn json_op(&mut self, a: &pb::AExpr, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+        let tl = self.ty(l);
+        if !(tl.is(Base::Jsonb) || tl.is(Base::Json)) {
+            return Err(TYPE_REFUSAL_JSON);
+        }
+        match op {
+            "->" | "->>" => {
+                self.note_param(r, Ty::TEXT);
+                // The outermost `->` of a chain carries the collation; a `->>` ends one.
+                let chained =
+                    |n: &NodeEnum| matches!(n, NodeEnum::AExpr(x) if op_name(x) == Some("->") && x.lexpr.is_some());
+                let top = op == "->" && !self.in_arrow;
+                if top {
+                    self.push("(");
+                }
+                let inner = std::mem::replace(&mut self.in_arrow, op == "->");
+                let r1 = if chained(l) && op == "->" {
+                    self.expr(l, Prec::Concat)
+                } else {
+                    let was = std::mem::replace(&mut self.in_arrow, false);
+                    let r = self.expr(l, Prec::Concat);
+                    self.in_arrow = was;
+                    r
+                };
+                self.in_arrow = inner;
+                r1?;
+                self.push(if op == "->" { " -> " } else { " ->> " });
+                let was = std::mem::replace(&mut self.in_arrow, false);
+                let r2 = self.expr(r, Prec::Unary);
+                self.in_arrow = was;
+                r2?;
+                if top {
+                    self.push(") COLLATE JSONB");
+                }
+                let _ = a;
+                Ok(())
+            }
+            "#>" | "#>>" => {
+                let jsonb = op == "#>";
+                if jsonb {
+                    self.push("(");
+                }
+                self.push("overlite_jsonb_path(");
+                self.expr(l, Prec::Or)?;
+                self.push(", ");
+                self.expr(r, Prec::Or)?;
+                self.push(if jsonb { ", 0) COLLATE JSONB)" } else { ", 1)" });
+                Ok(())
+            }
+            "@>" | "<@" => {
+                let (container, contained) = if op == "@>" { (l, r) } else { (r, l) };
+                self.push("json_contains(");
+                self.expr(container, Prec::Or)?;
+                self.push(", ");
+                self.expr(contained, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
+            _ => {
+                self.note_param(r, Ty::TEXT);
+                self.push(match op {
+                    "?|" => "jsonb_exists_any(",
+                    "?&" => "jsonb_exists_all(",
+                    _ => "jsonb_exists(",
+                });
+                self.expr(l, Prec::Or)?;
+                self.push(", ");
+                self.expr(r, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
         }
     }
 
@@ -1925,6 +2053,40 @@ impl Emitter<'_> {
             [n] => string(n)?,
             _ => return Err("qualified function"),
         };
+        if self.typed() && f.args.is_empty() && f.over.is_none() && f.agg_filter.is_none() {
+            // The clock, as rewrite_now writes it: the transaction's start, or the
+            // statement's, or the clock as it is read.
+            let clock = match name {
+                "now" | "transaction_timestamp" => Some("overlite_now(julianday('now'))"),
+                "statement_timestamp" => Some("overlite_now(julianday('now'), 'statement')"),
+                "clock_timestamp" => Some("overlite_clock_timestamp()"),
+                _ => None,
+            };
+            if let Some(c) = clock {
+                self.push(c);
+                return Ok(());
+            }
+        }
+        if self.typed()
+            && name == "date_part"
+            && let [field, x] = f.args.as_slice()
+            && f.over.is_none()
+        {
+            // date_part of a timestamptz reads its wall clock in the session's zone.
+            let (field, x) = (node(field)?, node(x)?);
+            self.push("date_part(");
+            self.expr(field, Prec::Or)?;
+            self.push(", ");
+            if self.ty(x).is(Base::Timestamptz) {
+                self.push("overlite_tz_wall(");
+                self.expr(x, Prec::Or)?;
+                self.push(")");
+            } else {
+                self.expr(x, Prec::Or)?;
+            }
+            self.push(")");
+            return Ok(());
+        }
         if !PLAIN_FUNCTIONS.contains(&name) && !name.starts_with("overlite_") {
             return Err("function");
         }
@@ -2178,9 +2340,9 @@ fn binary_prec(op: &str) -> Option<Prec> {
         "=" | "<>" | "!=" => Prec::Equality,
         "<" | ">" | "<=" | ">=" => Prec::Compare,
         "+" | "-" => Prec::Add,
-        // `%` is not here: on text it is pg_trgm's similarity, which only the
-        // operand's type tells from a remainder.
-        "*" | "/" => Prec::Mul,
+        // `%` is a remainder only where the environment says so: on text it is pg_trgm's
+        // similarity, a call (`typed_op`), and without the environment it is refused.
+        "*" | "/" | "%" => Prec::Mul,
         "||" => Prec::Concat,
         _ => return None,
     })
@@ -2209,6 +2371,10 @@ fn prec(n: &NodeEnum) -> Prec {
             match K::try_from(a.kind) {
                 Ok(K::AexprOp) => match (&a.lexpr, a.name.as_slice()) {
                     (None, _) => Prec::Unary,
+                    (Some(_), [op]) if matches!(string(op), Ok("~" | "~*")) => Prec::Equality,
+                    (Some(_), [op]) if matches!(string(op), Ok("!~" | "!~*")) => Prec::Not,
+                    // SQLite binds -> and ->> as tightly as ||.
+                    (Some(_), [op]) if matches!(string(op), Ok("->" | "->>")) => Prec::Concat,
                     (Some(_), [op]) => string(op).ok().and_then(binary_prec).unwrap_or(Prec::Atom),
                     _ => Prec::Atom,
                 },

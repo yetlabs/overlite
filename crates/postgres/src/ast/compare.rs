@@ -534,18 +534,27 @@ type Intended = (&'static str, fn(&[String], &[String]) -> bool);
 
 const INTENDED: &[Intended] = &[
     (
+        "a regular expression operator is REGEXP whatever its operands: over the corpus' text of two Django \
+         statements (a cast on the left, a subquery on the right) rewrite_full left the `~` as it was",
+        |old, new| old.iter().any(|t| t == "~") && !new.iter().any(|t| t == "~") && new.iter().any(|t| t == "regexp"),
+    ),
+    (
         "jsonb compares as jsonb however its name is spelled: the text path gave `::jsonb` its \
          COLLATE JSONB and not `::JSONB`",
         |old, new| {
-            let mut n: Vec<&String> = Vec::new();
-            for t in without_parens(new) {
-                if t == "jsonb" && n.last().is_some_and(|l| *l == "collate") {
-                    n.pop();
-                } else {
-                    n.push(t);
+            fn strip(t: &[String]) -> Vec<&String> {
+                let mut n: Vec<&String> = Vec::new();
+                for t in without_parens(t) {
+                    if t == "jsonb" && n.last().is_some_and(|l| *l == "collate") {
+                        n.pop();
+                    } else {
+                        n.push(t);
+                    }
                 }
+                n
             }
-            n.len() < without_parens(new).len() && same_but_labels(&without_parens(old), &n)
+            let n = strip(new);
+            n.len() < without_parens(new).len() && same_but_labels(&strip(old), &n)
         },
     ),
     (

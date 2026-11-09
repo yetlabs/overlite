@@ -187,3 +187,13 @@ fn an_integer_goes_out_at_its_width() {
         assert_eq!(described, want, "{sql} described");
     }
 }
+
+// date_part of a timestamptz reads its wall clock in the session's zone, as EXTRACT
+// does: the engine's pass knew EXTRACT and DATE_TRUNC only, so date_part read UTC.
+#[test]
+fn date_part_of_a_timestamptz_is_in_the_session_zone() {
+    let conn = connect(&start_server());
+    dt(&conn);
+    must_exec(&conn, "SET TIME ZONE 'Asia/Tokyo'");
+    assert_eq!(col(&conn, "SELECT date_part('hour', tz) FROM dt"), ["9"]);
+}

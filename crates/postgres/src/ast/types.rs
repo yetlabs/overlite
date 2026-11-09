@@ -793,8 +793,8 @@ impl Typer {
                         Ty::BOOL
                     }
                     "+" | "-" | "*" | "/" | "%" | "||" => arithmetic(op, l, r),
-                    "->" if l.is(Base::Jsonb) || l.is(Base::Json) => l,
-                    "->>" => Ty::TEXT,
+                    "->" | "#>" if l.is(Base::Jsonb) || l.is(Base::Json) => l,
+                    "->>" | "#>>" if l.is(Base::Jsonb) || l.is(Base::Json) => Ty::TEXT,
                     _ => Ty::ANY,
                 }
             }
@@ -891,7 +891,9 @@ impl Typer {
                 Base::Timestamptz | Base::Unknown | Base::Any => Ty::of(Base::Timestamp),
                 _ => Ty::ANY,
             },
-            "extract" | "date_part" => Ty::of(Base::Numeric),
+            // EXTRACT is a numeric since Postgres 14; date_part a double.
+            "extract" => Ty::of(Base::Numeric),
+            "date_part" => Ty::of(Base::Float8),
             "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => Ty::of(Base::Timestamptz),
             _ => Ty::ANY,
         }
