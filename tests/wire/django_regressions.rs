@@ -265,3 +265,58 @@ fn avg_over_nothing_is_null() {
         ["1|1.00000000000000000000", "2|2.0000000000000000", "NULL|NULL"]
     );
 }
+
+// -9223372036854775808, which the grammar leaves as text past int4, was written as a
+// numeric negated, and SQLite made it a double: a bigint column read it back as a
+// float8, and a bigserial key refused it as a datatype mismatch. A long number in a
+// statement the fast path took went to SQLite as a double too.
+#[test]
+fn the_smallest_bigint_is_a_bigint() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE TABLE bi (id bigserial PRIMARY KEY, v bigint)");
+    must_exec(&conn, "CREATE TABLE bs (v bigserial PRIMARY KEY)");
+    let (oids, cells) = texts(&conn, "INSERT INTO bi (v) VALUES (-9223372036854775808) RETURNING v");
+    assert_eq!(
+        (oids, cells),
+        (vec![20], vec![vec!["-9223372036854775808".to_string()]])
+    );
+    assert_eq!(
+        rows(&conn, "INSERT INTO bs (v) VALUES (-9223372036854775808) RETURNING v"),
+        ["-9223372036854775808"]
+    );
+    for w in ["v = -9223372036854775808", "v <= -9223372036854775808"] {
+        let (oids, cells) = texts(&conn, &format!("SELECT v FROM bi WHERE {w}"));
+        assert_eq!(
+            (oids, cells),
+            (vec![20], vec![vec!["-9223372036854775808".to_string()]])
+        );
+    }
+    assert_eq!(
+        rows(&conn, "SELECT v FROM bs WHERE v = -9223372036854775808"),
+        ["-9223372036854775808"]
+    );
+    let (oids, cells) = texts(
+        &conn,
+        "SELECT -9223372036854775808, 9223372036854775807, 9223372036854775808, -9223372036854775809",
+    );
+    assert_eq!(oids, [20, 20, 1700, 1700]);
+    assert_eq!(
+        cells,
+        [[
+            "-9223372036854775808",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775809"
+        ]]
+    );
+    must_exec(&conn, "CREATE TABLE nu (n numeric)");
+    must_exec(
+        &conn,
+        "INSERT INTO nu VALUES (-9223372036854775809), (0.12345678901234567890)",
+    );
+    assert_eq!(
+        rows(&conn, "SELECT n FROM nu WHERE n < 1 ORDER BY n"),
+        ["-9223372036854775809", "0.12345678901234567890"]
+    );
+}

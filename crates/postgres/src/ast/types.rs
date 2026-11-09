@@ -1238,7 +1238,7 @@ pub(crate) fn const_ty(k: &pb::AConst) -> Ty {
         Some(Val::Fval(f)) => {
             let digits = f.fval.trim_start_matches('-');
             if digits.bytes().all(|c| c.is_ascii_digit()) {
-                if digits.parse::<i64>().is_ok() {
+                if f.fval.parse::<i64>().is_ok() {
                     Ty::of(Base::Int8)
                 } else {
                     Ty::of(Base::Numeric)

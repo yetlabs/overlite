@@ -7,6 +7,28 @@ use std::sync::LazyLock;
 /// The longest word recognized; longer ones take the full rewrite.
 const MAX_WORD: usize = 32;
 
+/// Whether a number's text is one the printer writes as a numeric, which SQLite would
+/// read as a double: more significant digits than a double keeps, or, without a point,
+/// past a bigint.
+fn long_number(n: &str) -> bool {
+    if n.len() <= 16 {
+        return false;
+    }
+    let digits = || n.bytes().filter(u8::is_ascii_digit);
+    let lead = digits().take_while(|c| *c == b'0').count();
+    let trail = if n.contains('.') {
+        digits().rev().take_while(|c| *c == b'0').count()
+    } else {
+        0
+    };
+    let significant = digits().count().saturating_sub(lead + trail);
+    if n.contains('.') {
+        significant > 15
+    } else {
+        significant > 18 && n.parse::<i64>().is_err()
+    }
+}
+
 /// needs_no_rewrite reports whether sql is certain to come out of the printer
 /// (crate::ast::emit) as it is, in one allocation-free pass, but for its mark and the
 /// types of the columns it names, which `TableTypes::typed_differs` reads: the
@@ -49,7 +71,18 @@ pub fn needs_no_rewrite(sql: &str) -> bool {
                 Some(end) => i = end,
                 None => return false,
             },
-            b'0'..=b'9' => i += 1,
+            b'0'..=b'9' => {
+                // A number the printer writes otherwise: a numeric with more digits
+                // than a double keeps, an integer past a bigint.
+                let end = b[i..]
+                    .iter()
+                    .position(|c| !(c.is_ascii_digit() || *c == b'.'))
+                    .map_or(b.len(), |n| i + n);
+                if long_number(&sql[i..end]) {
+                    return false;
+                }
+                i = end;
+            }
             b'$' => {
                 // A name before a parameter is a type the value is read as.
                 if prev.is_some_and(|w| !is_plain_before_literal(std::str::from_utf8(&w[..last_len]).unwrap_or(""))) {

@@ -2876,15 +2876,14 @@ impl<'a> Emitter<'a> {
         }
         match k.val.as_ref().ok_or("constant")? {
             Val::Ival(i) => self.push(&i.ival.to_string()),
+            // An integer past int4 the grammar leaves as text is a bigint where it
+            // fits one, -9223372036854775808 included, which SQLite reads as one too.
+            Val::Fval(f) if f.fval.parse::<i64>().is_ok() => self.push(&f.fval),
             // A number with more digits than a double keeps is a numeric's text.
+            // Its sign inside, so that the item stays a numeric.
             Val::Fval(f) if self.typed() && is_long_number(&f.fval) => {
-                let (sign, digits) = match f.fval.strip_prefix('-') {
-                    Some(d) => ("-", d),
-                    None => ("", f.fval.as_str()),
-                };
-                self.push(sign);
                 self.push("(CAST(overlite_numeric(");
-                self.push(&quote_literal(digits));
+                self.push(&quote_literal(&f.fval));
                 self.push(") AS DECIMALTEXT) COLLATE DECIMAL)");
             }
             Val::Fval(f) => self.push(&f.fval),
