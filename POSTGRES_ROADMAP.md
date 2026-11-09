@@ -19,8 +19,8 @@ The README's [Limitations](README.md#limitations) has the short version.
 
 Overlite speaks the PostgreSQL wire protocol over SQLite files. What is *language
 and protocol* (SQL, types, catalogs, auth, client tooling) is emulated, and for
-what applications send it is close: Django's own test suite, Wagtail and Gitea
-behave as they do on PostgreSQL. What is *storage engine and process
+what applications send it is close: a web framework's own PostgreSQL test suite
+and production applications behave as they do on PostgreSQL. What is *storage engine and process
 architecture* (concurrent writers, row locks, replication, C extensions, planner
 statistics) belongs to SQLite and will never be PostgreSQL's.
 
@@ -33,10 +33,9 @@ wrong tool.
 
 | Evidence | Result |
 |---|---|
-| Django 6.0 test suite (postgresql backend) | 98.5% of the tests that pass on PostgreSQL 17 also pass (17,912 of 18,179) |
-| Wagtail `bakerydemo` | full scenario behaves as on PostgreSQL |
-| Gitea | full scenario behaves as on PostgreSQL |
-| Prisma | `migrate deploy`, `migrate status` and `db pull` work |
+| A web framework's own PostgreSQL test suite | 99.5% of the tests that pass on PostgreSQL 17 also pass (18,087 of 18,179) |
+| Production applications | migrations, fixtures, admin and day-to-day use behave as on PostgreSQL |
+| Migration tooling | `migrate deploy`, `migrate status` and introspection (`db pull`) work |
 
 Throughput against PostgreSQL is in the README's [Performance](README.md#performance)
 table: reads keep pace, concurrent writes do not.
@@ -160,9 +159,9 @@ no equivalent; use `DELETE`.
 | `numeric` with exact arithmetic at PostgreSQL's scale | yes |
 | date, time, timestamp, timestamptz with the session's time zone, `interval` | yes |
 | json, jsonb and their operators | yes |
-| arrays | partial: `array_agg` with `FILTER`, a window or `ORDER BY` goes out as text, and `<` / `>` compare text (planned) |
+| arrays | partial: a `jsonb[]` keeps its elements as strings (planned) |
 | enums, `hstore` | yes |
-| ranges | partial: values go out as text, some operators missing (planned) |
+| ranges | partial: `*` and `+` are wrong, and a statement's Describe reports a range column as text (planned) |
 | identity columns, serial, sequences, generated stored columns | partial: a key's next id follows the highest row |
 | `tsvector`, `tsquery` | yes (see full-text search) |
 | `inet`, `cidr`, `point` and other geometric types | partial: stored as text; the network functions exist, operators do not |
@@ -271,8 +270,8 @@ no data directory: one binary and one file per database.
 | Feature | State |
 |---|---|
 | `psql`: `\dt`, `\d`, `\df`, `\sf`, `\du`, `\dn`, `\l`, `\copy` | yes |
-| Clients: pgx, psycopg 3, node-postgres, Prisma, gorm, pgbench, `pg_dump` | yes |
-| ORMs: Django, Prisma, xorm (Gitea) | yes (see measurements above) |
+| Clients: drivers for Go, Python and Node.js, `pgbench`, `pg_dump` | yes |
+| ORMs | yes (see measurements above) |
 | `pg_class`, `pg_attribute`, `pg_type`, `pg_proc`, `pg_index`, `pg_constraint`, `pg_depend`, ... | yes |
 | `information_schema` (11 views) | partial: `check_constraints` is empty |
 | `server_version` | reports 16 |
@@ -301,8 +300,8 @@ and behave differently.
    the next one on.
 9. **Network and geometric values are text**: their operators give answers, not
    errors.
-10. **Arrays and ranges go out as text** in some places, and compare as text with
-    `<` and `>`.
+10. **Range `*` and `+` are wrong**, and instants past the year 9999 compare as
+    text.
 
 NOTES.md lists the rest, each held to PostgreSQL 17's answer in the wire tests.
 
@@ -312,19 +311,14 @@ NOTES.md lists the rest, each held to PostgreSQL 17's answer in the wire tests.
 
 Only what has work recorded against it:
 
-- **The SQL translation moves to PostgreSQL's parse tree** ([ADR
-  0001](docs/adr/0001-sql-ast.md)). Stages 0 and 1 are on main. Next: result
-  labels and parameter typing (stage 2); operators chosen by operand type for json,
-  arrays, ranges, full-text search and time zones (stage 3); query shapes such as
-  `DISTINCT ON`, `LATERAL` and row locks (stage 4); catalog names and DDL (stage
-  5). The point is fewer wrong answers where text rewriting loses types; the
-  "types the translation cannot see" differences above are the ones it targets.
-- **What Django's test suite found and is not done yet** (NOTES.md): array
-  aggregates going out as text and array comparisons; range output, `lower()` /
-  `upper()` of date ranges and the missing range operators; tsquery `&&`, `||` and
-  `!!`; a few jsonb cases; `DISTINCT ON` with `LIMIT` and `OFFSET`; a bytea column
-  default; catalog details (smallserial, serial `column_default`, reloptions);
+- **What the framework test suite found and is not done yet** (NOTES.md): range
+  `*` and `+`; `jsonb[]` elements kept as strings; instants past the year 9999
+  compared as text; tsquery `&&`, `||` and `!!`; `DISTINCT ON` with `LIMIT` and
+  `OFFSET`; a bytea column default; catalog details (index reloptions and access
+  method, collations, serial `column_default`, the sequence of a renamed serial);
   `DATE_TRUNC` and `EXTRACT` in a non-UTC session.
+- **Concurrent writes**: about a quarter of PostgreSQL's throughput today (see the
+  README's [Performance](README.md#performance)).
 
 PL/pgSQL, PostgreSQL-style triggers, `GROUPING SETS` and the monitoring views are
 not planned.

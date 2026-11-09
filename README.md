@@ -4,7 +4,7 @@
 
 [![ci](https://github.com/yetlabs/overlite/actions/workflows/ci.yml/badge.svg)](https://github.com/yetlabs/overlite/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/yetlabs/overlite?label=release)](https://github.com/yetlabs/overlite/releases/latest)
-[![docker](https://img.shields.io/docker/v/yetlabs/overlite?label=docker&sort=semver)](https://hub.docker.com/r/yetlabs/overlite)
+[![image](https://img.shields.io/badge/image-ghcr.io%2Fyetlabs%2Foverlite-blue)](https://github.com/yetlabs/overlite/pkgs/container/overlite)
 
 **Speak PostgreSQL, store SQLite.** Overlite is a lightweight server that talks
 the PostgreSQL wire protocol on the front and keeps all your data in a single
@@ -46,21 +46,17 @@ SQLite opened directly. Concurrent writes are where it stays behind both.
 
 ## Compatibility
 
-Overlite is a Rust server. It is tested end to end with real clients and real
-applications, and held to PostgreSQL 17's answers rather than to SQLite's.
+Overlite is a Rust server for Linux, macOS and Windows. It is tested end to end
+with real clients and real applications, and held to PostgreSQL 17's answers
+rather than to SQLite's. SQL is translated from PostgreSQL's own parse tree
+([ADR 0001](docs/adr/0001-sql-ast.md)).
 
 | Evidence | Result |
 |---|---|
-| ✅ Django 6.0 test suite (postgresql backend) | 98.5% of the tests that pass on PostgreSQL 17 also pass (17,912 of 18,179) |
-| ✅ Wagtail `bakerydemo` | 255 migrations, fixtures, admin edit/publish/revert, dump and reload: same as PostgreSQL |
-| ✅ Gitea | install, users, orgs, repos, push, issues, pull requests with review and merge, releases, wiki, search, repository deletion: same as PostgreSQL |
-| ✅ Prisma | `migrate deploy`, `migrate status`, `db pull` |
-| ✅ Clients | `psql`, `pg_dump`, pgx, psycopg 3, node-postgres, Prisma, gorm, pgbench |
-| ✅ This repository | about 530 wire tests that drive the real binary as a client, plus unit tests and a differential test of the SQL translation |
-
-SQL is being moved from text rewriting to a translation from PostgreSQL's own
-parse tree ([ADR 0001](docs/adr/0001-sql-ast.md)); both routes run side by side
-until the move is done.
+| ✅ A web framework's own PostgreSQL test suite | 99.5% of the tests that pass on PostgreSQL 17 also pass (18,087 of 18,179) |
+| ✅ Production applications | migrations, fixtures, admin and day-to-day use, dump and reload: same answers as PostgreSQL |
+| ✅ Clients | `psql`, `pg_dump`, `pgbench`, and drivers for Go, Python and Node.js, text and binary formats |
+| ✅ This repository | over 600 wire tests that drive the real binary as a client, plus unit tests and a snapshot of the SQL translation |
 
 ## Limitations
 
@@ -70,14 +66,13 @@ meet:
 
 ### Answers that differ without an error
 
-- 🟡 **Arrays**: `ARRAY_AGG` with `FILTER`, a window or `ORDER BY` goes out as text,
-  and `<`/`>` between arrays compare their text.
-- 🟡 **Ranges**: a range value goes out as text, and `lower()`/`upper()` of date and
-  timestamp ranges are text.
 - 🟡 **Types the translation cannot see**: an expression whose type is not known
   (a function it does not know, some subqueries) compares by SQLite's rules, e.g. a
-  date against a timestamp column, or a numeric out of an unknown function against
-  a number.
+  numeric out of an unknown function against a number.
+- 🟡 **Ranges**: `*` and `+` between ranges are wrong; a range column is described
+  as `text` before the statement runs (its rows go out as the range type).
+- 🟡 **Arrays**: a `jsonb[]` keeps its elements as strings.
+- 🟡 **Timestamps past the year 9999** compare as text, before every earlier year.
 - 🟡 **Identity and serial keys** are SQLite rowids: the next id follows the highest
   row, even one inserted with an explicit id.
 - 🟡 **Transactions**: a transaction reads like READ COMMITTED until it first writes;
@@ -91,15 +86,15 @@ meet:
   can hold a value of another type (`'abc'` in an integer column).
 - 🟡 `CREATE INDEX ... USING gin|gist|brin` makes a btree index; the method is only
   reported.
+- 🟡 SQLite-syntax triggers (`CREATE TRIGGER ... BEGIN ... END`) run as written; the
+  rest of SQLite's own syntax (`AUTOINCREMENT`, `EXPLAIN QUERY PLAN`, `LIMIT a, b`,
+  `PRAGMA`, `INSERT OR ...`) is refused with PostgreSQL's syntax error.
 
 ### Not implemented
 
 - ⬜ **PL/pgSQL**: `CREATE FUNCTION ... LANGUAGE plpgsql` is accepted but calling it
   fails, and a PostgreSQL-style `CREATE TRIGGER ... EXECUTE FUNCTION` is refused
-  (`LANGUAGE sql` functions and SQLite-syntax triggers work).
-- 🟡 **SQLite's own syntax** is refused with PostgreSQL's syntax error
-  (`AUTOINCREMENT`, `EXPLAIN QUERY PLAN`, `LIMIT a, b`, `PRAGMA`, `INSERT OR ...`);
-  SQLite-syntax triggers (`CREATE TRIGGER ... BEGIN ... END`) are the exception.
+  (`LANGUAGE sql` functions work).
 - ⬜ **Deferred `UNIQUE`** constraints are checked at each statement (deferred foreign
   keys are checked at commit).
 - ⬜ **Composite and geometric types**, planner statistics, `ts_headline`, table
@@ -107,7 +102,8 @@ meet:
 
 ### Reported differently
 
-- 🟡 Integer columns go out as `int8` whatever their width.
+- 🟡 A key column written `INTEGER PRIMARY KEY` goes out as `int8` (other integer
+  columns keep their width).
 - 🟡 `EXPLAIN` gives SQLite's plan in PostgreSQL's shape, with all costs at 0.
 - 🟡 Error codes are PostgreSQL's; the text of errors that come from SQLite is SQLite's
   (a syntax error is PostgreSQL's own, with its position).
@@ -128,7 +124,7 @@ psql "postgresql://postgres@localhost:5432/postgres?sslmode=disable"
 ### Docker
 
 ```sh
-$ docker run --rm -p 5432:5432 -v "$(pwd)/data:/data" yetlabs/overlite postgres.db
+$ docker run --rm -p 5432:5432 -v "$(pwd)/data:/data" ghcr.io/yetlabs/overlite postgres.db
 ```
 
 Mount the **directory**, not the file. SQLite writes recent commits to
@@ -147,7 +143,7 @@ mount for SELinux to allow writing to it.
 ```yaml
 services:
   overlite:
-    image: yetlabs/overlite
+    image: ghcr.io/yetlabs/overlite
     command: postgres.db
     ports:
       - "5432:5432"
