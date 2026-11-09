@@ -1414,6 +1414,14 @@ impl<'a> Emitter<'a> {
             return None;
         }
         let ty = self.ty(val);
+        if let NodeEnum::FuncCall(f) = val
+            && matches!(func_name(f), Some("sum" | "avg"))
+            && ty.is(Base::Float8)
+        {
+            // A double's sum and average, typed as one over no rows too, where nothing
+            // is left to sample.
+            return Some((ty, "float8"));
+        }
         let name = ty.cast_name()?;
         if let NodeEnum::FuncCall(f) = val {
             match func_name(f) {
@@ -4455,7 +4463,8 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         // avg of integers is a numeric, Postgres' sum divided by the count at its
-        // scale, where SQLite's is a double.
+        // scale, where SQLite's is a double; NULL over no rows or only NULLs, where
+        // the count is 0.
         if name == "avg"
             && self.typed()
             && let [x] = args.as_slice()
@@ -4468,12 +4477,12 @@ impl<'a> Emitter<'a> {
             self.expr(x, Prec::Or)?;
             self.push(")");
             self.call_clauses(f)?;
-            self.push(", count(");
+            self.push(", nullif(count(");
             self.push(distinct);
             self.expr(x, Prec::Or)?;
             self.push(")");
             self.call_clauses(f)?;
-            self.push(", '/'), 'numeric')");
+            self.push(", 0), '/'), 'numeric')");
             return Ok(());
         }
         // array_agg is the JSON array an array is stored as (NULL over no rows, as

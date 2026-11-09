@@ -226,3 +226,42 @@ fn a_timestamp_meets_a_timestamptz_in_the_session_zone() {
         ["a"]
     );
 }
+
+// avg of integers over no rows, or only NULLs, divided by a count of 0: division by
+// zero where Postgres answers NULL. avg and sum of a double went out as text then.
+#[test]
+fn avg_over_nothing_is_null() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(
+        &conn,
+        "CREATE TABLE av (x int, s smallint, b bigint, f float8, r real, n numeric)",
+    );
+    let q = "SELECT avg(x), avg(s), avg(b), avg(f), avg(r), avg(n), sum(f) FROM av";
+    let all_null = ["NULL|NULL|NULL|NULL|NULL|NULL|NULL"];
+    let oids = [1700, 1700, 1700, 701, 701, 1700, 701];
+    assert_eq!(texts(&conn, q).0, oids);
+    assert_eq!(rows(&conn, q), all_null);
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT coalesce(avg(x), 0.5), avg(DISTINCT x) FROM av WHERE x > 100"
+        ),
+        ["0.5|NULL"]
+    );
+    must_exec(&conn, "INSERT INTO av VALUES (NULL, NULL, NULL, NULL, NULL, NULL)");
+    assert_eq!(rows(&conn, q), all_null);
+    must_exec(
+        &conn,
+        "INSERT INTO av VALUES (1, 1, 1, 1.5, 1.5, 2.5), (2, 2, 2, 2, 2, 3)",
+    );
+    assert_eq!(texts(&conn, q).0, oids);
+    assert_eq!(
+        rows(&conn, q),
+        ["1.5000000000000000|1.5000000000000000|1.5000000000000000|1.75|1.75|2.7500000000000000|3.5"]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT x, avg(x) FROM av GROUP BY x ORDER BY x"),
+        ["1|1.00000000000000000000", "2|2.0000000000000000", "NULL|NULL"]
+    );
+}
