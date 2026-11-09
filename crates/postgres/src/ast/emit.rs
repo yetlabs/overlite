@@ -186,26 +186,33 @@ pub(crate) fn typed(
     print(stmt, labels, Some(Typer::new(ctx)))
 }
 
+/// An expression of a DDL statement (a DEFAULT, a CHECK, a generated column's, an
+/// index's key or WHERE), as SQLite reads it: untyped, as the engine's type passes
+/// finish a DDL statement's text. In a table's DDL (table_ddl), a cast is SQLite's own
+/// CAST and a cast of a literal the value it makes (`Emitter::table_ddl_cast`).
+pub(crate) fn expression(n: &NodeEnum, table_ddl: bool) -> Result<String, Unsupported> {
+    thread_local! {
+        // No table is known to a DDL statement's expressions: what their operands are
+        // is read as the text passes read what the catalog does not know.
+        static EMPTY: Rc<Context> = Rc::new(Context::new(
+            std::sync::Arc::new(overlite_engine::TableTypes::of(&[])),
+            None,
+        ));
+    }
+    let typer = EMPTY.with(|c| Typer::new(Rc::clone(c)));
+    let mut e = Emitter::new(None, Some(typer), false);
+    e.ddl = true;
+    e.table_ddl = table_ddl;
+    e.expr(n, Prec::Or)?;
+    if e.typer.as_ref().is_some_and(|t| t.mixed) {
+        return Err(TYPE_REFUSAL_BOOLEAN);
+    }
+    Ok(e.out)
+}
+
 fn print(stmt: &NodeEnum, labels: Option<&[Option<String>]>, typer: Option<Typer>) -> Result<Printed, Unsupported> {
-    let typed = typer.is_some();
-    let mut e = Emitter {
-        out: String::with_capacity(128),
-        labels,
-        item_casts: typed && matches!(stmt, NodeEnum::SelectStmt(s) if s.with_clause.is_none()),
-        typer,
-        params: Vec::new(),
-        in_form: false,
-        in_arrow: false,
-        renames: Vec::new(),
-        froms: Vec::new(),
-        cte_names: Vec::new(),
-        ctid_output: false,
-        srfs: 0,
-        list_srfs: Vec::new(),
-        srf_aliases: Vec::new(),
-        aliases: 0,
-        returning_table: None,
-    };
+    let item_casts = typer.is_some() && matches!(stmt, NodeEnum::SelectStmt(s) if s.with_clause.is_none());
+    let mut e = Emitter::new(labels, typer, item_casts);
     match stmt {
         NodeEnum::SelectStmt(s) => e.select(s, true)?,
         NodeEnum::InsertStmt(s) => e.insert(s)?,
@@ -316,6 +323,14 @@ struct Emitter<'a> {
     /// The alias of a written table and its name, which RETURNING reads it by: SQLite's
     /// RETURNING names the table alone.
     returning_table: Option<(String, String)>,
+    /// Writing an expression of a table's DDL, which SQLite keeps in the file's
+    /// schema: a cast there is SQLite's CAST (`table_ddl_cast`).
+    table_ddl: bool,
+    /// Writing an expression of a DDL statement, which SQLite runs without the
+    /// session (a default, a check, an index's key): the clock is SQLite's own
+    /// `datetime('now')` and CURRENT_TIMESTAMP its keyword, as the text passes wrote
+    /// them and the catalog reads them back.
+    ddl: bool,
 }
 
 fn node(n: &pb::Node) -> Result<&NodeEnum, Unsupported> {
@@ -557,7 +572,30 @@ fn is_reserved(w: &str) -> bool {
     WORDS.contains(&w)
 }
 
-impl Emitter<'_> {
+impl<'a> Emitter<'a> {
+    fn new(labels: Option<&'a [Option<String>]>, typer: Option<Typer>, item_casts: bool) -> Self {
+        Emitter {
+            out: String::with_capacity(128),
+            labels,
+            item_casts,
+            typer,
+            params: Vec::new(),
+            in_form: false,
+            in_arrow: false,
+            renames: Vec::new(),
+            froms: Vec::new(),
+            cte_names: Vec::new(),
+            ctid_output: false,
+            srfs: 0,
+            list_srfs: Vec::new(),
+            srf_aliases: Vec::new(),
+            aliases: 0,
+            returning_table: None,
+            table_ddl: false,
+            ddl: false,
+        }
+    }
+
     fn push(&mut self, s: &str) {
         self.out.push_str(s);
     }
@@ -2487,6 +2525,9 @@ impl Emitter<'_> {
                 // user and the schema into the statement before it is translated; what is
                 // left of them is the engine's functions (rewrite_niladic_funcs).
                 match O::try_from(f.op) {
+                    Ok(O::SvfopCurrentDate) if self.ddl => self.push("CURRENT_DATE"),
+                    Ok(O::SvfopCurrentTimestamp) if self.ddl => self.push("CURRENT_TIMESTAMP"),
+                    Ok(O::SvfopCurrentTime) if self.ddl => self.push("CURRENT_TIME"),
                     Ok(O::SvfopCurrentDate) if self.typed() => self.push("overlite_current_date()"),
                     Ok(O::SvfopCurrentTimestamp) if self.typed() => self.push("overlite_now(julianday('now'))"),
                     Ok(O::SvfopCurrentUser | O::SvfopCurrentRole | O::SvfopUser) => self.push("current_user()"),
@@ -2843,6 +2884,9 @@ impl Emitter<'_> {
         if let Some(lookup) = reg_lookup(&name) {
             return self.reg_cast(arg, &name, lookup);
         }
+        if self.table_ddl && !matches!(name.as_str(), "regconfig" | "tsquery" | "tsvector" | "hstore") {
+            return self.table_ddl_cast(arg, &name);
+        }
         if self.typed() {
             let target = types::of_type_name(ty);
             self.note_param(arg, target);
@@ -2930,6 +2974,33 @@ impl Emitter<'_> {
                 self.push(")");
             }
         }
+        Ok(())
+    }
+
+    /// A cast in a table's DDL, as the text passes leave one there (typed_cast.rs):
+    /// SQLite's own CAST, so that the file's schema reads without overlite's
+    /// functions, a string literal folded to the value it makes (`'5'::integer` is 5, a
+    /// uuid its canonical text, `'t'::boolean` 1), a boolean read by the engine's
+    /// boolin.
+    fn table_ddl_cast(&mut self, arg: &NodeEnum, name: &str) -> Out {
+        if let NodeEnum::AConst(k) = arg
+            && let Some(Val::Sval(s)) = &k.val
+            && let Some(v) = crate::rewrite::typed_cast::fold_literal(&quote_literal(&s.sval), name)
+        {
+            self.push(&v);
+            return Ok(());
+        }
+        if name == "boolean" {
+            self.push("pg_bool(");
+            self.expr(arg, Prec::Or)?;
+            self.push(")");
+            return Ok(());
+        }
+        self.push("CAST(");
+        self.expr(arg, Prec::Or)?;
+        self.push(" AS ");
+        self.push(name);
+        self.push(")");
         Ok(())
     }
 
@@ -3896,6 +3967,18 @@ impl Emitter<'_> {
             [schema, n] if string(schema)? == "pg_catalog" => string(n)?,
             _ => return Err("qualified function"),
         };
+        if self.ddl
+            && f.args.is_empty()
+            && matches!(
+                name,
+                "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
+            )
+        {
+            // SQLite's clock, which runs without the session, as rewrite_now wrote it in
+            // a table's DDL and the catalog reads it back.
+            self.push("datetime('now')");
+            return Ok(());
+        }
         if self.typed() && f.args.is_empty() && f.over.is_none() && f.agg_filter.is_none() {
             // The clock, as rewrite_now writes it: the transaction's start, or the
             // statement's, or the clock as it is read.

@@ -1233,7 +1233,20 @@ impl Session {
             .find('(')
             .map_or(def.as_str(), |o| &def[o + 1..def.len() - 1])
             .to_string();
-        items.insert(at, " ".to_string() + &rewrite(&def) + " ");
+        // The column is translated as a CREATE TABLE's, a statement the translation
+        // reads whole, and taken back out of it.
+        let created = rewrite(&["CREATE TABLE t (", &def, ")"].concat());
+        let Some(def) = created
+            .strip_prefix("CREATE TABLE t (")
+            .and_then(|c| c.strip_suffix(')'))
+        else {
+            return Err(errf!(
+                SqlState::INTERNAL_ERROR,
+                "cannot read the definition of the column added to {:?}",
+                quoted(ref_)
+            ));
+        };
+        items.insert(at, " ".to_string() + def + " ");
         let new_ddl = ddl[..=open].to_string() + &items.join(",") + slice(&ddl, after - 1, ddl.len());
         self.rebuild_table_copying(&qualified, &new_ddl, &cols, &master, &name)
     }

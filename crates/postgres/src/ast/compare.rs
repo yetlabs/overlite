@@ -21,8 +21,8 @@ pub(crate) enum Verdict {
 /// Compares the text passes' output with the AST path's, each after the passes
 /// `rewrite` runs on either.
 pub(crate) fn compare(text: &str, ast: &str) -> Verdict {
-    let old = same_functions(same_cast_types(tokens(text)));
-    let new = same_functions(same_cast_types(tokens(ast)));
+    let old = same_functions(same_cast_types(tokens(&cast_type_names(text))));
+    let new = same_functions(same_cast_types(tokens(&cast_type_names(ast))));
     if old == new {
         return Verdict::Identical;
     }
@@ -49,6 +49,40 @@ pub(crate) fn compare(text: &str, ast: &str) -> Verdict {
         Some(why) if INTENDED.iter().any(|(_, f)| f(&o, &n)) => Verdict::Intended(why),
         _ => Verdict::Unexplained,
     }
+}
+
+overlite_core::lazy_regex!(
+    RE_CAST_TYPE,
+    r"(?i)\bAS\s+(int4|int8|int2|int|bool|float8|float4|decimal|timestamp\s+with\s+time\s+zone)\s*([)(])"
+);
+
+/// The type of SQLite's CAST by one name for each: the text passes kept the spelling of
+/// the source (`CAST(x AS int)`), the printer writes the type's (`integer`), which
+/// SQLite reads alike.
+fn cast_type_names(sql: &str) -> std::borrow::Cow<'_, str> {
+    if !sql.contains("AS") && !sql.contains("as") {
+        return sql.into();
+    }
+    RE_CAST_TYPE.replace_all(sql, |c: &regex::Captures| {
+        let name = match c[1].to_ascii_lowercase().as_str() {
+            "int4" | "int" => "integer",
+            "int8" => "bigint",
+            "int2" => "smallint",
+            "bool" => "boolean",
+            "float8" => "double precision",
+            "float4" => "real",
+            "decimal" => "numeric",
+            _ => "timestamptz",
+        };
+        ["AS ", name, &c[2]].concat()
+    })
+}
+
+/// Whether two texts are the same SQL token for token, as `compare` reads them:
+/// spacing, the case of keywords, an optional AS and the quotes of a name that needs
+/// none apart.
+pub(crate) fn same_tokens(a: &str, b: &str) -> bool {
+    tokens(a) == tokens(b)
 }
 
 /// The engine's names for one function: overlite_column_at_time_zone is
@@ -771,6 +805,35 @@ fn strip_forms(t: &[String]) -> Vec<String> {
 type Intended = (&'static str, fn(&[String], &[String]) -> bool);
 
 const INTENDED: &[Intended] = &[
+    (
+        "a serial key is the rowid with AUTOINCREMENT whatever stands between serial and PRIMARY KEY (`serial \
+         NOT NULL PRIMARY KEY`, as Django writes it), so that its values are never used again, as a sequence's \
+         are not: the text pass gave AUTOINCREMENT only to `serial PRIMARY KEY` written together",
+        |old, new| {
+            let without = |t: &[String]| t.iter().filter(|x| *x != "autoincrement").cloned().collect::<Vec<_>>();
+            let count = |t: &[String]| t.iter().filter(|x| *x == "autoincrement").count();
+            count(new) > count(old) && without(old) == without(new)
+        },
+    ),
+    (
+        "a function's DDL is the engine's as written: the text pass read the ORDER BY of a body across its \
+         dollar quotes and wrote NULLS LAST after the statement",
+        |old, new| {
+            old.len() == new.len() + 2
+                && old.ends_with(&["nulls".to_string(), "last".to_string()])
+                && old[..new.len()] == *new
+                && new.iter().take(4).any(|x| x == "function")
+        },
+    ),
+    (
+        "a cast to tsvector of what is no literal is its operand, as the printer writes it in every statement: \
+         in an index's key (which SQLite keeps over the text) the text pass wrote tsvector_in",
+        |old, new| {
+            old.iter().any(|x| x == "tsvector_in")
+                && without_parens(&old.iter().filter(|x| *x != "tsvector_in").cloned().collect::<Vec<_>>())
+                    == without_parens(new)
+        },
+    ),
     (
         "a set operation on the right of another is read from a subquery, as Postgres groups it: SQLite read \
          the compound left to right, `1 UNION 2 INTERSECT 3` as `(1 UNION 2) INTERSECT 3`",

@@ -47,7 +47,7 @@ fn typed_cast(operand: &str, type_name: &str, table_ddl: bool) -> Option<String>
 
 /// The value of a literal under a cast, as a literal. None when it is not one or fails
 /// to convert, which leaves it to SQLite.
-fn fold_literal(operand: &str, name: &str) -> Option<String> {
+pub(crate) fn fold_literal(operand: &str, name: &str) -> Option<String> {
     let body = operand.strip_prefix('\'')?.strip_suffix('\'')?;
     if body.replace("''", "").contains('\'') {
         return None;

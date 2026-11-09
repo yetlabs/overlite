@@ -9,6 +9,7 @@
 //! purpose.
 
 pub(crate) mod compare;
+pub(crate) mod ddl;
 pub(crate) mod emit;
 pub(crate) mod env;
 pub(crate) mod labels;
@@ -60,7 +61,11 @@ pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
         }
         return Ok(out.join("; "));
     }
-    one(one_statement(&parsed)?)
+    let stmt = one_statement(&parsed)?;
+    if ddl::takes(stmt) {
+        return ddl::translate(sql, stmt);
+    }
+    one(stmt)
 }
 
 /// The type the environment gives each parameter of sql, `$1` first, when the AST

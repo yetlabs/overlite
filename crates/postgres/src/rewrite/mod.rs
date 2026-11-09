@@ -31,7 +31,7 @@ mod srf;
 pub(crate) mod strings;
 mod table_funcs;
 pub(crate) mod tokens;
-mod typed_cast;
+pub(crate) mod typed_cast;
 
 use crate::rewrite::aliases::{rewrite_drop_cascade, rewrite_keyword_labels};
 use crate::rewrite::arrays::{

@@ -90,6 +90,15 @@ pub(crate) fn wrapped_query(sql: &str) -> Option<String> {
     crate::session::copy::parse_copy(sql).and_then(|c| c.query().map(str::to_string))
 }
 
+/// Whether sql is one statement the DDL printer takes (`ddl::takes`).
+pub(crate) fn is_ddl(sql: &str) -> bool {
+    crate::ast::parse::parse(sql).is_ok_and(|p| {
+        matches!(p.stmts.as_slice(), [raw] if raw.stmt.as_deref()
+            .and_then(|s| s.node.as_ref())
+            .is_some_and(crate::ast::ddl::takes))
+    })
+}
+
 /// Runs both paths over the corpus, a statement that wraps a query (EXPLAIN, DECLARE,
 /// COPY) by that query, which is what the session translates.
 pub(crate) fn run() -> Tally {
@@ -112,7 +121,14 @@ pub(crate) fn run() -> Tally {
         };
         slot[2] += 1;
         // The text route as rewrite and the engine run it; the AST path's output is final.
-        let (old, new) = (text_route(&sql), ast);
+        // A DDL statement's is the engine's type passes' on either route, and what
+        // SQLite keeps of a table's: both are compared before them.
+        let old = if is_ddl(&sql) {
+            text_tail(&rewrite_full(&sql))
+        } else {
+            text_route(&sql)
+        };
+        let new = ast;
         match compare(&old, &new) {
             Verdict::Identical => t.identical += 1,
             Verdict::IdenticalButParentheses => t.identical_but_parens += 1,
@@ -141,7 +157,11 @@ fn ast_path_matches_the_text_passes_over_the_corpus() {
     let mut why: Vec<_> = t.unsupported.iter().collect();
     why.sort_by(|a, b| b.1.cmp(a.1));
     eprintln!("unsupported by first node: {why:?}");
-    for (sql, old, new) in t.unexplained.iter().take(40) {
+    let shown = std::env::var("OVERLITE_DIFF_SHOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    for (sql, old, new) in t.unexplained.iter().take(shown) {
         let one = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
         eprintln!("SQL  {}\nTEXT {}\nAST  {}\n", one(sql), one(old), one(new));
     }

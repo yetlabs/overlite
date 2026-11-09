@@ -177,11 +177,9 @@ impl Session {
             .to_string();
             let type_name = integer_type(&typ).map_or_else(|| typ.to_ascii_lowercase(), str::to_string);
             let def = if integer_type(&typ).is_some() && is_key(&rest) && clause.options.is_empty() {
-                join_def(
-                    &name,
-                    "INTEGER",
-                    &(with_autoincrement(&rest) + " " + &mark(clause.always, &type_name)),
-                )
+                // The rowid, as a serial key is: a statement Postgres' grammar reads, which
+                // the translation writes as INTEGER ... AUTOINCREMENT.
+                join_def(&name, "serial", &(rest + " " + &mark(clause.always, &type_name)))
             } else {
                 if self.identity_sequence(&stored, &column, &clause.options, None).is_err() {
                     return Cow::Borrowed(sql);

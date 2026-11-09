@@ -350,10 +350,20 @@ pub(crate) fn rewrite_serial(sql: &str) -> String {
         // SERIAL PRIMARY KEY is the rowid.
         let pk = toks.get(i + 1).is_some_and(|n| n.is_word(sql, "primary"))
             && toks.get(i + 2).is_some_and(|n| n.is_word(sql, "key"));
+        if t.span.start < at {
+            continue;
+        }
         out.push_str(&sql[at..t.span.start]);
         if pk {
             out.push_str("INTEGER PRIMARY KEY AUTOINCREMENT");
             at = toks[i + 2].span.end;
+        } else if let Some(key) = later_key(sql, &toks, i) {
+            // `serial NOT NULL PRIMARY KEY`, as Django writes it: the rowid as well,
+            // AUTOINCREMENT after its KEY [ASC | DESC].
+            out.push_str("INTEGER");
+            out.push_str(&sql[t.span.end..toks[key].span.end]);
+            out.push_str(" AUTOINCREMENT");
+            at = toks[key].span.end;
         } else {
             out.push_str("INTEGER");
             at = t.span.end;
@@ -364,6 +374,30 @@ pub(crate) fn rewrite_serial(sql: &str) -> String {
     }
     out.push_str(&sql[at..]);
     out
+}
+
+/// The token after which a serial at toks[i] takes AUTOINCREMENT: the KEY of a PRIMARY
+/// KEY later in its column's definition, or the ASC or DESC after it.
+fn later_key(sql: &str, toks: &[crate::rewrite::tokens::CodeTok], i: usize) -> Option<usize> {
+    let depth = toks[i].depth;
+    let end = (i + 1..toks.len())
+        .find(|&j| toks[j].depth < depth || (toks[j].depth == depth && toks[j].is_punct(sql, ",")))
+        .unwrap_or(toks.len());
+    let key = (i + 2..end)
+        .find(|&j| toks[j].depth == depth && toks[j].is_word(sql, "key") && toks[j - 1].is_word(sql, "primary"))?;
+    if toks[i..end].iter().any(|t| t.is_word(sql, "autoincrement")) {
+        return None;
+    }
+    Some(
+        if toks
+            .get(key + 1)
+            .is_some_and(|n| n.depth == depth && (n.is_word(sql, "asc") || n.is_word(sql, "desc")))
+        {
+            key + 1
+        } else {
+            key
+        },
+    )
 }
 
 /// Writes the deferral of a UNIQUE or PRIMARY KEY constraint of a CREATE TABLE as a
@@ -616,6 +650,10 @@ pub(crate) mod tests {
                 (
                     r#"CREATE TABLE t ("id" serial  primary  key)"#,
                     r#"CREATE TABLE t ("id" INTEGER PRIMARY KEY AUTOINCREMENT)"#,
+                ),
+                (
+                    r#"CREATE TABLE t ("id" serial NOT NULL PRIMARY KEY DESC /*x*/, n int)"#,
+                    r#"CREATE TABLE t ("id" INTEGER NOT NULL PRIMARY KEY DESC AUTOINCREMENT /*x*/, n int)"#,
                 ),
             ],
         );

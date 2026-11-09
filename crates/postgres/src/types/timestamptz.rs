@@ -75,6 +75,15 @@ pub(crate) fn rewrite_timestamptz_literal(sql: &str) -> String {
     out
 }
 
+/// The bare UTC text a timestamptz column's default stands for, when the default is
+/// the text of a timestamp with an offset: what rewrite_timestamptz_literal writes.
+pub(crate) fn utc_default(body: &str) -> Option<String> {
+    if !RE_WHOLE_TIMESTAMPTZ.is_match(body) {
+        return None;
+    }
+    to_utc_literal(body)
+}
+
 /// Parses a timestamp with an explicit offset and returns the bare UTC
 /// representation.
 fn to_utc_literal(s: &str) -> Option<String> {
