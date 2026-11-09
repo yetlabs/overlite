@@ -197,3 +197,36 @@ fn date_part_of_a_timestamptz_is_in_the_session_zone() {
     must_exec(&conn, "SET TIME ZONE 'Asia/Tokyo'");
     assert_eq!(col(&conn, "SELECT date_part('hour', tz) FROM dt"), ["9"]);
 }
+
+// Ranges compare by their bounds and take their operators where the environment knows
+// a side is a range: `-|-` and `<<` were syntax errors, and `@>` jsonb's containment.
+// Arrays compare element by element, numbers as numbers: as JSON texts, `{1,2,10}`
+// was before `{1,2,9}`.
+#[test]
+fn ranges_and_arrays_compare_as_postgres_compares_them() {
+    let conn = connect(&start_server());
+    must_exec(
+        &conn,
+        "CREATE TABLE ra (id int, r int4range, s int4range, a int[], b int[])",
+    );
+    must_exec(
+        &conn,
+        "INSERT INTO ra VALUES (1, '[1,5)', '[5,9)', '{1,2,10}', '{1,2,9}'), (2, '[1,5]', '[2,3)', '{2}', '{10}')",
+    );
+    assert_eq!(
+        raw_rows(
+            &conn,
+            "SELECT r -|- s, r << s, r && s, r @> s, s <@ r, a < b FROM ra ORDER BY id"
+        )
+        .into_iter()
+        .map(|r| r
+            .into_iter()
+            .map(|c| String::from_utf8(c.unwrap_or_default()).unwrap())
+            .collect::<Vec<_>>()
+            .join(","))
+        .collect::<Vec<_>>(),
+        ["t,t,f,f,f,f", "f,f,t,t,t,t"]
+    );
+    // A range given in another spelling is the same range: `[1,5]` is `[1,6)`.
+    assert_eq!(col(&conn, "SELECT r = '[1,5]' FROM ra ORDER BY id"), ["f", "t"]);
+}

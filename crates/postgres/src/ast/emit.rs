@@ -1396,6 +1396,14 @@ impl Emitter<'_> {
                     ", 'timestamp')"
                 });
             }
+            // A range in its canonical form, `[1,5]` as `[1,6)`.
+            t if !t.array && range_name(t.base).is_some() => {
+                self.push("overlite_cast(");
+                self.expr(n, Prec::Or)?;
+                self.push(", '");
+                self.push(range_name(t.base).unwrap_or("int4range"));
+                self.push("')");
+            }
             t if t.is(Base::Bool) && is_lit => {
                 let NodeEnum::AConst(k) = n else {
                     return self.expr(n, min);
@@ -1684,6 +1692,9 @@ impl Emitter<'_> {
                 self.push(" || ");
                 self.expr(r, Prec::Unary)
             }
+            "@>" | "<@" | "&&" | "-|-" | "<<" | ">>" | "&<" | "&>" if self.is_range(l) || self.is_range(r) => {
+                self.range_op(op, l, r)
+            }
             "->" | "->>" | "#>" | "#>>" | "@>" | "<@" | "?" | "?|" | "?&" => self.json_op(a, op, l, r),
             "%" => {
                 // pg_trgm's similarity on text, a remainder on numbers: only the types tell.
@@ -1706,6 +1717,37 @@ impl Emitter<'_> {
             }
             _ => Err("operator"),
         }
+    }
+
+    /// Whether the environment knows n is a range.
+    fn is_range(&mut self, n: &NodeEnum) -> bool {
+        let t = self.ty(n);
+        !t.array
+            && matches!(
+                t.base,
+                Base::Int4Range | Base::Int8Range | Base::NumRange | Base::DateRange | Base::TsRange | Base::TstzRange
+            )
+    }
+
+    /// A range operator or comparison over ranges, as the engine reads them
+    /// (overlite_range_op): their bounds, where SQLite compared their texts. The other
+    /// side is a range too, or a literal or a parameter read as one.
+    fn range_op(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+        let (tl, tr) = (self.ty(l), self.ty(r));
+        let ok = |me: &mut Self, n: &NodeEnum, t: Ty| me.is_range(n) || t.base == Base::Unknown;
+        if !(ok(self, l, tl) && ok(self, r, tr)) {
+            return Err("range operator with a side that is no range");
+        }
+        self.note_param(l, tr);
+        self.note_param(r, tl);
+        self.push("pg_bool(overlite_range_op(");
+        self.push(&quote_literal(op));
+        self.push(", ");
+        self.value(l, tr, Prec::Or)?;
+        self.push(", ");
+        self.value(r, tl, Prec::Or)?;
+        self.push("))");
+        Ok(())
     }
 
     /// The json and jsonb operators, where the environment knows the left side is one
@@ -1794,6 +1836,23 @@ impl Emitter<'_> {
     fn comparison(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
         let p = binary_prec(op).ok_or("operator")?;
         let (tl, tr) = (self.ty(l), self.ty(r));
+        if self.is_range(l) || self.is_range(r) {
+            return self.range_op(op, l, r);
+        }
+        // Two arrays in Postgres' order, element by element, whichever form each is in.
+        let array = |t: Ty| t.array || t.base == Base::Unknown;
+        if (tl.array || tr.array) && array(tl) && array(tr) {
+            self.note_param(l, tr);
+            self.note_param(r, tl);
+            self.push("overlite_array_cmp(");
+            self.expr(l, Prec::Or)?;
+            self.push(", ");
+            self.expr(r, Prec::Or)?;
+            self.push(") ");
+            self.push(op);
+            self.push(" 0");
+            return Ok(());
+        }
         let (tl, tr) = (self.guess(l, tl, tr), self.guess(r, tr, tl));
         let num = |t: Ty| t.is_number() || t.is_numeric();
         if (tl.is(Base::Interval) || tr.is(Base::Interval)) && !num(tl) && !num(tr) {
@@ -2303,6 +2362,19 @@ impl Emitter<'_> {
         self.push(")");
         Ok(())
     }
+}
+
+/// The name of a range type.
+fn range_name(b: Base) -> Option<&'static str> {
+    Some(match b {
+        Base::Int4Range => "int4range",
+        Base::Int8Range => "int8range",
+        Base::NumRange => "numrange",
+        Base::DateRange => "daterange",
+        Base::TsRange => "tsrange",
+        Base::TstzRange => "tstzrange",
+        _ => return None,
+    })
 }
 
 /// A function's name, unqualified or in pg_catalog.

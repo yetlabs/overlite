@@ -534,6 +534,14 @@ type Intended = (&'static str, fn(&[String], &[String]) -> bool);
 
 const INTENDED: &[Intended] = &[
     (
+        "a range operator over ranges is overlite_range_op, which reads their bounds: the text path took `@>` \
+         for jsonb's containment and compared ranges as their texts",
+        |old, new| {
+            let has = |t: &[String], w: &str| t.iter().any(|x| x == w);
+            has(new, "overlite_range_op") && !has(old, "overlite_range_op")
+        },
+    ),
+    (
         "a regular expression operator is REGEXP whatever its operands: over the corpus' text of two Django \
          statements (a cast on the left, a subquery on the right) rewrite_full left the `~` as it was",
         |old, new| old.iter().any(|t| t == "~") && !new.iter().any(|t| t == "~") && new.iter().any(|t| t == "regexp"),

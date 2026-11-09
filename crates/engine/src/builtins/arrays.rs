@@ -50,6 +50,42 @@ lazy_regex!(RE_INT_VECTOR, r"^-?\d+(?: -?\d+)*$");
 /// is, Postgres' '{a,b}' text, or a vector's "1 2". It is what unnest and
 /// generate_subscripts expand, so they work on the catalog's vectors as well as
 /// on stored arrays. Anything else is NULL: no elements.
+/// Postgres' order of two arrays, in either form an array is stored or given in:
+/// element by element, numbers as numbers and anything else by its text, a NULL
+/// element after every other, then the shorter first. None when either is not an array.
+pub(crate) fn array_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    use crate::builtins::json::{Json, json_decode_first};
+    use std::cmp::Ordering;
+    let (Value::Text(x), Value::Text(y)) = (array_as_json(a), array_as_json(b)) else {
+        return None;
+    };
+    let (Some(Json::Arr(x)), Some(Json::Arr(y))) = (json_decode_first(&x), json_decode_first(&y)) else {
+        return None;
+    };
+    let number = |j: &Json| match j {
+        Json::Number(n) => Some(n.clone()),
+        Json::Num(f) => Some(f.to_string()),
+        _ => None,
+    };
+    for (p, q) in x.iter().zip(&y) {
+        let o = match (p, q) {
+            (Json::Null, Json::Null) => Ordering::Equal,
+            (Json::Null, _) => Ordering::Greater,
+            (_, Json::Null) => Ordering::Less,
+            (Json::Str(a), Json::Str(b)) => a.cmp(b),
+            (Json::Bool(a), Json::Bool(b)) => a.cmp(b),
+            _ => match (number(p), number(q)) {
+                (Some(a), Some(b)) => crate::builtins::decimal::dec_cmp_str(&a, &b).cmp(&0),
+                _ => crate::builtins::json::json_marshal(p).cmp(&crate::builtins::json::json_marshal(q)),
+            },
+        };
+        if o != Ordering::Equal {
+            return Some(o);
+        }
+    }
+    Some(x.len().cmp(&y.len()))
+}
+
 pub(crate) fn array_as_json(v: &Value) -> Value {
     let arg = arg_str(v);
     let s = arg.trim();

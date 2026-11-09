@@ -949,6 +949,14 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     // The array that unnest and generate_subscripts in a select list step through
     // (whatever form it is stored in), and its first subscript.
     scalar(conn, "overlite_array_json", 1, |a| Ok(array_as_json(&a[0])))?;
+    // Two arrays in Postgres' order, -1, 0 or 1, which the AST path writes for a
+    // comparison of arrays; NULL over NULL and over what is no array.
+    scalar(conn, "overlite_array_cmp", 2, |a| {
+        if a[0].is_null() || a[1].is_null() {
+            return Ok(Value::Null);
+        }
+        Ok(crate::builtins::arrays::array_cmp(&a[0], &a[1]).map_or(Value::Null, |o| Value::Int(i64::from(o as i8))))
+    })?;
     // ARRAY(subquery), whose value is the JSON array the rewrite builds: the call
     // marks the result column an array.
     scalar(conn, "overlite_array", 1, |a| Ok(a[0].clone()))?;
