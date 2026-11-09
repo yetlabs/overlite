@@ -122,7 +122,53 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   INSERT ... SELECT, an UPDATE ... FROM or SET subquery, or a DELETE ... USING reads need
   SELECT, which the text reader did not ask for. A CTE is no longer taken for a table of
   its name.
-- `_overlite_rls` and `_overlite_policies` hold stored names too, and move and go with
+- A `LANGUAGE sql` function's body is held to the privileges Postgres checks, as
+  Postgres 17 answers them (tests/wire/function_privileges.rs). It is still inlined at
+  each call, now by the session before the privilege check and the policies, at any
+  depth (in a select list, WHERE, ORDER BY, RETURNING, a SET, a FROM as a set, a call
+  inside a call), so what it reads is in the statement they see. SECURITY INVOKER (the
+  default) reads with the caller's privileges, column by column, and through the
+  caller's policies. SECURITY DEFINER reads with its owner's and through its owner's
+  policies, and `current_user` in it is the owner; its arguments are the caller's to
+  read. The owner is who created it, and ALTER FUNCTION ... OWNER TO changes it (to a
+  role the owner may become, or by a superuser). EXECUTE is PUBLIC's until `REVOKE
+  EXECUTE ON FUNCTION f FROM PUBLIC`; GRANT/REVOKE EXECUTE take FUNCTION, ROUTINE,
+  PROCEDURE and ALL FUNCTIONS IN SCHEMA, and a role that does not own the function
+  grants nothing, without an error, as in Postgres. CREATE OR REPLACE, DROP and ALTER
+  FUNCTION of another role's function are 42501 `must be owner of function f`; ALTER
+  FUNCTION takes OWNER TO and SECURITY DEFINER | INVOKER, anything else is 0A000. The
+  engine inlines nothing: a call the session did not inline fails in SQLite. Before,
+  a body was inlined after the check and the policies and read anything, so a role
+  with no grant on a table read it through a function of its own; and a function named
+  like a built-in (`lower`) replaced it in every statement, the server's own privilege
+  queries included. Now a call of a built-in's name (SQLite's, this engine's, `pg_*`,
+  `overlite_*`) or of a Postgres keyword (`x IN (a, b)`) is never a stored function's,
+  as pg_catalog comes first in Postgres. The names a call may reach are kept per
+  database; they were one list for the whole process.
+- What else a statement reaches is checked too (tests/wire/privilege_routes.rs,
+  tests/wire/explain_privileges.rs). EXPLAIN, with any options, is held to the
+  statement it explains (42501, as in Postgres), and EXPLAIN ANALYZE runs a write as a
+  write runs, its policies' INSERT check included; over the extended protocol it runs
+  at Execute, each time, not at Parse. A view reads its tables with its owner's
+  privileges: CREATE VIEW records its creator as owner (and DROP VIEW is the owner's),
+  so a view of a role's over a table it cannot read reads nothing, for it or for whoever
+  it is granted to. CREATE TABLE AS and CREATE MATERIALIZED VIEW read their query with
+  the creator's privileges and through its policies; REFRESH is the owner's and reads
+  with the owner's privileges. SQL-level EXECUTE of an INSERT goes through the
+  policies' check (it did not). A SQLite trigger's body is checked with the privileges
+  of the role whose write fires it, as a Postgres trigger function runs; CREATE
+  TRIGGER needs the table's ownership or TRIGGER, DROP TRIGGER its ownership. An
+  UPDATE's or DELETE's subqueries, FROM and USING are read through their tables'
+  policies. A statement Postgres' grammar refuses (`INSERT OR REPLACE ... SELECT`) is
+  held to SELECT on what it reads after FROM, JOIN and USING, besides its target. The
+  server's own tables (`_overlite_*`, where the roles, the grants and the policies
+  are), sqlite_dbpage, writing `sqlite_*`, PRAGMA, ATTACH, DETACH and VACUUM INTO are a
+  superuser's: before, any role could make itself one with `UPDATE _overlite_roles`.
+  Checked and unchanged: cursors, PREPARE/EXECUTE's reads, COPY (query) TO, SELECT
+  INTO (refused before it runs), a DEFAULT, CHECK or generated column calling a
+  function that reads (SQLite takes no subquery there, so the table is refused). There
+  are no rules and no DO blocks: both are syntax errors.
+ and move and go with
   the table like its owner. COPY TO reads through the policies and COPY FROM is 0A000
   for a role under RLS, as in Postgres. An older server looked RLS up by bare name, so
   a row written through the search_path did protect `s1.t`, and reading it as public's
@@ -541,6 +587,21 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 - An operator class is known by its `_ops` suffix; one with parameters is not taken.
 - PL/pgSQL is not run: CREATE FUNCTION ... LANGUAGE plpgsql is still taken without
   effect, and a call to one fails.
+- A `LANGUAGE sql` body the privilege check cannot read (more than one statement, or
+  one Postgres' grammar refuses) is 0A000 to a caller that does not own the function,
+  where Postgres runs it; calls nested deeper than 16 are 54001. A function named as a
+  built-in or a keyword is stored and never called, and so is a body inside a view,
+  trigger or column default: those are inlined when the view, trigger or table is
+  made, as before. A function called in a view so runs with the view owner's
+  privileges, where Postgres runs it with the querying role's. EXPLAIN without ANALYZE
+  is held to the bodies of the functions it would call, where Postgres plans a call
+  without reading its body. has_function_privilege answers true.
+- A view whose owner the policies of a table it reads would filter is refused, 0A000,
+  to a role that is checked: SQLite expands the view where no filter can be added. A
+  superuser (or an unmanaged role) reading a view owned by a role without the
+  privileges it needs is not refused, where Postgres refuses it: a superuser is never
+  checked. A view or function from before owners were kept has none, and is an
+  administrator's as a table with no owner row is: its query is not checked.
 - There is no migration of `_overlite_owners` and `_overlite_grants` to stored names.
   In a database from before them, a row for a table outside public holds its bare
   name, and a bare name now means the public table of that name. So that row stops

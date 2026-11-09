@@ -82,7 +82,10 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   compares as a number;
   `tsvector` makes `length(col)` and `col || col` of a tsvector column count its
   lexemes and concatenate, by the same probe.
-- `sql_funcs`: `LANGUAGE sql` functions, stored and inlined at their call sites.
+- `sql_funcs`: `LANGUAGE sql` functions: stored with their owner, SECURITY DEFINER
+  and EXECUTE list, and their calls found (`DbSession::function_calls`, by the names
+  kept per database in `DbState`, never a built-in's). The engine inlines none; the
+  session does (`auth/functions.rs`).
 - `storage`: the storage format below, and the conversion of a file that holds
   another, once, when it is opened.
 - `deferred`: SET CONSTRAINTS, which checks the deferred foreign keys SQLite still has
@@ -102,7 +105,9 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   SQLite's), and cursors (`cursor`: DECLARE, FETCH, MOVE, CLOSE,
   routed before anything else reads the statement, and the end of a transaction,
   which reads a held cursor's rows and closes the others).
-- `auth`: SCRAM, roles, grants, privilege checks, row-level security, session identity.
+- `auth`: SCRAM, roles, grants, privilege checks, row-level security, session identity,
+  and `functions`: who may call, change and own a `LANGUAGE sql` function, and its
+  inlining (below).
 - `ddl`: what SQLite cannot run as written: `exclude` (EXCLUDE constraints, as two
   triggers per constraint whose first carries the constraint in a comment), `objects` (materialized views,
   CREATE/DROP EXTENSION and COLLATION, and the refusals of partitions and foreign
@@ -198,17 +203,22 @@ one run inside an implicit transaction. Each statement takes this route through
    search_path and the utility statements clients expect to succeed.
 3. `check_privileges` holds what is left to the role's grants: a SELECT, INSERT, UPDATE
    or DELETE column by column, from its parse tree (`auth/columns.rs`), anything else,
-   or one that reader does not follow, to table grants alone.
+   or one that reader does not follow, to table grants alone. It reads through an
+   EXPLAIN to what it explains, and through CREATE TABLE AS to its query. It first
+   inlines the statement's function calls (below), and follows what the statement
+   reaches: a view's query is checked as the view's owner, the body of each trigger a
+   write fires as the role writing (`follow_relations`).
 4. `apply_column_defaults` strips or injects nextval defaults and fits what a write
    stores to its columns' modifiers, and an INSERT into a table under RLS is checked by
    `try_rls_insert`.
-5. `rewrite_for_exec` injects RLS filters (`apply_rls`), expands session identity,
+5. `rewrite_for_exec` injects RLS filters (`apply_rls`), inlines function calls,
+   expands session identity,
    sequence calls, advisory locks and enum columns into literals, and calls `rewrite`
    (`rewrite_expanded` when it expanded something, so that the result columns keep
    the labels of the statement as sent), which answers from the translation cache or
    translates (the AST path, else the text passes).
 6. `Session::exec` arms the canceler and hands the text to `DbSession`. `execute` runs
-   function DDL, then the `resolve` passes and function inlining, and prepares, binds
+   function DDL, then the `resolve` passes, and prepares, binds
    and steps the statement. Nothing is cached: a statement is prepared and finalized
    on every execution. A computed column has no decltype, so `computed_types`
    (`column_types.rs`) reads the select list: a cast decides the column's type, and the rest speak for it only when
@@ -281,6 +291,28 @@ A pass reacting to a new word must therefore be seen by it. The tests in
 statement templates, and also run every statement of the wire suite
 (`tests/fixtures/rewrite-corpus.hex`) and random statements, asserting that nothing
 skipped changes under `rewrite_full`.
+
+### What a function's body reads
+
+A `LANGUAGE sql` call is inlined, so what its body reads is part of the statement
+that calls it, and the session does the inlining (`auth/functions.rs`) so that the
+privilege check and the policies see it; the engine only finds the calls. A
+statement's calls are inlined three ways:
+
+- for the check (`Inline::Check`): an invoker body in its call's place, checked with
+  the statement as the caller; a SECURITY DEFINER body checked on its own as its owner
+  (`as_role`), and left as `overlite_definer(args)`, so that its arguments are still
+  the caller's;
+- to run it (`Inline::Exec`, in `rewrite_for_exec`, after the statement's own
+  policies): each body read through the policies of the role it runs as before it is
+  put in, and never read through the caller's again;
+- as written (`Inline::Plain`), for a Describe and for what a view, trigger or column
+  stores.
+
+Each mode finds the same calls (`function_calls`) in the same text, and EXECUTE is
+checked at each call as the role making it. A call that is not inlined reaches SQLite
+as a function it does not have, and fails: nothing is read unchecked. A view's query,
+inlined bodies included, is checked as its owner; a trigger's body as the writer.
 
 ### RLS and ownership keys
 

@@ -94,7 +94,8 @@ against PostgreSQL do not transfer; a large aggregation runs on one core.
 | `CREATE TRIGGER ... EXECUTE FUNCTION` | no: refused with a syntax error |
 | SQLite-syntax triggers (`CREATE TRIGGER ... BEGIN ... END`) | yes |
 | `CREATE PROCEDURE`, `CREATE AGGREGATE` | no: accepted without effect; `CALL` is a syntax error |
-| `SECURITY DEFINER` | no: accepted; the body runs with the caller's privileges |
+| `SECURITY DEFINER` / `SECURITY INVOKER` on `LANGUAGE sql` | yes: a definer body reads with its owner's privileges and policies |
+| `GRANT` / `REVOKE EXECUTE` on functions, `ALTER FUNCTION ... OWNER TO` | yes |
 | PL/Python, PL/Perl, PL/v8 | never (they are extensions) |
 
 **This is the sharpest edge.** A migration that creates a PL/pgSQL function
@@ -221,11 +222,13 @@ collation; without one, "Ávila" sorts after "zeta".
 | Row-level security policies | yes, `COPY` included |
 | `pg_hba.conf` / `pg_hba.yaml`, TLS, scram-sha-256 / md5 / password / trust / reject | yes |
 | Column-level `GRANT` (SELECT, INSERT, UPDATE) | yes; REFERENCES is recorded, not enforced |
+| Privileges through `LANGUAGE sql` bodies, views (as the owner), triggers, `EXPLAIN` | yes |
 | Role names | partial: compared without case |
 
-Privileges and RLS are enforced, not decorative. The column-level gap widens
-access rather than narrowing it: `GRANT SELECT (a) ON t` lets the role read every
-column of `t`.
+Privileges and RLS are enforced, not decorative, through whatever a statement
+reaches: a function's body, a view (with its owner's privileges), a trigger, an
+EXPLAIN. A view whose base table's policies would filter its owner is refused rather
+than read unfiltered.
 
 ## Observability and operations
 
@@ -290,10 +293,10 @@ and behave differently.
    folds ASCII only.
 5. **SQLite's typing decides where the translation cannot see a type**: `1/0` is
    NULL, `'abc'` fits in an integer column.
-6. **A `LANGUAGE sql` function reads with no privilege check**: its body runs
-   inlined, so a role can read a table it has no grant on through one.
-7. **`ANALYZE`, `SECURITY DEFINER` and isolation levels are accepted** and change
-   nothing.
+6. **A function called in a view runs with the view owner's privileges**, not the
+   querying role's: its body is inlined into the view when the view is made. A
+   superuser reading a view whose owner lacks a privilege is not refused.
+7. **`ANALYZE` and isolation levels are accepted** and change nothing.
 8. **Identity and serial keys follow the highest row**, so an explicit id moves
    the next one on.
 9. **Network and geometric values are text**: their operators give answers, not
