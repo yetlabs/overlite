@@ -38,7 +38,7 @@ fn faithful_type_oids() {
     let rows = conn
         .query("SELECT a, b, c, d, e, f, g, h, i, j FROM typed", &[])
         .unwrap();
-    let want: [u32; 10] = [16, 20, 20, 25, 1043, 1042, 114, 3802, 2950, 701];
+    let want: [u32; 10] = [16, 23, 20, 25, 1043, 1042, 114, 3802, 2950, 701];
     let fds = &rows.fields;
     assert_eq!(fds.len(), want.len());
     for (i, fd) in fds.iter().enumerate() {

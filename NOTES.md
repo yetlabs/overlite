@@ -416,6 +416,34 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   (ROUND(365, -1) is 370, where SQLite's gave 365.0), stddev and variance of integers
   numerics. The fast path's statements and those left to the text passes keep the
   int8 and the labels they had.
+- Since stage 4 (docs/adr/0001-sql-ast.md), a plain statement that names a column of a
+  date, time, timestamp, interval, array or range type, or an integer narrower than a
+  bigint (or a star over a table with one), leaves the fast path for the typed
+  translation: `SELECT id FROM t WHERE tz > '2024-01-02'` reads the literal as a
+  timestamptz where it compared texts, and `SELECT * FROM t` sends an int column as
+  int4, so Django's inspectdb reads an IntegerField as one (a serial key, SQLite's
+  rowid, stays int8 and a BigAutoField). A lookup over other columns keeps the fast
+  path.
+- Answers that were wrong or refused and are Postgres' now, in statements the AST path
+  translates since stage 4 (tests/wire/ast_shapes.rs): a subscript of an expression
+  `(a)[2]` and a slice `a[2:3]`; `a || b` of arrays and of an array and an element,
+  which concatenated their texts; `<> ALL (subquery)`; `ARRAY((subquery))`;
+  array_agg, a JSON array as arrays are stored (array_length, subscripts and `= ANY`
+  read it; an element with a space is quoted), with ORDER BY, FILTER and OVER, NULL
+  over no rows; DISTINCT ON keeps a row per group before LIMIT counts them;
+  `a UNION b INTERSECT c` binds INTERSECT first; a jsonb aggregate's FILTER; a
+  row-locking clause on lines of its own; `"ctid"` quoted; real times numeric a
+  double.
+- Client-visible since stage 4, in a statement the AST path translates: avg of
+  integers is a numeric at Postgres' scale (`2.0000000000000000`, where it was the
+  double 2) and sum of a bigint a numeric, as Postgres types them; an int[] goes out
+  as int4[] (1007) with four-byte elements in binary, where it was int8[]; array_agg,
+  a slice, `||` of arrays, akeys and avals go out as arrays of their element's type;
+  a comparison or a test in a select list (`a = b`, `isempty(r)`) goes out as a
+  boolean where it could go out as the integer 1 or 0; a subscript is labelled by its
+  array (`tags[2]` is `tags`, as Postgres names it), a DISTINCT ON item without a name
+  by Postgres' label. A cast of a JSON array's text to an array type
+  (`CAST('["a"]' AS TEXT[])`) reads the array, which the text passes left as text.
 
 ## Limits
 
@@ -426,12 +454,12 @@ something other than what Postgres gives.
 Since stage 3 of the AST migration (docs/adr/0001-sql-ast.md), a statement the AST
 path translates is typed from its tree and the catalog, and the limits below that
 come from a type the translation cannot see hold for the others only: a statement the
-fast path runs as written (a plain lookup such as `SELECT id FROM t WHERE tz >
-'2024-01-02'`, whose literal stays text), one left to the text passes (its shape not
-yet in the slice), and the server's own probes. In a typed statement what is still
-not known is a column of a table the catalog does not have, a function the
-environment does not type, and a json, range or `%` operator over such a value, which
-go to the text passes.
+fast path runs as written (since stage 4 only one over columns whose types it reads
+the same), one left to the text passes (DDL and the catalog's statements, and the
+shapes listed in the ADR's stage 4 result), and the server's own probes. In a typed
+statement what is still not known is a column of a table the catalog does not have,
+a function the environment does not type; a json, range, array or `%` operator over
+such a value is read as the text passes read it.
 
 ### Silent: a different answer and no error
 
@@ -674,13 +702,13 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 ### Catalogs and what is reported
 
 - An integer column goes out as int8 whatever its width, as its values are sampled, in
-  a statement the fast path or the text passes run, so Django's inspectdb, whose
-  `SELECT * FROM t LIMIT 1` is on the fast path, reads an IntegerField as a
-  BigIntegerField and an AutoField as a BigAutoField. A statement the AST path types
-  sends the width, but for a rowid key, int8 there too. The catalogs have the declared
-  width.
-- Postgres' sum of a bigint and avg of integers are numerics; here they are an int8
-  and a double, as SQLite computes them, in a typed statement too.
+  a statement the text passes run. A statement the AST path types sends the width, but
+  for a rowid key, int8 there too, so Django's inspectdb reads an AutoField as a
+  BigAutoField. The catalogs have the declared width.
+- Postgres' sum of a bigint and avg of integers are numerics; in a statement the text
+  passes run they are an int8 and a double, as SQLite computes them.
+- A real is kept as a double: `r * 1.5` of a real 0.1 is 0.15000000000000002, where
+  Postgres widens the real's 0.10000000149011612.
 - Two UNIQUE constraints over the same key are both in pg_constraint, but SQLite makes
   one index for them, so pg_index lists one.
 - A renamed table's key, UNIQUE and sequence names follow its new name, where Postgres

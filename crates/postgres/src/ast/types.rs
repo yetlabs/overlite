@@ -152,12 +152,32 @@ impl Ty {
     }
 
     /// What the result-column mark says of this type (`overlite_engine::TYPED_MARK`):
-    /// an integer's width, which a declared INTEGER does not tell the protocol.
+    /// an integer's width, which a declared INTEGER does not tell the protocol, a
+    /// boolean, which SQLite holds as 1 or 0, and an array's element type.
     pub(crate) fn mark(self) -> &'static str {
+        if self.array {
+            // An array's element type, which a computed column does not tell either.
+            return match self.base {
+                Base::Int2 => "int2[]",
+                Base::Int4 => "int4[]",
+                Base::Int8 => "int8[]",
+                Base::Bool => "boolean[]",
+                Base::Float8 => "double precision[]",
+                Base::Numeric => "numeric[]",
+                Base::Text | Base::Varchar | Base::Bpchar | Base::Name => "text[]",
+                Base::Uuid => "uuid[]",
+                Base::Date => "date[]",
+                Base::Timestamp => "timestamp[]",
+                Base::Jsonb => "jsonb[]",
+                _ => "",
+            };
+        }
         match self {
             t if t.is(Base::Int2) => "int2",
             t if t.is(Base::Int4) => "int4",
             t if t.is(Base::Int8) => "int8",
+            // A comparison or a test is a boolean whatever SQLite's 1 or 0 says.
+            t if t.is(Base::Bool) => "bool",
             _ => "",
         }
     }
@@ -524,13 +544,74 @@ impl Typer {
                 }
             }
             NodeEnum::RangeSubselect(s) => {
-                let cols = match boxed(s.subquery.as_deref()) {
+                let mut cols = match boxed(s.subquery.as_deref()) {
                     Some(NodeEnum::SelectStmt(q)) => self.select_cols(q),
                     _ => Vec::new(),
                 };
+                // `AS v(a, b)` renames the first columns.
+                for (c, name) in cols.iter_mut().zip(s.alias.iter().flat_map(|a| a.colnames.iter())) {
+                    if let Some(name) = string(name) {
+                        c.name = name.to_string();
+                    }
+                }
                 let name = s.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_default();
                 rels.push(Rel {
                     name,
+                    schema: String::new(),
+                    cols: Some(Rc::from(cols)),
+                });
+            }
+            NodeEnum::RangeFunction(r) => {
+                let srf = crate::ast::emit::srf_from(r).ok().flatten();
+                let Some(srf) = srf else {
+                    rels.push(Rel {
+                        name: r.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_default(),
+                        schema: String::new(),
+                        cols: None,
+                    });
+                    return;
+                };
+                let arg = |k: usize, me: &mut Self| srf.args.get(k).map_or(Ty::ANY, |a| me.ty(a));
+                let jsonish = |me: &mut Self| {
+                    let t = arg(0, me);
+                    if t.is(Base::Json) || t.is(Base::Jsonb) {
+                        t
+                    } else {
+                        Ty::ANY
+                    }
+                };
+                let mut tys: Vec<Ty> = match srf.name {
+                    "unnest" => (0..srf.args.len())
+                        .map(|k| {
+                            let t = arg(k, self);
+                            if t.array { Ty::of(t.base) } else { Ty::ANY }
+                        })
+                        .collect(),
+                    "generate_series" => {
+                        let t = common(&[arg(0, self), arg(1, self)]);
+                        vec![if t.is_integer() { t } else { Ty::ANY }]
+                    }
+                    "generate_subscripts" => vec![Ty::of(Base::Int4)],
+                    "json_object_keys" | "jsonb_object_keys" | "regexp_split_to_table" => vec![Ty::TEXT],
+                    n if n.contains("_each_text") => vec![Ty::TEXT, Ty::TEXT],
+                    n if n.contains("_each") => vec![Ty::TEXT, jsonish(self)],
+                    n if n.ends_with("_text") => vec![Ty::TEXT],
+                    _ => vec![jsonish(self)],
+                };
+                tys.push(Ty::of(Base::Int8));
+                let cols: Vec<Col> = srf
+                    .names
+                    .iter()
+                    .zip(tys)
+                    .map(|(n, ty)| Col {
+                        name: n.clone(),
+                        ty,
+                        mixed: false,
+                        rowid: false,
+                    })
+                    .collect();
+                rels.push(Rel {
+                    name: srf.alias.clone(),
                     schema: String::new(),
                     cols: Some(Rc::from(cols)),
                 });
@@ -754,9 +835,49 @@ impl Typer {
                     Some(NodeEnum::SelectStmt(q)) => self.select_cols(q).first().map_or(Ty::ANY, |c| c.ty),
                     _ => Ty::ANY,
                 },
-                Ok(SubLinkType::ArraySublink) => Ty::ANY,
+                Ok(SubLinkType::ArraySublink) => match boxed(s.subselect.as_deref()) {
+                    Some(NodeEnum::SelectStmt(q)) => match self.select_cols(q).first() {
+                        Some(c) if c.ty.known() && !c.ty.array => Ty {
+                            base: c.ty.base,
+                            array: true,
+                        },
+                        _ => Ty::ANY,
+                    },
+                    _ => Ty::ANY,
+                },
                 _ => Ty::BOOL,
             },
+            NodeEnum::AArrayExpr(a) => {
+                let tys: Vec<Ty> = a.elements.iter().filter_map(node).map(|x| self.ty(x)).collect();
+                let t = common(&tys);
+                if t.known() && !t.array {
+                    Ty {
+                        base: t.base,
+                        array: true,
+                    }
+                } else if tys.iter().all(|t| t.base == Base::Unknown) && !tys.is_empty() {
+                    Ty {
+                        base: Base::Text,
+                        array: true,
+                    }
+                } else {
+                    Ty::ANY
+                }
+            }
+            // A subscript of an array is its element, a slice an array.
+            NodeEnum::AIndirection(i) => {
+                let t = boxed(i.arg.as_deref()).map_or(Ty::ANY, |a| self.ty(a));
+                if !t.array {
+                    return Ty::ANY;
+                }
+                let slice = i
+                    .indirection
+                    .iter()
+                    .any(|x| matches!(node(x), Some(NodeEnum::AIndices(ix)) if ix.is_slice));
+                if slice { t } else { Ty::of(t.base) }
+            }
+            NodeEnum::CollateClause(c) => boxed(c.arg.as_deref()).map_or(Ty::ANY, |a| self.ty(a)),
+            NodeEnum::JsonArrayConstructor(_) | NodeEnum::JsonObjectConstructor(_) => Ty::of(Base::Jsonb),
             NodeEnum::SqlvalueFunction(f) => {
                 use pb::SqlValueFunctionOp as O;
                 Ty::of(match O::try_from(f.op) {
@@ -804,6 +925,8 @@ impl Typer {
         }
     }
 
+    /// The result type of a function call, by Postgres' signature of the function
+    /// overlite provides under that name.
     fn func(&mut self, f: &pb::FuncCall) -> Ty {
         let name = match f.funcname.as_slice() {
             [n] => string(n).unwrap_or(""),
@@ -812,30 +935,122 @@ impl Typer {
         };
         let args: Vec<&NodeEnum> = f.args.iter().filter_map(node).collect();
         let arg = |k: usize, me: &mut Self| args.get(k).map_or(Ty::ANY, |a| me.ty(a));
+        let array_of = |t: Ty| {
+            if t.known() && !t.array {
+                Ty {
+                    base: t.base,
+                    array: true,
+                }
+            } else {
+                Ty::ANY
+            }
+        };
         match name {
-            "count" => Ty::of(Base::Int8),
+            "count" | "row_number" | "rank" | "dense_rank" | "ntile" | "nextval" | "currval" | "setval" | "lastval"
+            | "pg_backend_pid" => Ty::of(Base::Int8),
+            "percent_rank" | "cume_dist" | "random" => Ty::of(Base::Float8),
+            "lag" | "lead" | "first_value" | "last_value" | "nth_value" => arg(0, self),
             "sum" => {
                 let t = arg(0, self);
                 match t.base {
                     _ if t.array => Ty::ANY,
-                    // Postgres' sum of a bigint is a numeric; SQLite's is an integer,
-                    // and so it goes out (NOTES.md, Limits).
-                    Base::Int2 | Base::Int4 | Base::Int8 => Ty::of(Base::Int8),
-                    Base::Numeric => Ty::of(Base::Numeric),
-                    Base::Float4 | Base::Float8 => Ty::of(Base::Float8),
+                    Base::Int2 | Base::Int4 => Ty::of(Base::Int8),
+                    Base::Int8 | Base::Numeric => Ty::of(Base::Numeric),
+                    Base::Float4 => Ty::of(Base::Float4),
+                    Base::Float8 => Ty::of(Base::Float8),
                     Base::Interval => t,
                     _ => Ty::ANY,
                 }
             }
             "avg" => {
                 let t = arg(0, self);
-                if t.is_numeric() || t.is(Base::Interval) {
+                if t.is_integer() || t.is_numeric() {
+                    Ty::of(Base::Numeric)
+                } else if t.is(Base::Interval) {
                     t
                 } else if t.is_number() {
                     Ty::of(Base::Float8)
                 } else {
                     Ty::ANY
                 }
+            }
+            "array_agg" => array_of(arg(0, self)),
+            "string_agg"
+            | "array_to_string"
+            | "btrim"
+            | "ltrim"
+            | "rtrim"
+            | "substring"
+            | "translate"
+            | "regexp_replace"
+            | "quote_ident"
+            | "quote_literal"
+            | "quote_nullable"
+            | "format"
+            | "encode"
+            | "version"
+            | "current_setting"
+            | "format_type"
+            | "unaccent"
+            | "host"
+            | "text"
+            | "pg_get_userbyid"
+            | "pg_get_expr"
+            | "pg_get_triggerdef"
+            | "obj_description"
+            | "col_description"
+            | "set_config"
+            | "pg_encoding_to_char" => Ty::TEXT,
+            "current_database" | "current_schema" => Ty::of(Base::Name),
+            "gen_random_uuid" | "uuid_generate_v4" => Ty::of(Base::Uuid),
+            "array_length" | "array_upper" | "array_lower" | "cardinality" | "json_array_length"
+            | "jsonb_array_length" | "position" => Ty::of(Base::Int4),
+            "regexp_split_to_array" | "string_to_array" | "akeys" | "avals" => Ty {
+                base: Base::Text,
+                array: true,
+            },
+            "json_build_object" | "json_build_array" | "json_agg" | "json_object_agg" | "to_json" => Ty::of(Base::Json),
+            "jsonb_build_object" | "jsonb_build_array" | "jsonb_agg" | "jsonb_object_agg" | "to_jsonb" => {
+                Ty::of(Base::Jsonb)
+            }
+            "to_tsvector" | "setweight" | "strip" | "tsvector_in" => Ty::of(Base::Tsvector),
+            "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery" | "websearch_to_tsquery" => Ty::of(Base::Tsquery),
+            "ts_rank" | "ts_rank_cd" | "similarity" | "word_similarity" | "strict_word_similarity" => {
+                Ty::of(Base::Float4)
+            }
+            "pg_try_advisory_lock"
+            | "pg_try_advisory_xact_lock"
+            | "isempty"
+            | "lower_inc"
+            | "upper_inc"
+            | "lower_inf"
+            | "upper_inf"
+            | "has_table_privilege"
+            | "has_column_privilege" => Ty::BOOL,
+            "hstore" => Ty::of(Base::Hstore),
+            "int4range" => Ty::of(Base::Int4Range),
+            "int8range" => Ty::of(Base::Int8Range),
+            "numrange" => Ty::of(Base::NumRange),
+            "daterange" => Ty::of(Base::DateRange),
+            "tsrange" => Ty::of(Base::TsRange),
+            "tstzrange" => Ty::of(Base::TstzRange),
+            // lower and upper of a range are its bounds, of text text.
+            "lower" | "upper" if args.len() == 1 => {
+                let t = arg(0, self);
+                match t.base {
+                    _ if t.array => Ty::ANY,
+                    Base::Int4Range => Ty::of(Base::Int4),
+                    Base::Int8Range => Ty::of(Base::Int8),
+                    Base::NumRange => Ty::of(Base::Numeric),
+                    Base::DateRange => Ty::of(Base::Date),
+                    Base::TsRange => Ty::of(Base::Timestamp),
+                    Base::TstzRange => Ty::of(Base::Timestamptz),
+                    _ => Ty::TEXT,
+                }
+            }
+            "log" | "log10" | "cbrt" | "trunc" => {
+                let t = arg(0, self);
+                if t.is_numeric() { t } else { Ty::of(Base::Float8) }
             }
             "min" | "max" | "any_value" | "bit_and" | "bit_or" | "bit_xor" => arg(0, self),
             "abs" | "ceil" | "ceiling" | "floor" | "sign" => {
@@ -854,8 +1069,8 @@ impl Typer {
             }
             "dec_add" | "dec_sub" | "dec_mul" | "dec_div" => Ty::of(Base::Numeric),
             "length" | "char_length" | "octet_length" | "strpos" | "ascii" => Ty::of(Base::Int4),
-            "lower" | "upper" | "replace" | "substr" | "split_part" | "lpad" | "rpad" | "left" | "right"
-            | "reverse" | "repeat" | "concat" | "initcap" | "chr" | "md5" | "hex" | "typeof" | "to_char" => Ty::TEXT,
+            "replace" | "substr" | "split_part" | "lpad" | "rpad" | "left" | "right" | "reverse" | "repeat"
+            | "concat" | "initcap" | "chr" | "md5" | "hex" | "typeof" | "to_char" => Ty::TEXT,
             // Of integers and numerics a numeric, of floats a double.
             "stddev_pop" | "stddev_samp" | "var_pop" | "var_samp" => {
                 let t = arg(0, self);

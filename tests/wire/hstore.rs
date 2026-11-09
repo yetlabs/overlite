@@ -44,8 +44,9 @@ fn hstore() {
         .query_row("SELECT avals(h) FROM t WHERE id = 1", &[])
         .scan()
         .unwrap();
-    assert_eq!(keys, r#"["a","b"]"#);
-    assert_eq!(vals, r#"["1","2"]"#);
+    // text[] arrays, as Postgres sends them.
+    assert_eq!(keys, "{a,b}");
+    assert_eq!(vals, "{1,2}");
 }
 
 // hstore_send: the pair count, then each key and value with its length, -1 for NULL.

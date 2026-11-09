@@ -51,95 +51,77 @@ enum Prec {
     Atom,
 }
 
-/// Functions the text passes leave as they are, by name: a call to one of them is
-/// written as it came. None is named by any pass (each was looked for in the rewrite,
-/// types and session code), and the differential test holds those the corpus calls.
-const PLAIN_FUNCTIONS: &[&str] = &[
-    "count",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "lower",
-    "upper",
-    "length",
-    "abs",
-    "round",
-    "nullif",
-    "coalesce",
-    // Strings.
-    "replace",
-    "substr",
-    "strpos",
-    "split_part",
-    "lpad",
-    "rpad",
-    "left",
-    "right",
-    "reverse",
-    "repeat",
-    "concat",
-    "char_length",
-    "octet_length",
-    "initcap",
-    "chr",
-    "ascii",
-    "md5",
-    "hex",
-    "typeof",
-    // Numbers.
-    "floor",
-    "ceil",
-    "ceiling",
-    "sign",
-    "sqrt",
-    "power",
-    "mod",
-    "exp",
-    "ln",
-    "pi",
-    "sin",
-    "cos",
-    "tan",
-    "cot",
-    "asin",
-    "acos",
-    "atan",
-    "atan2",
-    "degrees",
-    "radians",
-    "dec_add",
-    "dec_sub",
-    "dec_mul",
-    "dec_div",
-    "dec_cmp",
-    // Aggregates.
-    "any_value",
-    "bool_and",
-    "bool_or",
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    "stddev_pop",
-    "stddev_samp",
-    "var_pop",
-    "var_samp",
-    "covar_pop",
-    "covar_samp",
-    "corr",
-    "regr_avgx",
-    "regr_avgy",
-    "regr_count",
-    "regr_intercept",
-    "regr_r2",
-    "regr_slope",
-    "regr_sxx",
-    "regr_sxy",
-    "regr_syy",
-    // Time, on what the engine's own functions read.
-    "date_trunc",
-    "to_char",
-    "age",
+/// The functions the text passes rewrite by name (each found by running every word of
+/// the rewrite's sources as a call through `rewrite_full`): a call to one is written
+/// here as they write it, or left to them. Any other function is written as it came,
+/// SQLite's, the engine's, or one of the session's that it inlines.
+pub(crate) const REWRITTEN: &[&str] = &[
+    "array_to_string",
+    "clock_timestamp",
+    "col_description",
+    "generate_series",
+    "generate_subscripts",
+    "json_agg",
+    "json_array",
+    "json_array_elements",
+    "json_array_elements_text",
+    "json_build_array",
+    "json_build_object",
+    "json_each",
+    "json_each_text",
+    "json_object",
+    "json_object_agg",
+    "json_object_keys",
+    "json_typeof",
+    "jsonb_agg",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_array_length",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "jsonb_each",
+    "jsonb_each_text",
+    "jsonb_insert",
+    "jsonb_object_agg",
+    "jsonb_object_keys",
+    "jsonb_pretty",
+    "jsonb_set",
+    "jsonb_typeof",
+    "localtime",
+    "localtimestamp",
+    "now",
+    "obj_description",
+    "pg_get_constraintdef",
+    "pg_get_indexdef",
+    "pg_options_to_table",
+    "pg_partition_ancestors",
+    "pg_partition_root",
+    "pg_partition_tree",
+    "regexp_split_to_table",
+    "shobj_description",
+    "statement_timestamp",
+    "string_agg",
+    "to_json",
+    "to_jsonb",
+    "transaction_timestamp",
+    "trim",
+    "unnest",
+];
+
+/// The json and jsonb functions SQLite has under other names, and whether the value is
+/// jsonb (rewrite/json.rs, JSON_FUNC_MAP and JSONB_FUNCS).
+const JSON_RENAMES: &[(&str, &str, bool)] = &[
+    ("json_build_object", "json_object", false),
+    ("jsonb_build_object", "json_object", true),
+    ("json_build_array", "json_array", false),
+    ("jsonb_build_array", "json_array", true),
+    ("json_object_agg", "json_group_object", false),
+    ("jsonb_object_agg", "json_group_object", true),
+    ("json_agg", "json_group_array", false),
+    ("jsonb_agg", "json_group_array", true),
+    ("jsonb_array_length", "json_array_length", false),
+    ("to_json", "json_quote", false),
+    ("to_jsonb", "json_quote", true),
 ];
 
 /// Writes a statement of the slice, or says which node it stopped at: the untyped
@@ -189,6 +171,14 @@ fn print(stmt: &NodeEnum, labels: Option<&[Option<String>]>, typer: Option<Typer
         params: Vec::new(),
         in_form: false,
         in_arrow: false,
+        renames: Vec::new(),
+        froms: Vec::new(),
+        cte_names: Vec::new(),
+        ctid_output: false,
+        srfs: 0,
+        srf_aliases: Vec::new(),
+        aliases: 0,
+        returning_table: None,
     };
     match stmt {
         NodeEnum::SelectStmt(s) => e.select(s, true)?,
@@ -274,6 +264,29 @@ struct Emitter<'a> {
     /// knows (MIN, MAX, COALESCE, SUM of numerics, DATE_TRUNC, a scalar subquery...) is
     /// cast to it there, so that the protocol sends it as one.
     item_casts: bool,
+    /// The relations of a FROM written as a table function whose columns SQLite names
+    /// otherwise (`unnest(a) AS u(x)` is `overlite_elements(...) AS u`, whose `x` is
+    /// `u.value`): each alias and its columns, as the statement names them and as
+    /// SQLite does.
+    renames: Vec<(String, Vec<(String, String)>)>,
+    /// The relations of each FROM being written, innermost last: each name and whether
+    /// it is a table, whose ctid is its rowid.
+    froms: Vec<Vec<(String, bool)>>,
+    /// The CTEs in scope, which are no tables.
+    cte_names: Vec<String>,
+    /// The select whose ORDER BY is being written has an output named ctid, which a
+    /// bare ctid there names.
+    ctid_output: bool,
+    /// How many set-returning functions without an alias have been written (`_srf0`...).
+    srfs: usize,
+    /// The aliases of each FROM's set-returning functions, in the order they are
+    /// written, innermost FROM last.
+    srf_aliases: Vec<std::collections::VecDeque<String>>,
+    /// How many derived column lists have been written (`_alias0`...).
+    aliases: usize,
+    /// The alias of a written table and its name, which RETURNING reads it by: SQLite's
+    /// RETURNING names the table alone.
+    returning_table: Option<(String, String)>,
 }
 
 fn node(n: &pb::Node) -> Result<&NodeEnum, Unsupported> {
@@ -560,16 +573,13 @@ impl Emitter<'_> {
         if s.into_clause.is_some() {
             return Err("SELECT INTO");
         }
-        if !s.locking_clause.is_empty() {
-            return Err("FOR UPDATE");
-        }
-        if !s.window_clause.is_empty() {
-            return Err("WINDOW");
-        }
+        // A row lock is the session's (`take_row_locks`, on the statement as sent):
+        // SQLite's write lock holds every row, and the clause has no SQLite spelling.
         let (ctes, outputs) = match &mut self.typer {
             Some(t) => (t.push_with(s.with_clause.as_ref()), t.outputs.take()),
             None => (0, None),
         };
+        let cte_names = self.cte_names.len();
         if let Some(w) = &s.with_clause {
             self.with(w)?;
         }
@@ -577,13 +587,23 @@ impl Emitter<'_> {
         match op {
             SetOperation::SetopNone | SetOperation::Undefined => {
                 self.push_from(&s.from_clause);
-                self.select_core(s, top)?;
-                if !s.sort_clause.is_empty()
-                    && let Some(t) = &mut self.typer
-                {
-                    t.outputs = Some(t.targets(&s.target_list));
+                let renamed = self.renames.len();
+                self.enter_from(&s.from_clause)?;
+                if s.distinct_clause.iter().any(|d| d.node.is_some()) {
+                    self.distinct_on(s, top)?;
+                } else {
+                    self.select_core(s, top)?;
+                    if !s.sort_clause.is_empty()
+                        && let Some(t) = &mut self.typer
+                    {
+                        t.outputs = Some(t.targets(&s.target_list));
+                    }
+                    let was = std::mem::replace(&mut self.ctid_output, names_ctid(&s.target_list));
+                    self.order_limit(s)?;
+                    self.ctid_output = was;
                 }
-                self.order_limit(s)?;
+                self.leave_from();
+                self.renames.truncate(renamed);
                 self.pop_scope();
             }
             SetOperation::SetopUnion | SetOperation::SetopIntersect | SetOperation::SetopExcept => {
@@ -592,11 +612,8 @@ impl Emitter<'_> {
                 };
                 // SQLite reads a compound left to right with one precedence; Postgres binds
                 // INTERSECT tighter and keeps a parenthesized right arm whole. A set
-                // operation on the right is a grouping SQLite cannot write.
-                if r.op != SetOperation::SetopNone as i32 {
-                    return Err("set operation on the right of a set operation");
-                }
-                self.set_member(l, top)?;
+                // operation on the right is a member of its own, read from a subquery.
+                self.set_member(l, top, false)?;
                 self.push(match op {
                     SetOperation::SetopUnion => " UNION ",
                     SetOperation::SetopIntersect => " INTERSECT ",
@@ -605,7 +622,7 @@ impl Emitter<'_> {
                 if s.all {
                     self.push("ALL ");
                 }
-                self.set_member(r, false)?;
+                self.set_member(r, false, true)?;
                 // The ORDER BY of a set operation reads its output columns alone.
                 if !s.sort_clause.is_empty()
                     && let Some(t) = &mut self.typer
@@ -614,7 +631,15 @@ impl Emitter<'_> {
                     t.push_from(&[]);
                     t.outputs = Some(cols);
                 }
+                let mut first = l.as_ref();
+                while let Some(l) = first.larg.as_deref() {
+                    first = l;
+                }
+                let was = std::mem::replace(&mut self.ctid_output, names_ctid(&first.target_list));
+                self.enter_from(&[])?;
                 self.order_limit(s)?;
+                self.leave_from();
+                self.ctid_output = was;
                 if !s.sort_clause.is_empty() {
                     self.pop_scope();
                 }
@@ -624,14 +649,21 @@ impl Emitter<'_> {
             t.pop_with(ctes);
             t.outputs = outputs;
         }
+        self.cte_names.truncate(cte_names);
         Ok(())
     }
 
     /// A member of a UNION: SQLite takes no parentheses there, so one with its own
-    /// ORDER BY, LIMIT or WITH is not written.
-    fn set_member(&mut self, s: &pb::SelectStmt, top: bool) -> Out {
-        if !s.sort_clause.is_empty() || s.limit_count.is_some() || s.limit_offset.is_some() || s.with_clause.is_some() {
-            return Err("set member with ORDER BY or LIMIT");
+    /// ORDER BY, LIMIT or WITH, or a set operation of its own on the right, is read
+    /// from a subquery, as the text passes write it (rewrite_set_members).
+    fn set_member(&mut self, s: &pb::SelectStmt, top: bool, right: bool) -> Out {
+        let own =
+            !s.sort_clause.is_empty() || s.limit_count.is_some() || s.limit_offset.is_some() || s.with_clause.is_some();
+        if own || (right && s.op != SetOperation::SetopNone as i32) {
+            self.push("SELECT * FROM (");
+            self.select(s, top)?;
+            self.push(")");
+            return Ok(());
         }
         self.select(s, top)
     }
@@ -640,6 +672,11 @@ impl Emitter<'_> {
         self.push("WITH ");
         if w.recursive {
             self.push("RECURSIVE ");
+        }
+        for c in &w.ctes {
+            if let NodeEnum::CommonTableExpr(c) = node(c)? {
+                self.cte_names.push(c.ctename.clone());
+            }
         }
         for (i, c) in w.ctes.iter().enumerate() {
             if i > 0 {
@@ -702,10 +739,8 @@ impl Emitter<'_> {
             return Ok(());
         }
         self.push("SELECT ");
-        match s.distinct_clause.as_slice() {
-            [] => {}
-            [only] if only.node.is_none() => self.push("DISTINCT "),
-            _ => return Err("DISTINCT ON"),
+        if !s.distinct_clause.is_empty() {
+            self.push("DISTINCT ");
         }
         self.targets(&s.target_list, top)?;
         if !s.from_clause.is_empty() {
@@ -726,6 +761,292 @@ impl Emitter<'_> {
         if let Some(h) = &s.having_clause {
             self.push(" HAVING ");
             self.expr(node(h)?, Prec::Or)?;
+        }
+        if !s.window_clause.is_empty() {
+            self.push(" WINDOW ");
+            for (i, w) in s.window_clause.iter().enumerate() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                let NodeEnum::WindowDef(w) = node(w)? else {
+                    return Err("window definition");
+                };
+                self.push(&ident(&w.name));
+                self.push(" AS ");
+                self.window_spec(w)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// SELECT DISTINCT ON, which SQLite has not: the first row of each group of the ON
+    /// expressions in the statement's order, by ROW_NUMBER() over them, as the text
+    /// passes write it (rewrite/distinct_on.rs). Each item and each ORDER BY key is
+    /// computed beside the row number in a subquery, and the outer SELECT keeps the
+    /// first rows under the items' names; a star over one table keeps them by rowid.
+    fn distinct_on(&mut self, s: &pb::SelectStmt, top: bool) -> Out {
+        if !s.values_lists.is_empty() || s.group_distinct {
+            return Err("DISTINCT ON");
+        }
+        let items: Vec<&pb::ResTarget> = s
+            .target_list
+            .iter()
+            .map(|t| match node(t)? {
+                NodeEnum::ResTarget(t) => Ok(t.as_ref()),
+                _ => Err("target"),
+            })
+            .collect::<Result<_, _>>()?;
+        let star = items.iter().any(|t| {
+            matches!(t.val.as_deref().and_then(|v| v.node.as_ref()), Some(NodeEnum::ColumnRef(c))
+                if matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(NodeEnum::AStar(_))))
+        });
+        // A position or an output name, in ON as in ORDER BY, is the item it stands for.
+        let resolve = |n: &'_ NodeEnum| -> Result<NodeEnum, Unsupported> {
+            match n {
+                NodeEnum::AConst(k) => match &k.val {
+                    Some(Val::Ival(i)) => {
+                        let at = usize::try_from(i.ival - 1).map_err(|_| "DISTINCT ON position")?;
+                        let t = items.get(at).ok_or("DISTINCT ON position")?;
+                        Ok(boxed(t.val.as_deref())?.clone())
+                    }
+                    _ => Ok(n.clone()),
+                },
+                NodeEnum::ColumnRef(c) if c.fields.len() == 1 => {
+                    let name = string(&c.fields[0])?;
+                    match items.iter().find(|t| t.name == name) {
+                        Some(t) => Ok(boxed(t.val.as_deref())?.clone()),
+                        None => Ok(n.clone()),
+                    }
+                }
+                _ => Ok(n.clone()),
+            }
+        };
+        let on: Vec<NodeEnum> = s
+            .distinct_clause
+            .iter()
+            .map(|d| resolve(node(d)?))
+            .collect::<Result<_, _>>()?;
+        let mut keys: Vec<(NodeEnum, &pb::SortBy)> = Vec::new();
+        for k in &s.sort_clause {
+            let NodeEnum::SortBy(k) = node(k)? else {
+                return Err("sort key");
+            };
+            keys.push((resolve(boxed(k.node.as_deref())?)?, k.as_ref()));
+        }
+        let casts = std::mem::take(&mut self.item_casts);
+        let _ = casts;
+        if top {
+            // The labels are the outer SELECT's, written below.
+            self.labels.take();
+        }
+        if star {
+            let ([only], [NodeEnum::RangeVar(r)]) = (
+                items.as_slice(),
+                s.from_clause
+                    .iter()
+                    .map(node)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .as_slice(),
+            ) else {
+                return Err("DISTINCT ON over a star");
+            };
+            if !s.group_clause.is_empty() || s.having_clause.is_some() {
+                return Err("DISTINCT ON over a star");
+            }
+            let qual = ident(r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname));
+            self.push("SELECT ");
+            self.expr(boxed(only.val.as_deref())?, Prec::Or)?;
+            self.push(" FROM ");
+            self.range_var(r, true)?;
+            self.push(" WHERE ");
+            self.push(&qual);
+            self.push(".rowid IN (SELECT rid FROM (SELECT ");
+            self.push(&qual);
+            self.push(".rowid AS rid, ");
+            self.row_number(&on, &keys)?;
+            self.push(" FROM ");
+            self.range_var(r, true)?;
+            if let Some(w) = &s.where_clause {
+                self.push(" WHERE ");
+                self.expr(node(w)?, Prec::Or)?;
+            }
+            self.push(") WHERE _ov_rn = 1)");
+            if !keys.is_empty() {
+                self.push(" ORDER BY ");
+                for (i, (key, k)) in keys.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.expr(key, Prec::Or)?;
+                    self.sort_direction(k, key)?;
+                }
+            }
+            return self.limit(s);
+        }
+        self.push("SELECT ");
+        for (i, t) in items.iter().enumerate() {
+            if i > 0 {
+                self.push(", ");
+            }
+            self.push(&format!("\"_ov_c{i}\" AS "));
+            let label = if t.name.is_empty() {
+                match figure_colname(boxed(t.val.as_deref())?) {
+                    Label::Named(l) => l,
+                    Label::Itself => match boxed(t.val.as_deref())? {
+                        NodeEnum::ColumnRef(c) => string(c.fields.last().ok_or("column")?)?.to_string(),
+                        _ => "?column?".to_string(),
+                    },
+                }
+            } else {
+                t.name.clone()
+            };
+            self.push(&quote_ident(&label));
+        }
+        self.push(" FROM (SELECT ");
+        for (i, t) in items.iter().enumerate() {
+            self.expr(boxed(t.val.as_deref())?, Prec::Or)?;
+            self.push(&format!(" AS \"_ov_c{i}\", "));
+        }
+        for (i, (key, _)) in keys.iter().enumerate() {
+            self.expr(key, Prec::Or)?;
+            self.push(&format!(" AS \"_ov_o{i}\", "));
+        }
+        self.row_number(&on, &keys)?;
+        if !s.from_clause.is_empty() {
+            self.push(" FROM ");
+            self.list(&s.from_clause, Self::table_ref)?;
+        }
+        if let Some(w) = &s.where_clause {
+            self.push(" WHERE ");
+            self.expr(node(w)?, Prec::Or)?;
+        }
+        if !s.group_clause.is_empty() {
+            self.push(" GROUP BY ");
+            self.list(&s.group_clause, Self::expr_node)?;
+        }
+        if let Some(h) = &s.having_clause {
+            self.push(" HAVING ");
+            self.expr(node(h)?, Prec::Or)?;
+        }
+        self.push(") AS _ov WHERE _ov_rn = 1");
+        if !keys.is_empty() {
+            self.push(" ORDER BY ");
+            for (i, (key, k)) in keys.iter().enumerate() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                self.push(&format!("\"_ov_o{i}\""));
+                self.sort_direction(k, key)?;
+            }
+        }
+        self.limit(s)
+    }
+
+    /// `ROW_NUMBER() OVER (PARTITION BY on ORDER BY keys) AS _ov_rn`.
+    fn row_number(&mut self, on: &[NodeEnum], keys: &[(NodeEnum, &pb::SortBy)]) -> Out {
+        self.push("ROW_NUMBER() OVER (PARTITION BY ");
+        for (i, e) in on.iter().enumerate() {
+            if i > 0 {
+                self.push(", ");
+            }
+            self.expr(e, Prec::Or)?;
+        }
+        if !keys.is_empty() {
+            self.push(" ORDER BY ");
+            for (i, (key, k)) in keys.iter().enumerate() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                self.expr(key, Prec::Or)?;
+                self.sort_direction(k, key)?;
+            }
+        }
+        self.push(") AS _ov_rn");
+        Ok(())
+    }
+
+    /// A window: a name, or `(` [base] PARTITION BY, ORDER BY and the frame `)`.
+    fn window_spec(&mut self, w: &pb::WindowDef) -> Out {
+        self.push("(");
+        let mut sep = "";
+        if !w.refname.is_empty() {
+            self.push(&ident(&w.refname));
+            sep = " ";
+        }
+        if !w.partition_clause.is_empty() {
+            self.push(sep);
+            self.push("PARTITION BY ");
+            self.list(&w.partition_clause, Self::expr_node)?;
+            sep = " ";
+        }
+        if !w.order_clause.is_empty() {
+            self.push(sep);
+            self.push("ORDER BY ");
+            self.sort_keys(&w.order_clause)?;
+            sep = " ";
+        }
+        self.frame(w, sep)?;
+        self.push(")");
+        Ok(())
+    }
+
+    /// A window's frame, from Postgres' FRAMEOPTION_ bits (nodes/parsenodes.h), which
+    /// SQLite reads in the same words.
+    fn frame(&mut self, w: &pb::WindowDef, sep: &str) -> Out {
+        let o = w.frame_options;
+        if o & 0x1 == 0 {
+            return Ok(());
+        }
+        self.push(sep);
+        self.push(if o & 0x2 != 0 {
+            "RANGE "
+        } else if o & 0x4 != 0 {
+            "ROWS "
+        } else if o & 0x8 != 0 {
+            "GROUPS "
+        } else {
+            return Err("window frame");
+        });
+        let between = o & 0x10 != 0;
+        if between {
+            self.push("BETWEEN ");
+        }
+        // The start: UNBOUNDED PRECEDING, CURRENT ROW, n PRECEDING, n FOLLOWING.
+        if o & 0x20 != 0 {
+            self.push("UNBOUNDED PRECEDING");
+        } else if o & 0x200 != 0 {
+            self.push("CURRENT ROW");
+        } else if o & 0x800 != 0 {
+            self.expr(boxed(w.start_offset.as_deref())?, Prec::Or)?;
+            self.push(" PRECEDING");
+        } else if o & 0x2000 != 0 {
+            self.expr(boxed(w.start_offset.as_deref())?, Prec::Or)?;
+            self.push(" FOLLOWING");
+        } else {
+            return Err("window frame");
+        }
+        if between {
+            self.push(" AND ");
+            if o & 0x100 != 0 {
+                self.push("UNBOUNDED FOLLOWING");
+            } else if o & 0x400 != 0 {
+                self.push("CURRENT ROW");
+            } else if o & 0x1000 != 0 {
+                self.expr(boxed(w.end_offset.as_deref())?, Prec::Or)?;
+                self.push(" PRECEDING");
+            } else if o & 0x4000 != 0 {
+                self.expr(boxed(w.end_offset.as_deref())?, Prec::Or)?;
+                self.push(" FOLLOWING");
+            } else {
+                return Err("window frame");
+            }
+        }
+        if o & 0x8000 != 0 {
+            self.push(" EXCLUDE CURRENT ROW");
+        } else if o & 0x10000 != 0 {
+            self.push(" EXCLUDE GROUP");
+        } else if o & 0x20000 != 0 {
+            self.push(" EXCLUDE TIES");
         }
         Ok(())
     }
@@ -761,6 +1082,13 @@ impl Emitter<'_> {
             } else if let Some(Some(l)) = given.map(|g| &g[i]) {
                 self.push(" AS ");
                 self.push(&quote_ident(l));
+            } else if let NodeEnum::ColumnRef(c) = val
+                && let Some(Ok(name)) = c.fields.last().map(string)
+                && (name == "ctid" || self.renamed(&c.fields)?.is_some())
+            {
+                // A column SQLite names otherwise: ctid, a table function's column.
+                self.push(" AS ");
+                self.push(&quote_ident(name));
             } else if labels {
                 match figure_colname(val) {
                     Label::Itself => {}
@@ -789,6 +1117,11 @@ impl Emitter<'_> {
                     "min"
                         | "max"
                         | "any_value"
+                        | "lag"
+                        | "lead"
+                        | "first_value"
+                        | "last_value"
+                        | "nth_value"
                         | "sum"
                         | "avg"
                         | "abs"
@@ -845,46 +1178,62 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// Sort keys, each with its NULLS written out: Postgres sorts NULL above every
+    /// value, SQLite below.
+    fn sort_keys(&mut self, keys: &[pb::Node]) -> Out {
+        for (i, k) in keys.iter().enumerate() {
+            if i > 0 {
+                self.push(", ");
+            }
+            let NodeEnum::SortBy(k) = node(k)? else {
+                return Err("sort key");
+            };
+            let key = boxed(k.node.as_deref())?;
+            self.expr(key, Prec::Or)?;
+            self.sort_direction(k, key)?;
+        }
+        Ok(())
+    }
+
+    /// The direction of a sort key and where its NULLs go.
+    fn sort_direction(&mut self, k: &pb::SortBy, key: &NodeEnum) -> Out {
+        // An interval sorts by its span (`1 mon` after `29 days`).
+        if self.typed() && self.ty(key).is(Base::Interval) {
+            self.push(" COLLATE INTERVAL");
+        }
+        let desc = match SortByDir::try_from(k.sortby_dir) {
+            Ok(SortByDir::SortbyDesc) => {
+                self.push(" DESC");
+                true
+            }
+            Ok(SortByDir::SortbyAsc) => {
+                self.push(" ASC");
+                false
+            }
+            Ok(SortByDir::SortbyDefault | SortByDir::Undefined) => false,
+            _ => return Err("ORDER BY USING"),
+        };
+        let first = match SortByNulls::try_from(k.sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => true,
+            Ok(SortByNulls::SortbyNullsLast) => false,
+            _ => desc,
+        };
+        self.push(if first { " NULLS FIRST" } else { " NULLS LAST" });
+        Ok(())
+    }
+
     fn order_limit(&mut self, s: &pb::SelectStmt) -> Out {
         if !s.sort_clause.is_empty() {
             self.push(" ORDER BY ");
-            for (i, k) in s.sort_clause.iter().enumerate() {
-                if i > 0 {
-                    self.push(", ");
-                }
-                let NodeEnum::SortBy(k) = node(k)? else {
-                    return Err("sort key");
-                };
-                let key = boxed(k.node.as_deref())?;
-                self.expr(key, Prec::Or)?;
-                // An interval sorts by its span (`1 mon` after `29 days`).
-                if self.typed() && self.ty(key).is(Base::Interval) {
-                    self.push(" COLLATE INTERVAL");
-                }
-                let desc = match SortByDir::try_from(k.sortby_dir) {
-                    Ok(SortByDir::SortbyDesc) => {
-                        self.push(" DESC");
-                        true
-                    }
-                    Ok(SortByDir::SortbyAsc) => {
-                        self.push(" ASC");
-                        false
-                    }
-                    Ok(SortByDir::SortbyDefault | SortByDir::Undefined) => false,
-                    _ => return Err("ORDER BY USING"),
-                };
-                // Postgres sorts NULL above every value, SQLite below: say it.
-                let first = match SortByNulls::try_from(k.sortby_nulls) {
-                    Ok(SortByNulls::SortbyNullsFirst) => true,
-                    Ok(SortByNulls::SortbyNullsLast) => false,
-                    _ => desc,
-                };
-                self.push(if first { " NULLS FIRST" } else { " NULLS LAST" });
-            }
+            self.sort_keys(&s.sort_clause)?;
             if let Some(t) = &mut self.typer {
                 t.outputs = None;
             }
         }
+        self.limit(s)
+    }
+
+    fn limit(&mut self, s: &pb::SelectStmt) -> Out {
         match LimitOption::try_from(s.limit_option) {
             Ok(LimitOption::WithTies) => return Err("FETCH WITH TIES"),
             Ok(_) => {}
@@ -963,19 +1312,338 @@ impl Emitter<'_> {
                     return Err("subquery");
                 };
                 self.push("(");
-                self.select(q, false)?;
+                match &r.alias {
+                    // `(VALUES ...) AS v(a, b)`: SQLite names a subquery's columns only by
+                    // a CTE's column list, as the text passes write it (rewrite_derived_aliases).
+                    Some(a) if !a.colnames.is_empty() => {
+                        let mut names: Vec<String> = a
+                            .colnames
+                            .iter()
+                            .map(|c| string(c).map(str::to_string))
+                            .collect::<Result<_, _>>()?;
+                        let width = output_names(q)?;
+                        if names.len() > width.len() {
+                            return Err("derived column aliases");
+                        }
+                        names.extend(width[names.len()..].iter().cloned());
+                        let cte = format!("_alias{}", self.aliases);
+                        self.aliases += 1;
+                        self.push("WITH ");
+                        self.push(&cte);
+                        self.push("(");
+                        for (i, n) in names.iter().enumerate() {
+                            if i > 0 {
+                                self.push(", ");
+                            }
+                            self.push(&ident(n));
+                        }
+                        self.push(") AS (");
+                        self.select(q, false)?;
+                        self.push(") SELECT * FROM ");
+                        self.push(&cte);
+                    }
+                    _ => self.select(q, false)?,
+                }
                 self.push(")");
                 if let Some(a) = &r.alias {
-                    if !a.colnames.is_empty() {
-                        return Err("derived column aliases");
-                    }
                     self.push(" AS ");
                     self.push(&ident(&a.aliasname));
                 }
                 Ok(())
             }
+            NodeEnum::RangeFunction(f) => self.range_function(f),
             _ => Err("FROM item"),
         }
+    }
+
+    /// Opens a FROM: its relations' names, and the columns of its table functions under
+    /// the names SQLite gives them (`srf_from`), before the select list reads them.
+    fn enter_from(&mut self, from: &[pb::Node]) -> Out {
+        let mut rels = Vec::new();
+        self.srf_aliases.push(std::collections::VecDeque::new());
+        self.prepare_from(from, &mut rels)?;
+        self.froms.push(rels);
+        Ok(())
+    }
+
+    fn leave_from(&mut self) {
+        self.froms.pop();
+        self.srf_aliases.pop();
+    }
+
+    fn prepare_from(&mut self, from: &[pb::Node], rels: &mut Vec<(String, bool)>) -> Out {
+        for f in from {
+            match node(f)? {
+                NodeEnum::JoinExpr(j) => {
+                    self.prepare_from(std::slice::from_ref(j.larg.as_deref().ok_or("join")?), rels)?;
+                    self.prepare_from(std::slice::from_ref(j.rarg.as_deref().ok_or("join")?), rels)?;
+                }
+                NodeEnum::RangeVar(r) => {
+                    let table = !(r.schemaname.is_empty() && self.cte_names.contains(&r.relname));
+                    rels.push((r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname).clone(), table));
+                }
+                NodeEnum::RangeSubselect(r) => {
+                    rels.push((r.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_default(), false));
+                }
+                NodeEnum::RangeFunction(r) => {
+                    let Some(mut srf) = srf_from(r)? else {
+                        rels.push((r.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_default(), false));
+                        continue;
+                    };
+                    if !srf.aliased && srf.lateral {
+                        srf.alias = format!("_srf{}", self.srfs);
+                    }
+                    if !srf.aliased {
+                        self.srfs += 1;
+                    }
+                    rels.push((srf.alias.clone(), false));
+                    let mut cols: Vec<(String, String)> = if srf.lateral {
+                        (0..srf.names.len())
+                            .map(|i| (srf.names[i].clone(), srf.column_of(i, &srf.alias)))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    // A function of one column is named by its alias too (`unnest(a) AS u`
+                    // reads `u`).
+                    if srf.aliased
+                        && !srf.pairs
+                        && srf.columns.len() - usize::from(r.ordinality) == 1
+                        && srf.names[0] != srf.alias
+                    {
+                        let col = if srf.lateral {
+                            srf.column_of(0, &srf.alias)
+                        } else {
+                            [ident(&srf.alias), ".".to_string(), ident(&srf.names[0])].concat()
+                        };
+                        cols.push((srf.alias.clone(), col));
+                    }
+                    if !cols.is_empty() {
+                        self.renames.push((srf.alias.clone(), cols));
+                    }
+                    if let Some(q) = self.srf_aliases.last_mut() {
+                        q.push_back(srf.alias);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// A function in FROM. A set-returning function is the engine's walk of the JSON
+    /// array a scalar builds (builtins/srf.rs), as the text passes write it
+    /// (rewrite/srf.rs, table_funcs.rs): in a subquery naming its columns where it
+    /// reads no column, else in place, lateral, its columns read under SQLite's names;
+    /// generate_series of integers a recursive CTE. Any other function is SQLite's or
+    /// the engine's table, as it is.
+    fn range_function(&mut self, r: &pb::RangeFunction) -> Out {
+        let Some(mut srf) = srf_from(r)? else {
+            let [item] = r.functions.as_slice() else {
+                return Err("ROWS FROM");
+            };
+            let NodeEnum::List(l) = node(item)? else {
+                return Err("FROM function");
+            };
+            let call = l.items.first().ok_or("FROM function")?;
+            if r.ordinality || r.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) || !r.coldeflist.is_empty() {
+                return Err("FROM function with columns");
+            }
+            self.expr(node(call)?, Prec::Or)?;
+            if let Some(a) = &r.alias {
+                self.push(" AS ");
+                self.push(&ident(&a.aliasname));
+            }
+            return Ok(());
+        };
+        if let Some(alias) = self
+            .srf_aliases
+            .last_mut()
+            .and_then(std::collections::VecDeque::pop_front)
+        {
+            srf.alias = alias;
+        }
+        if srf.name == "generate_series" {
+            return self.generate_series(&srf);
+        }
+        let walker = |me: &mut Self| -> Out {
+            me.push(if srf.pairs {
+                "overlite_pairs("
+            } else {
+                "overlite_elements("
+            });
+            me.srf_source(&srf)?;
+            me.push(")");
+            Ok(())
+        };
+        if srf.lateral {
+            walker(self)?;
+            self.push(" AS ");
+            self.push(&ident(&srf.alias));
+            return Ok(());
+        }
+        self.push("(SELECT ");
+        for (i, (name, col)) in srf.names.iter().zip(&srf.columns).enumerate() {
+            if i > 0 {
+                self.push(", ");
+            }
+            self.push(col);
+            self.push(" AS ");
+            self.push(&ident(name));
+        }
+        self.push(" FROM ");
+        walker(self)?;
+        self.push(") AS ");
+        self.push(&ident(&srf.alias));
+        Ok(())
+    }
+
+    /// The scalar that builds a set-returning function's rows (rewrite/srf.rs, set_of).
+    fn srf_source(&mut self, srf: &Srf) -> Out {
+        let args = srf.args.as_slice();
+        let array_arg = |me: &mut Self, a: &NodeEnum| -> Out {
+            me.push("overlite_array_json(");
+            me.expr(a, Prec::Or)?;
+            me.push(")");
+            Ok(())
+        };
+        match srf.name {
+            "unnest" if args.len() > 1 => {
+                self.push("overlite_zip(");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    array_arg(self, a)?;
+                }
+                self.push(")");
+                Ok(())
+            }
+            "unnest" => array_arg(self, args.first().ok_or("unnest")?),
+            "generate_subscripts" => {
+                self.push("overlite_subscripts(");
+                self.expr(args.first().ok_or("generate_subscripts")?, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
+            "regexp_split_to_table" => {
+                self.push("overlite_regexp_split(");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.expr(a, Prec::Or)?;
+                }
+                self.push(")");
+                Ok(())
+            }
+            "json_object_keys" | "jsonb_object_keys" => {
+                self.push("overlite_json_keys(");
+                self.expr(args.first().ok_or("object keys")?, Prec::Or)?;
+                self.push(", ");
+                self.push(&quote_literal(srf.name));
+                self.push(")");
+                Ok(())
+            }
+            name => {
+                let text = u8::from(name.ends_with("_text"));
+                self.push(if srf.pairs {
+                    "overlite_json_pairs("
+                } else {
+                    "overlite_json_elements("
+                });
+                self.expr(args.first().ok_or("json set")?, Prec::Or)?;
+                if srf.pairs {
+                    let sorted = u8::from(name.starts_with("jsonb"));
+                    self.push(&format!(", {text}, {sorted})"));
+                } else {
+                    self.push(&format!(", {text})"));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// generate_series of integers, as rewrite_generate_series writes it: a recursive
+    /// CTE stepping from the start while the step's sign says the end is not passed.
+    fn generate_series(&mut self, srf: &Srf) -> Out {
+        if srf.lateral {
+            return Err("generate_series reading a column");
+        }
+        let (a, b, step) = match srf.args.as_slice() {
+            [a, b] => (a, b, None),
+            [a, b, s] => (a, b, Some(s)),
+            _ => return Err("generate_series"),
+        };
+        for x in [Some(a), Some(b), step].into_iter().flatten() {
+            let t = self.ty(x);
+            if !(t.is_integer() || t.base == Base::Any && matches!(x, NodeEnum::AExpr(_))) {
+                return Err("generate_series of what is no integer");
+            }
+        }
+        let one = NodeEnum::AConst(pb::AConst {
+            isnull: false,
+            val: Some(Val::Ival(pb::Integer { ival: 1 })),
+            location: 0,
+        });
+        let step: &NodeEnum = step.copied().unwrap_or(&one);
+        let ord = srf.names.len() > 1;
+        let paren = |me: &mut Self, n: &NodeEnum| -> Out {
+            me.push("(");
+            me.expr(n, Prec::Or)?;
+            me.push(")");
+            Ok(())
+        };
+        // (((s) > 0 AND x <= (b)) OR ((s) < 0 AND x >= (b)))
+        let within = |me: &mut Self, x: &dyn Fn(&mut Self) -> Out| -> Out {
+            me.push("(((");
+            me.expr(step, Prec::Or)?;
+            me.push(") > 0 AND ");
+            x(me)?;
+            me.push(" <= ");
+            paren(me, b)?;
+            me.push(") OR ((");
+            me.expr(step, Prec::Or)?;
+            me.push(") < 0 AND ");
+            x(me)?;
+            me.push(" >= ");
+            paren(me, b)?;
+            me.push("))");
+            Ok(())
+        };
+        self.push(if ord {
+            "(WITH RECURSIVE _gs(value, ord) AS (SELECT "
+        } else {
+            "(WITH RECURSIVE _gs(value) AS (SELECT "
+        });
+        paren(self, a)?;
+        if ord {
+            self.push(", 1");
+        }
+        self.push(" WHERE ");
+        within(self, &|me: &mut Self| paren(me, a))?;
+        self.push(" UNION ALL SELECT value + ");
+        paren(self, step)?;
+        if ord {
+            self.push(", ord + 1");
+        }
+        self.push(" FROM _gs WHERE ");
+        within(self, &|me: &mut Self| {
+            me.push("value + ");
+            paren(me, step)
+        })?;
+        self.push(") SELECT value AS ");
+        self.push(&ident(&srf.names[0]));
+        if ord {
+            self.push(", ord AS ");
+            self.push(&ident(&srf.names[1]));
+        }
+        self.push(" FROM _gs)");
+        if srf.aliased {
+            self.push(" AS ");
+            self.push(&ident(&srf.alias));
+        }
+        Ok(())
     }
 
     /// A table: its schema as written, except the two the text passes resolve.
@@ -1017,21 +1685,34 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// The WITH of a write: SQLite takes one before INSERT, UPDATE and DELETE.
+    fn write_with(&mut self, w: Option<&pb::WithClause>) -> Result<usize, Unsupported> {
+        let n = match &mut self.typer {
+            Some(t) => t.push_with(w),
+            None => 0,
+        };
+        if let Some(w) = w {
+            self.with(w)?;
+        }
+        Ok(n)
+    }
+
+    fn pop_with(&mut self, n: usize) {
+        if let Some(t) = &mut self.typer {
+            t.pop_with(n);
+        }
+    }
+
     fn insert(&mut self, s: &pb::InsertStmt) -> Out {
-        if s.with_clause.is_some() {
-            return Err("WITH INSERT");
-        }
-        if s.on_conflict_clause.is_some() {
-            return Err("ON CONFLICT");
-        }
         // OVERRIDING SYSTEM or USER VALUE decides what an identity column gets; the
         // printer has no way to say it, so it is not dropped but left to the passes.
         if s.r#override > pb::OverridingKind::OverridingNotSet as i32 {
             return Err("OVERRIDING");
         }
+        let ctes = self.write_with(s.with_clause.as_ref())?;
         self.push("INSERT INTO ");
         let r = s.relation.as_ref().ok_or("INSERT target")?;
-        self.range_var(r, false)?;
+        self.range_var(r, true)?;
         if !s.cols.is_empty() {
             self.push(" (");
             for (i, c) in s.cols.iter().enumerate() {
@@ -1056,11 +1737,85 @@ impl Emitter<'_> {
                 };
                 self.push(" ");
                 self.select(q, false)?;
+                // SQLite reads `ON` after a FROM as a join's: a SELECT before ON CONFLICT
+                // takes a WHERE, as SQLite's documentation asks.
+                if s.on_conflict_clause.is_some()
+                    && q.values_lists.is_empty()
+                    && q.op == SetOperation::SetopNone as i32
+                    && !q.from_clause.is_empty()
+                    && q.where_clause.is_none()
+                    && q.group_clause.is_empty()
+                    && q.sort_clause.is_empty()
+                    && q.limit_count.is_none()
+                    && q.limit_offset.is_none()
+                    && q.window_clause.is_empty()
+                {
+                    self.push(" WHERE true");
+                }
             }
         }
         self.push_target(r);
-        self.returning(s.returning_clause.as_ref())?;
+        self.enter_from(&[pb::Node {
+            node: Some(NodeEnum::RangeVar(r.clone())),
+        }])?;
+        if let Some(c) = &s.on_conflict_clause {
+            self.on_conflict(c)?;
+        }
+        self.returning_with_alias(r, s.returning_clause.as_ref())?;
+        self.leave_from();
         self.pop_scope();
+        self.pop_with(ctes);
+        Ok(())
+    }
+
+    /// ON CONFLICT, which SQLite spells as Postgres does, but for a constraint's name.
+    fn on_conflict(&mut self, c: &pb::OnConflictClause) -> Out {
+        use pb::OnConflictAction as A;
+        self.push(" ON CONFLICT");
+        if let Some(infer) = &c.infer {
+            if !infer.conname.is_empty() {
+                return Err("ON CONFLICT ON CONSTRAINT");
+            }
+            if !infer.index_elems.is_empty() {
+                self.push(" (");
+                for (i, e) in infer.index_elems.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    let NodeEnum::IndexElem(e) = node(e)? else {
+                        return Err("conflict target");
+                    };
+                    if !e.opclass.is_empty() || !e.collation.is_empty() || e.ordering != 1 || e.nulls_ordering != 1 {
+                        return Err("conflict target");
+                    }
+                    match &e.expr {
+                        Some(x) => {
+                            self.push("(");
+                            self.expr(node(x)?, Prec::Or)?;
+                            self.push(")");
+                        }
+                        None => self.push(&ident(&e.name)),
+                    }
+                }
+                self.push(")");
+            }
+            if let Some(w) = &infer.where_clause {
+                self.push(" WHERE ");
+                self.expr(node(w)?, Prec::Or)?;
+            }
+        }
+        match A::try_from(c.action) {
+            Ok(A::OnconflictNothing) => self.push(" DO NOTHING"),
+            Ok(A::OnconflictUpdate) => {
+                self.push(" DO UPDATE SET ");
+                self.set_list(&c.target_list)?;
+                if let Some(w) = &c.where_clause {
+                    self.push(" WHERE ");
+                    self.expr(node(w)?, Prec::Or)?;
+                }
+            }
+            _ => return Err("ON CONFLICT action"),
+        }
         Ok(())
     }
 
@@ -1076,19 +1831,10 @@ impl Emitter<'_> {
         self.targets(&r.exprs, true)
     }
 
-    fn update(&mut self, s: &pb::UpdateStmt) -> Out {
-        if s.with_clause.is_some() {
-            return Err("WITH UPDATE");
-        }
-        if !s.from_clause.is_empty() {
-            return Err("UPDATE FROM");
-        }
-        self.push("UPDATE ");
-        let r = s.relation.as_ref().ok_or("UPDATE target")?;
-        self.range_var(r, false)?;
-        self.push_target(r);
-        self.push(" SET ");
-        for (i, t) in s.target_list.iter().enumerate() {
+    /// The `a = x, b = y` of an UPDATE or an ON CONFLICT DO UPDATE, each value's
+    /// parameter typed by its column.
+    fn set_list(&mut self, items: &[pb::Node]) -> Out {
+        for (i, t) in items.iter().enumerate() {
             if i > 0 {
                 self.push(", ");
             }
@@ -1113,32 +1859,128 @@ impl Emitter<'_> {
             self.push(" = ");
             self.expr(val, Prec::Or)?;
         }
-        if let Some(w) = &s.where_clause {
-            self.push(" WHERE ");
-            self.expr(node(w)?, Prec::Or)?;
-        }
-        self.returning(s.returning_clause.as_ref())?;
-        self.pop_scope();
         Ok(())
     }
 
-    fn delete(&mut self, s: &pb::DeleteStmt) -> Out {
-        if s.with_clause.is_some() {
-            return Err("WITH DELETE");
+    /// Whether a RETURNING reads only the written table: SQLite's sees no other, where
+    /// Postgres' sees those of FROM and USING too.
+    fn returns_target_only(s: Option<&pb::ReturningClause>, r: &pb::RangeVar) -> bool {
+        let Some(s) = s else { return true };
+        let names = [
+            r.relname.as_str(),
+            r.alias.as_ref().map_or("", |a| a.aliasname.as_str()),
+        ];
+        s.exprs.iter().all(|t| {
+            let Some(NodeEnum::ResTarget(t)) = t.node.as_ref() else {
+                return false;
+            };
+            match t.val.as_deref().and_then(|v| v.node.as_ref()) {
+                Some(NodeEnum::ColumnRef(c)) => match c.fields.as_slice() {
+                    [q, _] => matches!(string(q), Ok(q) if names.contains(&q)),
+                    _ => false,
+                },
+                _ => false,
+            }
+        })
+    }
+
+    fn update(&mut self, s: &pb::UpdateStmt) -> Out {
+        let r = s.relation.as_ref().ok_or("UPDATE target")?;
+        if !s.from_clause.is_empty() && !Self::returns_target_only(s.returning_clause.as_ref(), r) {
+            return Err("UPDATE FROM RETURNING");
         }
-        if !s.using_clause.is_empty() {
-            return Err("DELETE USING");
+        let ctes = self.write_with(s.with_clause.as_ref())?;
+        self.push("UPDATE ");
+        self.range_var(r, true)?;
+        if s.from_clause.is_empty() {
+            self.push_target(r);
+        } else {
+            // The FROM's tables are in scope beside the written one.
+            let mut from = vec![pb::Node {
+                node: Some(NodeEnum::RangeVar(r.clone())),
+            }];
+            from.extend(s.from_clause.iter().cloned());
+            self.push_from(&from);
         }
-        self.push("DELETE FROM ");
-        let r = s.relation.as_ref().ok_or("DELETE target")?;
-        self.range_var(r, false)?;
-        self.push_target(r);
+        let renamed = self.renames.len();
+        let mut rels = vec![pb::Node {
+            node: Some(NodeEnum::RangeVar(r.clone())),
+        }];
+        rels.extend(s.from_clause.iter().cloned());
+        self.enter_from(&rels)?;
+        self.push(" SET ");
+        self.set_list(&s.target_list)?;
+        if !s.from_clause.is_empty() {
+            self.push(" FROM ");
+            self.list(&s.from_clause, Self::table_ref)?;
+        }
         if let Some(w) = &s.where_clause {
             self.push(" WHERE ");
             self.expr(node(w)?, Prec::Or)?;
         }
-        self.returning(s.returning_clause.as_ref())?;
+        self.returning_with_alias(r, s.returning_clause.as_ref())?;
+        self.renames.truncate(renamed);
+        self.leave_from();
         self.pop_scope();
+        self.pop_with(ctes);
+        Ok(())
+    }
+
+    /// A RETURNING of a written table its alias names, which SQLite's reads by its
+    /// name.
+    fn returning_with_alias(&mut self, r: &pb::RangeVar, ret: Option<&pb::ReturningClause>) -> Out {
+        self.returning_table = r.alias.as_ref().map(|a| (a.aliasname.clone(), r.relname.clone()));
+        let out = self.returning(ret);
+        self.returning_table = None;
+        out
+    }
+
+    fn delete(&mut self, s: &pb::DeleteStmt) -> Out {
+        let r = s.relation.as_ref().ok_or("DELETE target")?;
+        let ctes = self.write_with(s.with_clause.as_ref())?;
+        self.push("DELETE FROM ");
+        let renamed = self.renames.len();
+        if s.using_clause.is_empty() {
+            self.range_var(r, true)?;
+            self.push_target(r);
+            self.enter_from(&[pb::Node {
+                node: Some(NodeEnum::RangeVar(r.clone())),
+            }])?;
+            if let Some(w) = &s.where_clause {
+                self.push(" WHERE ");
+                self.expr(node(w)?, Prec::Or)?;
+            }
+        } else {
+            // DELETE ... USING, which SQLite has not: the rows of the join, by rowid,
+            // as rewrite_delete_using writes it.
+            if !Self::returns_target_only(s.returning_clause.as_ref(), r) {
+                return Err("DELETE USING RETURNING");
+            }
+            let mut bare = r.clone();
+            bare.alias = None;
+            self.range_var(&bare, false)?;
+            let mut from = vec![pb::Node {
+                node: Some(NodeEnum::RangeVar(r.clone())),
+            }];
+            from.extend(s.using_clause.iter().cloned());
+            self.push_from(&from);
+            self.enter_from(&from)?;
+            let qual = r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname);
+            self.push(" WHERE rowid IN (SELECT ");
+            self.push(&ident(qual));
+            self.push(".rowid FROM ");
+            self.list(&from, Self::table_ref)?;
+            if let Some(w) = &s.where_clause {
+                self.push(" WHERE ");
+                self.expr(node(w)?, Prec::Or)?;
+            }
+            self.push(")");
+        }
+        self.returning_with_alias(r, s.returning_clause.as_ref())?;
+        self.renames.truncate(renamed);
+        self.leave_from();
+        self.pop_scope();
+        self.pop_with(ctes);
         Ok(())
     }
 
@@ -1208,16 +2050,31 @@ impl Emitter<'_> {
                     // the text passes.
                     t.column(&c.fields);
                 }
+                if let Some(written) = self.renamed(&c.fields)? {
+                    self.push(&written);
+                    return Ok(());
+                }
+                if let Some(ctid) = self.ctid(&c.fields)? {
+                    self.push(&ctid);
+                    return Ok(());
+                }
+                let last = c.fields.len() - 1;
                 for (i, f) in c.fields.iter().enumerate() {
                     if i > 0 {
                         self.push(".");
                     }
                     match node(f)? {
                         NodeEnum::String(s) => {
-                            if matches!(s.sval.as_str(), "ctid" | "xmin" | "xmax" | "oid" | "tableoid") {
+                            if matches!(s.sval.as_str(), "xmin" | "xmax" | "oid" | "tableoid") {
                                 return Err("system column");
                             }
-                            self.push(&ident(&s.sval));
+                            // RETURNING names a written table by its name, not its alias.
+                            match &self.returning_table {
+                                Some((alias, table)) if i == 0 && last > 0 && s.sval == *alias => {
+                                    self.push(&ident(table));
+                                }
+                                _ => self.push(&ident(&s.sval)),
+                            }
                         }
                         NodeEnum::AStar(_) => self.push("*"),
                         _ => return Err("column reference"),
@@ -1305,18 +2162,181 @@ impl Emitter<'_> {
                 self.push(word);
                 Ok(())
             }
-            NodeEnum::SqlvalueFunction(f) if self.typed() => {
+            // ARRAY[...] is the JSON array an array is stored as.
+            NodeEnum::AArrayExpr(arr) => {
+                self.push("json_array(");
+                self.list(&arr.elements, Self::expr_node)?;
+                self.push(")");
+                Ok(())
+            }
+            NodeEnum::AIndirection(i) => self.subscript(i),
+            // The SQL/JSON constructors, as rewrite_sql_json_constructors writes them:
+            // json_array and json_object as jsonb, their NULLs left out unless NULL ON
+            // NULL (JSON_ARRAY's default) or ABSENT ON NULL (JSON_OBJECT's) says.
+            NodeEnum::JsonArrayConstructor(c) => {
+                let values: Vec<&NodeEnum> = c
+                    .exprs
+                    .iter()
+                    .map(|e| match node(e)? {
+                        NodeEnum::JsonValueExpr(v) => boxed(v.raw_expr.as_deref()),
+                        _ => Err("JSON_ARRAY item"),
+                    })
+                    .collect::<Result<_, _>>()?;
+                self.json_constructor("json_array(", &values, c.absent_on_null)
+            }
+            NodeEnum::JsonObjectConstructor(c) => {
+                if c.unique {
+                    return Err("JSON_OBJECT WITH UNIQUE KEYS");
+                }
+                let mut values: Vec<&NodeEnum> = Vec::new();
+                for e in &c.exprs {
+                    let NodeEnum::JsonKeyValue(kv) = node(e)? else {
+                        return Err("JSON_OBJECT item");
+                    };
+                    values.push(boxed(kv.key.as_deref())?);
+                    values.push(boxed(kv.value.as_deref().and_then(|v| v.raw_expr.as_deref()))?);
+                }
+                self.json_constructor("json_object(", &values, c.absent_on_null)
+            }
+            NodeEnum::SqlvalueFunction(f) => {
                 use pb::SqlValueFunctionOp as O;
-                // CURRENT_DATE is the date in the session's zone.
+                // CURRENT_DATE is the date in the session's zone. The session writes the
+                // user and the schema into the statement before it is translated; what is
+                // left of them is the engine's functions (rewrite_niladic_funcs).
                 match O::try_from(f.op) {
-                    Ok(O::SvfopCurrentDate) => self.push("overlite_current_date()"),
-                    Ok(O::SvfopCurrentTimestamp) => self.push("overlite_now(julianday('now'))"),
+                    Ok(O::SvfopCurrentDate) if self.typed() => self.push("overlite_current_date()"),
+                    Ok(O::SvfopCurrentTimestamp) if self.typed() => self.push("overlite_now(julianday('now'))"),
+                    Ok(O::SvfopCurrentUser | O::SvfopCurrentRole | O::SvfopUser) => self.push("current_user()"),
+                    Ok(O::SvfopSessionUser) => self.push("session_user()"),
+                    Ok(O::SvfopCurrentSchema) => self.push("current_schema()"),
+                    Ok(O::SvfopCurrentCatalog) => self.push("current_database()"),
                     _ => return Err("SQL value function"),
                 }
                 Ok(())
             }
+            // DEFAULT in a VALUES row or a SET, which the session fills in before.
+            NodeEnum::SetToDefault(_) => {
+                self.push("DEFAULT");
+                Ok(())
+            }
+            NodeEnum::CollateClause(c) => self.collate(c),
             _ => Err("expression"),
         }
+    }
+
+    fn json_constructor(&mut self, call: &str, values: &[&NodeEnum], absent: bool) -> Out {
+        let absent = absent && !values.is_empty();
+        if absent {
+            self.push("overlite_json_absent(");
+        }
+        self.push("(overlite_cast(");
+        self.push(call);
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                self.push(", ");
+            }
+            self.expr(v, Prec::Or)?;
+        }
+        self.push("), 'jsonb') COLLATE JSONB)");
+        if absent {
+            self.push(")");
+        }
+        Ok(())
+    }
+
+    /// `x COLLATE name`, as rewrite_collate writes it: SQLite's and the engine's own
+    /// collations by their names, a language collation or one CREATE COLLATION made by
+    /// its name, quoted, a case-insensitive one as NOCASE; any other is dropped.
+    fn collate(&mut self, c: &pb::CollateClause) -> Out {
+        let name = match c.collname.as_slice() {
+            [n] | [_, n] => string(n)?,
+            _ => return Err("collation"),
+        };
+        let arg = boxed(c.arg.as_deref())?;
+        let low = name.to_lowercase();
+        let clause = if matches!(low.as_str(), "decimal" | "binary" | "nocase" | "rtrim") {
+            [" COLLATE ", name].concat()
+        } else if overlite_engine::collation_known(name) {
+            [" COLLATE \"", &name.replace('"', "\"\""), "\""].concat()
+        } else if crate::rewrite::operators::collation_is_ci(name) {
+            " COLLATE NOCASE".to_string()
+        } else {
+            String::new()
+        };
+        self.expr(arg, if clause.is_empty() { Prec::Or } else { Prec::Unary })?;
+        self.push(&clause);
+        Ok(())
+    }
+
+    /// A subscript of an array, `a[i]`, as rewrite_array_subscript writes it: the JSON
+    /// element at i - 1, NULL past the end or where the value is no JSON array; a
+    /// slice `a[i:j]` the JSON array of the elements from i to j, of a column only.
+    fn subscript(&mut self, i: &pb::AIndirection) -> Out {
+        let arg = boxed(i.arg.as_deref())?;
+        let mut out = String::new();
+        std::mem::swap(&mut self.out, &mut out);
+        let r = self.expr(arg, Prec::Or);
+        std::mem::swap(&mut self.out, &mut out);
+        r?;
+        for x in &i.indirection {
+            let NodeEnum::AIndices(ix) = node(x)? else {
+                return Err("field selection");
+            };
+            let bound = |me: &mut Self, b: Option<&pb::Node>| -> Result<Option<String>, Unsupported> {
+                let Some(b) = b else { return Ok(None) };
+                let b = node(b)?;
+                me.note_param(b, Ty::of(Base::Int4));
+                let mut text = String::new();
+                std::mem::swap(&mut me.out, &mut text);
+                let r = me.expr(b, Prec::Or);
+                std::mem::swap(&mut me.out, &mut text);
+                r?;
+                Ok(Some(text))
+            };
+            let lo = bound(self, ix.lidx.as_deref())?;
+            let hi = bound(self, ix.uidx.as_deref())?;
+            if ix.is_slice {
+                if !matches!(arg, NodeEnum::ColumnRef(_)) || i.indirection.len() > 1 {
+                    return Err("slice of what is no column");
+                }
+                let mut conds = Vec::new();
+                if let Some(lo) = lo {
+                    conds.push(["key + 1 >= (", &lo, ")"].concat());
+                }
+                if let Some(hi) = hi {
+                    conds.push(["key + 1 <= (", &hi, ")"].concat());
+                }
+                let filter = if conds.is_empty() {
+                    String::new()
+                } else {
+                    [" WHERE ", &conds.join(" AND ")].concat()
+                };
+                out = [
+                    "CASE WHEN json_valid(",
+                    &out,
+                    ") THEN overlite_array((SELECT json_group_array(value) FROM json_each(",
+                    &out,
+                    ")",
+                    &filter,
+                    ")) END",
+                ]
+                .concat();
+            } else {
+                let idx = hi.ok_or("subscript")?;
+                out = [
+                    "CASE WHEN json_valid(",
+                    &out,
+                    ") THEN json_extract(",
+                    &out,
+                    ", '$[' || ((",
+                    &idx,
+                    ")-1) || ']') END",
+                ]
+                .concat();
+            }
+        }
+        self.push(&out);
+        Ok(())
     }
 
     /// The arguments of COALESCE, GREATEST or LEAST: with the environment, beside a
@@ -1345,6 +2365,66 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// ctid, the row's identifier, which a table calls rowid in SQLite: None for a
+    /// reference to another column.
+    fn ctid(&mut self, fields: &[pb::Node]) -> Result<Option<String>, Unsupported> {
+        let parts: Vec<&str> = match fields.iter().map(string).collect::<Result<Vec<_>, _>>() {
+            Ok(p) if p.last() == Some(&"ctid") => p,
+            _ => return Ok(None),
+        };
+        // A table may have a column of that name, which SQLite lets it have.
+        if let Some(t) = &mut self.typer
+            && t.column(fields).is_some_and(|c| c.ty.known())
+        {
+            return Ok(None);
+        }
+        let scope = self.froms.last().map_or(&[][..], Vec::as_slice);
+        match parts.as_slice() {
+            // An output column named ctid, in the ORDER BY that reads it.
+            ["ctid"] if self.ctid_output => Ok(Some("ctid".to_string())),
+            ["ctid"] if !scope.is_empty() && scope.iter().all(|(_, table)| *table) => Ok(Some("rowid".to_string())),
+            [q, "ctid"] => {
+                for scope in self.froms.iter().rev() {
+                    if let Some((_, table)) = scope.iter().find(|(n, _)| n == q) {
+                        return Ok(Some(
+                            [ident(q).as_str(), if *table { ".rowid" } else { ".ctid" }].concat(),
+                        ));
+                    }
+                }
+                Err("system column")
+            }
+            _ => Err("system column"),
+        }
+    }
+
+    /// A column of a table function written in place, under the name SQLite gives it
+    /// (`u.x` is `u.value`), when fields name one.
+    fn renamed(&self, fields: &[pb::Node]) -> Result<Option<String>, Unsupported> {
+        if self.renames.is_empty() {
+            return Ok(None);
+        }
+        let parts: Vec<&str> = match fields.iter().map(string).collect::<Result<Vec<_>, _>>() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let found = match parts.as_slice() {
+            [alias, col] => self
+                .renames
+                .iter()
+                .rev()
+                .find(|(a, _)| a == alias)
+                .and_then(|(a, cols)| cols.iter().find(|(n, _)| n == col).map(|(_, w)| (a, w))),
+            [col] => self
+                .renames
+                .iter()
+                .rev()
+                .find_map(|(a, cols)| cols.iter().find(|(n, _)| n == col).map(|(_, w)| (a, w))),
+            _ => None,
+        };
+        let _ = &found;
+        Ok(found.map(|(_, written)| written.clone()))
+    }
+
     fn constant(&mut self, k: &pb::AConst) -> Out {
         if k.isnull {
             self.push("NULL");
@@ -1366,7 +2446,16 @@ impl Emitter<'_> {
             Val::Fval(f) => self.push(&f.fval),
             Val::Boolval(b) => self.push(if b.boolval { "true" } else { "false" }),
             Val::Sval(s) => self.push(&quote_literal(&s.sval)),
-            Val::Bsval(_) => return Err("bit string"),
+            // X'1F' is a bit string in Postgres; the text passes leave it to SQLite, which
+            // reads a blob, and clients write bytes so.
+            Val::Bsval(b) => match b.bsval.strip_prefix('x') {
+                Some(hex) if hex.bytes().all(|c| c.is_ascii_hexdigit()) => {
+                    self.push("X'");
+                    self.push(hex);
+                    self.push("'");
+                }
+                _ => return Err("bit string"),
+            },
         }
         Ok(())
     }
@@ -1432,6 +2521,27 @@ impl Emitter<'_> {
     fn cast(&mut self, t: &pb::TypeCast) -> Out {
         let ty = t.type_name.as_ref().ok_or("cast type")?;
         let arg = boxed(t.arg.as_deref())?;
+        if !ty.array_bounds.is_empty() {
+            // An array: the engine reads it and makes each element its type, whatever
+            // form it comes in (a stored JSON array, Postgres' text, a parameter), as
+            // the text passes write a cast of a literal or a parameter
+            // (rewrite_array_cast).
+            if ty.setof || ty.pct_type {
+                return Err("array or SETOF type");
+            }
+            let mut elem = ty.clone();
+            elem.array_bounds.clear();
+            let name = cast_type(&elem)?.replace(", ", ",");
+            if self.typed() {
+                self.note_param(arg, types::of_type_name(ty));
+            }
+            self.push("overlite_assign(");
+            self.expr(arg, Prec::Or)?;
+            self.push(", ");
+            self.push(&quote_literal(&[name.as_str(), "[]"].concat()));
+            self.push(")");
+            return Ok(());
+        }
         let name = cast_type(ty)?;
         if self.typed() {
             let target = types::of_type_name(ty);
@@ -1465,6 +2575,19 @@ impl Emitter<'_> {
             }
         }
         match name.as_str() {
+            // A text search configuration is its name; a query and a vector are read by
+            // the engine's input functions (rewrite_fts).
+            "regconfig" => self.expr(arg, Prec::Atom)?,
+            "tsquery" | "tsvector" if is_string(arg) => {
+                self.push(if name == "tsquery" {
+                    "tsquery_in("
+                } else {
+                    "tsvector_in("
+                });
+                self.expr(arg, Prec::Or)?;
+                self.push(")");
+            }
+            "tsquery" | "tsvector" => self.expr(arg, Prec::Atom)?,
             // hstore is stored as its text: a literal is read by hstore_in, anything
             // else is one already.
             "hstore" => {
@@ -1613,6 +2736,43 @@ impl Emitter<'_> {
                 }
                 Ok(())
             }
+            // `x = ANY (array)` and `x <> ALL (array)`: a list in ARRAY[...] is an IN list,
+            // as rewrite_any_array writes it, any other array the elements json_each
+            // reads of it, whatever form it is in (rewrite_any_array_expr).
+            K::AexprOpAny | K::AexprOpAll => {
+                let not = match (kind, op) {
+                    (K::AexprOpAny, "=") => false,
+                    (K::AexprOpAll, "<>" | "!=") => true,
+                    _ => return Err("ANY or ALL of another operator"),
+                };
+                let (l, r) = (boxed(a.lexpr.as_deref())?, boxed(a.rexpr.as_deref())?);
+                let tl = self.ty(l);
+                self.expr(l, Prec::Compare)?;
+                self.push(if not { " NOT IN (" } else { " IN (" });
+                if let NodeEnum::AArrayExpr(arr) = r {
+                    for (i, x) in arr.elements.iter().enumerate() {
+                        if i > 0 {
+                            self.push(", ");
+                        }
+                        self.value(node(x)?, tl, Prec::Or)?;
+                    }
+                } else {
+                    if tl.known() && !tl.array {
+                        self.note_param(
+                            r,
+                            Ty {
+                                base: tl.base,
+                                array: true,
+                            },
+                        );
+                    }
+                    self.push("SELECT value FROM json_each(overlite_array_json(");
+                    self.expr(r, Prec::Or)?;
+                    self.push("))");
+                }
+                self.push(")");
+                Ok(())
+            }
             K::AexprBetween | K::AexprNotBetween => {
                 let NodeEnum::List(b) = boxed(a.rexpr.as_deref())? else {
                     return Err("BETWEEN bounds");
@@ -1678,6 +2838,24 @@ impl Emitter<'_> {
             "+" | "-" | "*" | "/" => self.arithmetic(a, op),
             "||" => {
                 let (tl, tr) = (self.ty(l), self.ty(r));
+                if tl.array || tr.array {
+                    // Two arrays end to end, or an element put at one end.
+                    let kinds = match (tl.array, tr.array) {
+                        (true, true) => "aa",
+                        (true, false) if tr.base == Base::Unknown && is_string(r) => "aa",
+                        (true, false) => "ae",
+                        (false, true) if tl.base == Base::Unknown && is_string(l) => "aa",
+                        _ => "ea",
+                    };
+                    self.push("overlite_array_cat(");
+                    self.array_value(l, tr, kinds.starts_with('a'))?;
+                    self.push(", ");
+                    self.array_value(r, tl, kinds.ends_with('a'))?;
+                    self.push(", '");
+                    self.push(kinds);
+                    self.push("')");
+                    return Ok(());
+                }
                 if tl.is(Base::Tsvector) || tr.is(Base::Tsvector) {
                     // Two vectors' lexemes, the right one's positions shifted.
                     self.push("ts_concat(");
@@ -1696,7 +2874,28 @@ impl Emitter<'_> {
             "@>" | "<@" | "&&" | "-|-" | "<<" | ">>" | "&<" | "&>" if self.is_range(l) || self.is_range(r) => {
                 self.range_op(op, l, r)
             }
+            "@>" | "<@" | "&&" if self.ty(l).array || self.ty(r).array => self.array_op(op, l, r),
             "->" | "->>" | "#>" | "#>>" | "@>" | "<@" | "?" | "?|" | "?&" => self.json_op(a, op, l, r),
+            // Full-text search's match, the engine's (rewrite_fts), the vector first.
+            "@@" => {
+                let (v, q) = if self.ty(l).is(Base::Tsquery) { (r, l) } else { (l, r) };
+                self.push("ts_match(");
+                self.expr(v, Prec::Or)?;
+                self.push(", ");
+                self.expr(q, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
+            // Overlap of what the catalog does not know, an array or a range, as the
+            // text passes write it.
+            "&&" if self.ty(l).base == Base::Any || self.ty(r).base == Base::Any => {
+                self.push("overlite_overlaps(");
+                self.expr(l, Prec::Or)?;
+                self.push(", ");
+                self.expr(r, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
             "%" => {
                 // pg_trgm's similarity on text, a remainder on numbers: only the types tell.
                 let (tl, tr) = (self.ty(l), self.ty(r));
@@ -1709,7 +2908,10 @@ impl Emitter<'_> {
                     self.push(", '%')");
                     return Ok(());
                 }
-                if (tl.is_integer() || tl.is_numeric()) && (tr.is_integer() || tr.is_numeric()) {
+                // Of numbers a remainder, and of what the catalog does not know, as the
+                // text passes take it.
+                let num = |t: Ty| t.is_integer() || t.is_numeric() || t.base == Base::Any;
+                if num(tl) && num(tr) {
                     self.expr(l, Prec::Mul)?;
                     self.push(" % ");
                     return self.expr(r, Prec::Concat);
@@ -1718,6 +2920,61 @@ impl Emitter<'_> {
             }
             _ => Err("operator"),
         }
+    }
+
+    /// The array operators: containment as json_contains reads two JSON arrays, overlap
+    /// as overlite_overlaps, the text passes' functions, each side an array or a
+    /// literal or a parameter read as the other's type.
+    fn array_op(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+        let (tl, tr) = (self.ty(l), self.ty(r));
+        let side = |t: Ty| t.array || matches!(t.base, Base::Unknown | Base::Any);
+        if !(side(tl) && side(tr)) {
+            return Err("array operator with a side that is no array");
+        }
+        let (a, b, ta, tb) = if op == "<@" { (r, l, tr, tl) } else { (l, r, tl, tr) };
+        self.push(if op == "&&" {
+            "overlite_overlaps("
+        } else {
+            "json_contains("
+        });
+        self.array_value(a, tb, true)?;
+        self.push(", ");
+        self.array_value(b, ta, true)?;
+        self.push(")");
+        Ok(())
+    }
+
+    /// n beside an array of type other: an untyped literal or a parameter read as that
+    /// array when it stands for one, anything else as it is.
+    fn array_value(&mut self, n: &NodeEnum, other: Ty, array: bool) -> Out {
+        let lit = is_string(n) || matches!(n, NodeEnum::ParamRef(_));
+        if !(array && lit && self.ty(n).base == Base::Unknown && other.array && other.known()) {
+            if !array && other.array {
+                self.note_param(n, Ty::of(other.base));
+            }
+            return self.expr(n, Prec::Or);
+        }
+        self.note_param(n, other);
+        self.push("overlite_assign(");
+        self.expr(n, Prec::Or)?;
+        self.push(", ");
+        let elem = Ty::of(other.base).cast_name().or(match other.base {
+            Base::Int2 => Some("smallint"),
+            Base::Int4 => Some("integer"),
+            Base::Int8 => Some("bigint"),
+            Base::Float4 => Some("real"),
+            Base::Float8 => Some("double precision"),
+            Base::Bool => Some("boolean"),
+            Base::Text => Some("text"),
+            Base::Varchar => Some("varchar"),
+            Base::Uuid => Some("uuid"),
+            Base::Jsonb => Some("jsonb"),
+            Base::Json => Some("json"),
+            _ => None,
+        });
+        self.push(&quote_literal(&[elem.unwrap_or("text"), "[]"].concat()));
+        self.push(")");
+        Ok(())
     }
 
     /// Whether the environment knows n is a range.
@@ -1735,7 +2992,7 @@ impl Emitter<'_> {
     /// side is a range too, or a literal or a parameter read as one.
     fn range_op(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
         let (tl, tr) = (self.ty(l), self.ty(r));
-        let ok = |me: &mut Self, n: &NodeEnum, t: Ty| me.is_range(n) || t.base == Base::Unknown;
+        let ok = |me: &mut Self, n: &NodeEnum, t: Ty| me.is_range(n) || matches!(t.base, Base::Unknown | Base::Any);
         if !(ok(self, l, tl) && ok(self, r, tr)) {
             return Err(TYPE_REFUSAL_RANGE);
         }
@@ -1758,8 +3015,14 @@ impl Emitter<'_> {
     /// `#>>` overlite_jsonb_path; `@>` and `<@` json_contains; `?`, `?|` and `?&`
     /// jsonb_exists, jsonb_exists_any and jsonb_exists_all.
     fn json_op(&mut self, a: &pb::AExpr, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
-        let tl = self.ty(l);
-        if !(tl.is(Base::Jsonb) || tl.is(Base::Json)) {
+        let (tl, tr) = (self.ty(l), self.ty(r));
+        // What the catalog does not know is taken for json, as the text passes take it:
+        // hstore, stored as JSON text, answers `->`, `?` and `@>` the same; containment
+        // of a known scalar is a range's.
+        let any_json = tl.base == Base::Any
+            && !tl.array
+            && (!matches!(op, "@>" | "<@") || matches!(tr.base, Base::Any | Base::Unknown | Base::Json | Base::Jsonb));
+        if !(tl.is(Base::Jsonb) || tl.is(Base::Json) || any_json) {
             return Err(TYPE_REFUSAL_JSON);
         }
         match op {
@@ -1970,7 +3233,9 @@ impl Emitter<'_> {
         terms.extend(ops.iter().map(|(_, t)| *t));
         let tys: Vec<Ty> = terms.iter().map(|t| self.ty(t)).collect();
         let temporal = tys.iter().any(|t| t.is_temporal());
-        let decimal = tys.iter().any(|t| t.is_numeric());
+        // A float beside a numeric makes the numeric a float, as Postgres casts it.
+        let decimal =
+            tys.iter().any(|t| t.is_numeric()) && !tys.iter().any(|t| t.is(Base::Float4) || t.is(Base::Float8));
         if temporal {
             // Each step's kinds: the running result's, and the term's.
             let mut acc = tys[0];
@@ -2111,6 +3376,8 @@ impl Emitter<'_> {
         }
         let name = match f.funcname.as_slice() {
             [n] => string(n)?,
+            // pg_catalog's functions are the ones a bare name calls.
+            [schema, n] if string(schema)? == "pg_catalog" => string(n)?,
             _ => return Err("qualified function"),
         };
         if self.typed() && f.args.is_empty() && f.over.is_none() && f.agg_filter.is_none() {
@@ -2147,35 +3414,34 @@ impl Emitter<'_> {
             self.push(")");
             return Ok(());
         }
-        if !PLAIN_FUNCTIONS.contains(&name) && !name.starts_with("overlite_") {
-            return Err("function");
-        }
-        if f.over.is_some()
-            || f.agg_filter.is_some()
-            || !f.agg_order.is_empty()
-            || f.agg_within_group
-            || f.func_variadic
-        {
+        if f.agg_within_group || f.func_variadic {
             return Err("aggregate or window clause");
+        }
+        // TRIM([BOTH | LEADING | TRAILING] [chars] FROM s) is btrim, ltrim or rtrim in the
+        // tree, SQLite's trim, ltrim and rtrim of the same arguments (rewrite_trim_from).
+        if f.funcformat == pb::CoercionForm::CoerceSqlSyntax as i32
+            && matches!(name, "btrim" | "ltrim" | "rtrim")
+            && f.over.is_none()
+            && f.agg_filter.is_none()
+        {
+            self.push(if name == "btrim" { "trim(" } else { name });
+            if name != "btrim" {
+                self.push("(");
+            }
+            self.list(&f.args, Self::expr_node)?;
+            self.push(")");
+            return Ok(());
         }
         if f.funcformat != pb::CoercionForm::CoerceExplicitCall as i32 {
             return Err("special function syntax");
         }
-        if self.typed() {
-            let args: Vec<&NodeEnum> = f.args.iter().map(node).collect::<Result<_, _>>()?;
+        if REWRITTEN.contains(&name) && !JSON_RENAMES.iter().any(|(n, _, _)| *n == name) && name != "string_agg" {
+            return Err("function");
+        }
+        let clauses = f.over.is_some() || f.agg_filter.is_some() || !f.agg_order.is_empty();
+        let args: Vec<&NodeEnum> = f.args.iter().map(node).collect::<Result<_, _>>()?;
+        if self.typed() && !clauses {
             match (name, args.as_slice()) {
-                // bool_and and bool_or are MIN and MAX over the truth values, read as
-                // Postgres' boolin reads them.
-                ("bool_and" | "bool_or", [x]) if !f.agg_distinct => {
-                    self.push(if name == "bool_or" {
-                        "pg_bool(max(overlite_bool("
-                    } else {
-                        "pg_bool(min(overlite_bool("
-                    });
-                    self.expr(x, Prec::Or)?;
-                    self.push(")))");
-                    return Ok(());
-                }
                 // What the session writes for a value stored or cast to a type: one
                 // given for a timestamptz is a wall clock in the session's zone, and a
                 // timestamptz written on goes with its offset, which no zone misreads.
@@ -2214,18 +3480,138 @@ impl Emitter<'_> {
                 _ => {}
             }
         }
-        self.push(name);
+        // bool_and and bool_or are MIN and MAX over the truth values, read as Postgres'
+        // boolin reads them.
+        if self.typed()
+            && let ("bool_and" | "bool_or", [x]) = (name, args.as_slice())
+            && !f.agg_distinct
+        {
+            self.push(if name == "bool_or" {
+                "pg_bool(max(overlite_bool("
+            } else {
+                "pg_bool(min(overlite_bool("
+            });
+            self.expr(x, Prec::Or)?;
+            self.push("))");
+            self.call_clauses(f)?;
+            self.push(")");
+            return Ok(());
+        }
+        // avg of integers is a numeric, Postgres' sum divided by the count at its
+        // scale, where SQLite's is a double.
+        if name == "avg"
+            && self.typed()
+            && let [x] = args.as_slice()
+            && self.ty(x).is_integer()
+            && f.agg_order.is_empty()
+        {
+            let distinct = if f.agg_distinct { "DISTINCT " } else { "" };
+            self.push("overlite_cast(overlite_numeric_op(sum(");
+            self.push(distinct);
+            self.expr(x, Prec::Or)?;
+            self.push(")");
+            self.call_clauses(f)?;
+            self.push(", count(");
+            self.push(distinct);
+            self.expr(x, Prec::Or)?;
+            self.push(")");
+            self.call_clauses(f)?;
+            self.push(", '/'), 'numeric')");
+            return Ok(());
+        }
+        // array_agg is the JSON array an array is stored as (NULL over no rows, as
+        // Postgres' is), where the engine's aggregate wrote Postgres' text.
+        if name == "array_agg" && self.typed() {
+            let [x] = args.as_slice() else {
+                return Err("array_agg");
+            };
+            let elem = self.ty(x);
+            if elem.array {
+                return Err("array_agg of arrays");
+            }
+            self.push("overlite_array(nullif(json_group_array(");
+            if f.agg_distinct {
+                self.push("DISTINCT ");
+            }
+            self.json_element(x, elem)?;
+            if !f.agg_order.is_empty() {
+                self.push(" ORDER BY ");
+                self.sort_keys(&f.agg_order)?;
+            }
+            self.push(")");
+            self.call_clauses(f)?;
+            self.push(", '[]'))");
+            return Ok(());
+        }
+        // The json builders and aggregates by SQLite's names, those of jsonb in its
+        // collation, as rewrite_json_funcs writes them.
+        let (call, jsonb) = match JSON_RENAMES.iter().find(|(n, _, _)| *n == name) {
+            Some((_, to, jsonb)) => (*to, *jsonb),
+            None if name == "string_agg" && f.agg_distinct => ("overlite_string_agg_distinct", false),
+            None if name == "string_agg" => ("group_concat", false),
+            None => (name, false),
+        };
+        if jsonb {
+            self.push("(overlite_cast(");
+        }
+        if call.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric()) {
+            self.push(call);
+        } else {
+            self.push(&quote_ident(call));
+        }
         self.push("(");
         if f.agg_star {
             self.push("*");
         } else {
-            if f.agg_distinct {
+            if f.agg_distinct && call != "overlite_string_agg_distinct" {
                 self.push("DISTINCT ");
             }
             self.list(&f.args, Self::expr_node)?;
+            if !f.agg_order.is_empty() {
+                self.push(" ORDER BY ");
+                self.sort_keys(&f.agg_order)?;
+            }
         }
         self.push(")");
+        self.call_clauses(f)?;
+        if jsonb {
+            self.push(", 'jsonb') COLLATE JSONB)");
+        }
         Ok(())
+    }
+
+    /// An aggregate's FILTER and a window function's OVER, after its call.
+    fn call_clauses(&mut self, f: &pb::FuncCall) -> Out {
+        if let Some(w) = &f.agg_filter {
+            self.push(" FILTER (WHERE ");
+            self.expr(node(w)?, Prec::Or)?;
+            self.push(")");
+        }
+        if let Some(w) = &f.over {
+            self.push(" OVER ");
+            let w = w.as_ref();
+            let bare = w.partition_clause.is_empty() && w.order_clause.is_empty() && w.frame_options & 0x1 == 0;
+            if !w.name.is_empty() && bare && w.refname.is_empty() {
+                self.push(&ident(&w.name));
+            } else {
+                self.window_spec(w)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// x as an element of a JSON array: a boolean as JSON's true or false, where SQLite
+    /// keeps one as 1 or 0.
+    fn json_element(&mut self, x: &NodeEnum, ty: Ty) -> Out {
+        if ty.is(Base::Bool) {
+            self.push("CASE WHEN ");
+            self.expr(x, Prec::Or)?;
+            self.push(" IS NULL THEN NULL WHEN ");
+            self.expr(x, Prec::Or)?;
+            self.push(" THEN json('true') ELSE json('false') END");
+            return Ok(());
+        }
+        self.expr(x, Prec::Or)
     }
 
     /// overlite_assign or overlite_cast of x to the type target names, as the session
@@ -2327,6 +3713,13 @@ impl Emitter<'_> {
                 self.push(")");
                 Ok(())
             }
+            ("btrim" | "ltrim" | "rtrim", _) => {
+                self.push(if name == "btrim" { "trim" } else { name });
+                self.push("(");
+                self.list(&f.args, Self::expr_node)?;
+                self.push(")");
+                Ok(())
+            }
             _ => Err("special function syntax"),
         }
     }
@@ -2340,6 +3733,27 @@ impl Emitter<'_> {
             }
             SubLinkType::ExprSublink => self.subquery(s),
             SubLinkType::AnySublink if s.oper_name.is_empty() => self.in_subquery(s, false),
+            // `x = ANY (subquery)` is IN, `x <> ALL (subquery)` NOT IN.
+            SubLinkType::AnySublink if sublink_op(s) == Some("=") => self.in_subquery(s, false),
+            SubLinkType::AllSublink if matches!(sublink_op(s), Some("<>" | "!=")) => self.in_subquery(s, true),
+            // ARRAY(subquery): the JSON array of its rows, in their order, as
+            // rewrite_array_subquery writes it.
+            SubLinkType::ArraySublink => {
+                let NodeEnum::SelectStmt(q) = boxed(s.subselect.as_deref())? else {
+                    return Err("subquery");
+                };
+                if q.op != SetOperation::SetopNone as i32 || q.target_list.len() != 1 || !q.values_lists.is_empty() {
+                    return Err("ARRAY of a subquery of more than one column");
+                }
+                let mut q = q.as_ref().clone();
+                if let Some(NodeEnum::ResTarget(t)) = q.target_list[0].node.as_mut() {
+                    t.name = "_a".to_string();
+                }
+                self.push("overlite_array((SELECT json_group_array(_a) FROM (");
+                self.select(&q, false)?;
+                self.push(")))");
+                Ok(())
+            }
             _ => Err("sublink kind"),
         }
     }
@@ -2363,6 +3777,186 @@ impl Emitter<'_> {
         self.push(")");
         Ok(())
     }
+}
+
+/// The operator of `x op ANY (subquery)`.
+fn sublink_op(s: &pb::SubLink) -> Option<&str> {
+    match s.oper_name.as_slice() {
+        [n] => string(n).ok(),
+        _ => None,
+    }
+}
+
+/// A set-returning function of a FROM, as the engine walks it (`range_function`).
+pub(crate) struct Srf<'a> {
+    pub name: &'static str,
+    pub args: Vec<&'a NodeEnum>,
+    /// It has keys: overlite_pairs walks it.
+    pairs: bool,
+    /// It reads a column, of a table to its left: written in place.
+    lateral: bool,
+    /// Its alias, the statement's or its name.
+    pub alias: String,
+    /// Whether the statement gave the alias.
+    aliased: bool,
+    /// Its columns as the statement names them, the ordinality last.
+    pub names: Vec<String>,
+    /// The same columns as the walker's row holds them: `value`, `key`, `ord`, or a
+    /// zipped array's element (`json_extract(value, '$[1]')`).
+    columns: Vec<String>,
+}
+
+impl Srf<'_> {
+    /// A column as read from the walker under alias, for one written in place.
+    fn column_of(&self, i: usize, alias: &str) -> String {
+        let c = &self.columns[i];
+        match c.strip_prefix("json_extract(value") {
+            Some(rest) => ["json_extract(", &ident(alias), ".value", rest].concat(),
+            None => [ident(alias).as_str(), ".", c].concat(),
+        }
+    }
+}
+
+/// The set-returning functions the engine walks, as rewrite/srf.rs knows them.
+const SRFS: &[&str] = &[
+    "unnest",
+    "generate_subscripts",
+    "generate_series",
+    "json_each_text",
+    "jsonb_each_text",
+    "json_each",
+    "jsonb_each",
+    "json_array_elements_text",
+    "jsonb_array_elements_text",
+    "json_array_elements",
+    "jsonb_array_elements",
+    "json_object_keys",
+    "jsonb_object_keys",
+    "regexp_split_to_table",
+];
+
+/// The set-returning function a FROM item calls, None for another function.
+pub(crate) fn srf_from(r: &pb::RangeFunction) -> Result<Option<Srf<'_>>, Unsupported> {
+    let [item] = r.functions.as_slice() else {
+        return Ok(None);
+    };
+    let NodeEnum::List(l) = node(item)? else {
+        return Err("FROM function");
+    };
+    let NodeEnum::FuncCall(f) = node(l.items.first().ok_or("FROM function")?)? else {
+        return Ok(None);
+    };
+    let fname = match f.funcname.as_slice() {
+        [n] => string(n)?,
+        [schema, n] if string(schema)? == "pg_catalog" => string(n)?,
+        _ => return Ok(None),
+    };
+    let Some(name) = SRFS.iter().find(|n| **n == fname).copied() else {
+        return Ok(None);
+    };
+    if !r.coldeflist.is_empty() || r.is_rowsfrom || f.agg_star || f.agg_distinct || f.over.is_some() {
+        return Err("set-returning function's clauses");
+    }
+    let args: Vec<&NodeEnum> = f.args.iter().map(node).collect::<Result<_, _>>()?;
+    if args.is_empty() {
+        return Err("set-returning function of nothing");
+    }
+    let width = if name == "unnest" { args.len() } else { 1 };
+    let pairs = name.contains("_each");
+    let lateral = args.iter().any(|a| reads_column(a));
+    let (alias, aliased) = match &r.alias {
+        Some(a) => (a.aliasname.clone(), true),
+        None => (name.to_string(), false),
+    };
+    let colnames: Vec<String> = r
+        .alias
+        .iter()
+        .flat_map(|a| a.colnames.iter())
+        .map(|c| string(c).map(str::to_string))
+        .collect::<Result<_, _>>()?;
+    let (mut names, mut columns): (Vec<String>, Vec<String>) = if pairs {
+        (vec!["key".into(), "value".into()], vec!["key".into(), "value".into()])
+    } else if name.contains("array_elements") {
+        (vec!["value".into()], vec!["value".into()])
+    } else if width > 1 {
+        (
+            vec![name.to_string(); width],
+            (0..width).map(|i| format!("json_extract(value, '$[{i}]')")).collect(),
+        )
+    } else {
+        (vec![alias.clone()], vec!["value".into()])
+    };
+    if r.ordinality {
+        names.push("ordinality".into());
+        columns.push("ord".into());
+    }
+    if colnames.len() > names.len() {
+        return Err("set-returning function's column list");
+    }
+    for (n, c) in names.iter_mut().zip(colnames) {
+        *n = c;
+    }
+    Ok(Some(Srf {
+        name,
+        args,
+        pairs,
+        lateral,
+        alias,
+        aliased,
+        names,
+        columns,
+    }))
+}
+
+/// Whether a select list has an output named ctid.
+fn names_ctid(items: &[pb::Node]) -> bool {
+    items.iter().any(|t| match t.node.as_ref() {
+        Some(NodeEnum::ResTarget(t)) if t.name == "ctid" => true,
+        Some(NodeEnum::ResTarget(t)) if t.name.is_empty() => matches!(
+            t.val.as_deref().and_then(|v| v.node.as_ref()),
+            Some(NodeEnum::ColumnRef(c)) if c.fields.last().and_then(|f| string(f).ok()) == Some("ctid")
+        ),
+        _ => false,
+    })
+}
+
+/// Whether an expression reads a column.
+fn reads_column(n: &NodeEnum) -> bool {
+    format!("{n:?}").contains("ColumnRef(")
+}
+
+/// The names of a query's output columns, as Postgres names them; a star is not known.
+fn output_names(q: &pb::SelectStmt) -> Result<Vec<String>, Unsupported> {
+    if q.op != SetOperation::SetopNone as i32 {
+        return output_names(q.larg.as_deref().ok_or("set operation arms")?);
+    }
+    if let Some(row) = q.values_lists.first() {
+        let NodeEnum::List(row) = node(row)? else {
+            return Err("VALUES row");
+        };
+        return Ok((1..=row.items.len()).map(|k| format!("column{k}")).collect());
+    }
+    q.target_list
+        .iter()
+        .map(|t| {
+            let NodeEnum::ResTarget(t) = node(t)? else {
+                return Err("target");
+            };
+            if !t.name.is_empty() {
+                return Ok(t.name.clone());
+            }
+            match boxed(t.val.as_deref())? {
+                NodeEnum::ColumnRef(c) => match node(c.fields.last().ok_or("column")?)? {
+                    NodeEnum::String(s) => Ok(s.sval.clone()),
+                    _ => Err("star in a derived column list"),
+                },
+                v => match figure_colname(v) {
+                    Label::Named(l) => Ok(l),
+                    Label::Itself => Err("target"),
+                },
+            }
+        })
+        .collect()
 }
 
 /// The name of a range type.
@@ -2513,6 +4107,12 @@ fn cast_type(t: &pb::TypeName) -> Result<String, Unsupported> {
         "text" | "date" | "uuid" | "json" | "jsonb" | "bytea" | "interval" | "name" | "hstore" | "inet" | "cidr"
         | "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => b,
         "time" | "timetz" | "timestamp" | "timestamptz" => b,
+        "float" => "double precision",
+        "regconfig" | "tsquery" | "tsvector" => b,
+        // The catalog's reg* types are stage 5's; another name is the engine's to read
+        // or refuse (an enum, a type it does not know), as the text passes leave it.
+        b if b.starts_with("reg") || b == "oid" => return Err("cast type"),
+        b if names.len() == 1 && b.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric()) => b,
         _ => return Err("cast type"),
     };
     Ok(match (base, mods.as_slice()) {

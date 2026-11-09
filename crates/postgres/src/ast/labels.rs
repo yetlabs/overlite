@@ -111,6 +111,19 @@ fn figure(n: &NodeEnum) -> Option<(String, u8)> {
             _ => None,
         },
         NodeEnum::AArrayExpr(_) => Some(("array".to_string(), 2)),
+        NodeEnum::JsonArrayConstructor(_) => Some(("json_array".to_string(), 2)),
+        NodeEnum::JsonObjectConstructor(_) => Some(("json_object".to_string(), 2)),
+        NodeEnum::CollateClause(c) => c.arg.as_deref().and_then(|a| a.node.as_ref()).and_then(figure),
+        // The last field a subscript or a selection names, else its operand's.
+        NodeEnum::AIndirection(i) => i
+            .indirection
+            .iter()
+            .rev()
+            .find_map(|x| match x.node.as_ref()? {
+                NodeEnum::String(s) => Some((s.sval.clone(), 2)),
+                _ => None,
+            })
+            .or_else(|| i.arg.as_deref().and_then(|a| a.node.as_ref()).and_then(figure)),
         NodeEnum::RowExpr(_) => Some(("row".to_string(), 2)),
         NodeEnum::SqlvalueFunction(f) => Some((sql_value_name(f.op)?.to_string(), 2)),
         NodeEnum::AConst(k) => match &k.val {

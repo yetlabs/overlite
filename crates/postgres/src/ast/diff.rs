@@ -78,10 +78,24 @@ pub(crate) fn text_route(sql: &str) -> String {
     overlite_engine::type_passes_without_tables(&text_tail(&rewrite_full(sql)))
 }
 
-/// Runs both paths over the corpus.
+/// The query a statement wraps that the session translates alone: an EXPLAIN's, a
+/// DECLARE's, a `COPY (query) TO STDOUT`'s.
+pub(crate) fn wrapped_query(sql: &str) -> Option<String> {
+    if let Some(q) = crate::session::explain::explained(sql) {
+        return Some(q.to_string());
+    }
+    if crate::session::cursor::is_cursor_statement(sql) {
+        return crate::session::cursor::declared_query(sql);
+    }
+    crate::session::copy::parse_copy(sql).and_then(|c| c.query().map(str::to_string))
+}
+
+/// Runs both paths over the corpus, a statement that wraps a query (EXPLAIN, DECLARE,
+/// COPY) by that query, which is what the session translates.
 pub(crate) fn run() -> Tally {
     let mut t = Tally::default();
     for (src, sql) in corpus() {
+        let sql = wrapped_query(&sql).unwrap_or(sql);
         let slot = t.per_source.entry(src).or_default();
         if needs_no_rewrite(&sql) {
             t.fast_path += 1;
@@ -183,7 +197,12 @@ fn printer_writes_what_postgres_read() {
     );
     // What only types tell apart, and groupings SQLite cannot write, go to the text passes.
     assert!(t("SELECT name FROM t WHERE name % 'x'").is_err());
-    assert!(t("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3").is_err());
+    // A set operation on the right of one is read from a subquery: Postgres binds
+    // INTERSECT tighter, SQLite reads a compound left to right.
+    assert_eq!(
+        t("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3").as_deref(),
+        Ok("SELECT 1 AS \"?column?\" UNION SELECT * FROM (SELECT 2 INTERSECT SELECT 3)")
+    );
 }
 
 #[test]
@@ -507,5 +526,73 @@ fn the_typed_printer_writes_from_the_catalog() {
             Ty::TEXT,
             Ty::of(Base::Int8)
         ]
+    );
+}
+
+/// Every word of the rewrite's, the session's and the engine's sources called as a
+/// function: those whose call `rewrite_full` changes are in `emit::REWRITTEN`, the
+/// functions the printer does not write as they came, or are no function in Postgres'
+/// grammar. A pass that learns a new function's name has to be taught to the printer.
+#[test]
+fn the_printer_knows_every_function_the_text_passes_rewrite() {
+    use std::collections::BTreeSet;
+    fn collect(dir: &std::path::Path, out: &mut BTreeSet<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                collect(&path, out);
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for w in src.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                if !w.is_empty() && w.len() < 40 && !w.as_bytes()[0].is_ascii_digit() {
+                    out.insert(w.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    // Words the grammar reads as no call: keywords, a system column, the operators.
+    const NO_CALL: &[&str] = &[
+        "ctid",
+        "current_timestamp",
+        "ilike",
+        "is_operator",
+        "lateral",
+        "like",
+        "no_operator",
+        "operator",
+        "pg_operator",
+        "raw_operator",
+        "re_any_operator",
+        "regoperator",
+        "rewrite_any_operator",
+    ];
+    let mut words = BTreeSet::new();
+    collect(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        &mut words,
+    );
+    collect(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../engine/src")),
+        &mut words,
+    );
+    let mut missing = Vec::new();
+    for w in &words {
+        let changed = ["SELECT @(a) FROM t", "SELECT @(a, b) FROM t", "SELECT @() FROM t"]
+            .iter()
+            .any(|t| {
+                let sql = t.replace('@', w);
+                let call = sql["SELECT ".len()..sql.find(" FROM").unwrap_or(sql.len())].to_string();
+                !text_tail(&rewrite_full(&sql)).contains(&call)
+            });
+        if changed && !crate::ast::emit::REWRITTEN.contains(&w.as_str()) && !NO_CALL.contains(&w.as_str()) {
+            missing.push(w.clone());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "rewritten by the text passes, unknown to the printer: {missing:?}"
     );
 }

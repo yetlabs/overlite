@@ -216,13 +216,16 @@ fn parity_bytes_through_functions() {
         ),
         ("SELECT hex(pg_get_expr(CAST(X'FF' AS TEXT), 0))", b"FF"),
         ("SELECT hex(overlite_array_lower(CAST(X'FF' AS TEXT)))", b"31"),
+        // A cast to an array reads the JSON array its text spells, as the functions
+        // that read JSON do (hstore above): a byte outside UTF-8 is U+FFFD there, and
+        // the array goes out as a text[].
         (
             "SELECT hex(CAST(CAST(X'5B2261FF62225D' AS TEXT) AS TEXT[]))",
-            b"5B2261FF62225D",
+            b"5B2261EFBFBD62225D",
         ),
         (
             "SELECT CAST(CAST(X'5B2261FF62225D' AS TEXT) AS TEXT[])",
-            b"[\"a\xffb\"]",
+            b"{a\xef\xbf\xbdb}",
         ),
         (
             "SELECT hex(to_char(CAST('2024-01-02' AS DATE), CAST(X'FF59595959' AS TEXT)))",

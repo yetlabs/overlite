@@ -69,7 +69,7 @@ pub(crate) fn rewrite_collate(sql: &str) -> String {
 
 /// Reports whether a Postgres collation name denotes a case-insensitive
 /// collation (by convention or ICU comparison level).
-fn collation_is_ci(name: &str) -> bool {
+pub(crate) fn collation_is_ci(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("nocase")
         || n.contains("insensitive")

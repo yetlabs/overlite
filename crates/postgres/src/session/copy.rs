@@ -30,6 +30,14 @@ pub(crate) struct CopyStmt {
 
 lazy_regex!(RE_COPY, r"(?is)^\s*COPY\s+(.*?)\s+(FROM\s+STDIN|TO\s+STDOUT)\s*(.*)$");
 
+impl CopyStmt {
+    /// The query of `COPY (query) TO STDOUT`, which the session translates alone.
+    #[cfg(test)]
+    pub(crate) fn query(&self) -> Option<&str> {
+        (!self.from_stdin && !self.query.is_empty()).then_some(self.query.as_str())
+    }
+}
+
 /// Parses a COPY statement, or returns None if it isn't one.
 pub(crate) fn parse_copy(sql: &str) -> Option<CopyStmt> {
     let code = blank_literals(sql);

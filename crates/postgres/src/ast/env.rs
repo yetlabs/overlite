@@ -78,6 +78,12 @@ pub(crate) fn stamp() -> u64 {
     CONTEXT.with(|c| c.borrow().as_ref().map_or(0, |c| c.stamp))
 }
 
+/// Whether the typed translation of sql under the current context may differ from sql
+/// as written, which the fast path would send (`TableTypes::typed_differs`).
+pub(crate) fn typed_differs(sql: &str) -> bool {
+    CONTEXT.with(|c| c.borrow().as_ref().is_some_and(|c| c.types.typed_differs(sql)))
+}
+
 /// Runs f with ctx as the context of the translations it makes, the previous one
 /// restored after.
 pub(crate) fn with<T>(ctx: Option<Context>, f: impl FnOnce() -> T) -> T {

@@ -209,6 +209,16 @@ fn near(t: Option<&Tok>) -> String {
     }
 }
 
+/// The query a DECLARE reads, which the session translates alone; None for any other
+/// statement.
+#[cfg(test)]
+pub(crate) fn declared_query(sql: &str) -> Option<String> {
+    match parse(sql) {
+        Ok(Statement::Declare { query, .. }) => Some(query),
+        _ => None,
+    }
+}
+
 fn parse(sql: &str) -> Result<Statement> {
     let first = sql
         .trim_start()

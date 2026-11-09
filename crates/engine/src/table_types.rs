@@ -41,6 +41,125 @@ pub struct TableTypes {
     /// for as long as the database's snapshot has this generation.
     pub generation: u64,
     tables: HashMap<String, Arc<[ColumnType]>>,
+    /// The names of the columns whose type makes the AST path's typed translation of a
+    /// statement differ from the statement as written (`typed_differs`).
+    typed_columns: HashSet<String>,
+    /// The tables with an integer column narrower than a bigint, which a star reads.
+    narrow_tables: HashSet<String>,
+    /// The lengths and first bytes of those names, which most words of a statement are
+    /// told from before any hashing.
+    lengths: u64,
+    firsts: [u64; 2],
+}
+
+/// How a column's type bears on the fast path: whether a statement naming it reads
+/// differently typed, and whether it is an integer the protocol sends at its width.
+fn typed_kind(c: &ColumnType) -> (bool, bool) {
+    let d = c.decl.trim().trim_matches('"').to_ascii_lowercase();
+    if d.contains('[') {
+        return (true, false);
+    }
+    let base = d.split('(').next().unwrap_or("").trim();
+    let narrow = !c.rowid
+        && matches!(
+            base,
+            "smallint" | "int2" | "smallserial" | "serial2" | "integer" | "int" | "int4" | "serial" | "serial4"
+        );
+    let temporal =
+        base.starts_with("time") || base.starts_with("date") || base == "interval" || base.ends_with("range");
+    (narrow || temporal, narrow)
+}
+
+impl TableTypes {
+    fn new(generation: u64, tables: HashMap<String, Arc<[ColumnType]>>) -> TableTypes {
+        let mut typed_columns = HashSet::new();
+        let mut narrow_tables = HashSet::new();
+        for (t, cols) in &tables {
+            for c in cols.iter() {
+                let (typed, narrow) = typed_kind(c);
+                if typed {
+                    typed_columns.insert(c.name.to_ascii_lowercase());
+                }
+                if narrow {
+                    // The table by its name alone, as a statement may name it.
+                    narrow_tables.insert(t.rsplit('.').next().unwrap_or(t).to_string());
+                }
+            }
+        }
+        let (mut lengths, mut firsts) = (0u64, [0u64; 2]);
+        for w in typed_columns.iter().chain(&narrow_tables) {
+            lengths |= 1 << w.len().min(63);
+            if let Some(&c) = w.as_bytes().first() {
+                firsts[usize::from(c >= 64) & 1] |= 1 << (c % 64);
+            }
+        }
+        TableTypes {
+            generation,
+            tables,
+            typed_columns,
+            narrow_tables,
+            lengths,
+            firsts,
+        }
+    }
+
+    /// Whether the AST path's typed translation of sql, a statement the text passes
+    /// would leave as it is (the fast path), may say something else: sql names a
+    /// column of a date, time or interval type, an array or a range, which the typed
+    /// translation compares by its type, or an integer narrower than a bigint, which it
+    /// sends at its width, or a star over a table with one. A word that is no column
+    /// but has such a name answers true too, which costs a translation, not an answer.
+    #[must_use]
+    pub fn typed_differs(&self, sql: &str) -> bool {
+        if self.typed_columns.is_empty() {
+            return false;
+        }
+        let b = sql.as_bytes();
+        let star = b.contains(&b'*');
+        let mut word = [0u8; 64];
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\'' {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            if c.is_ascii_alphabetic() || c == b'_' {
+                let mut n = 0;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                    if n < word.len() {
+                        word[n] = b[i].to_ascii_lowercase();
+                    }
+                    n += 1;
+                    i += 1;
+                }
+                if n > word.len() || (i < b.len() && b[i] >= 0x80) {
+                    return true;
+                }
+                let c = word[0];
+                if self.lengths & (1 << n.min(63)) == 0 || self.firsts[usize::from(c >= 64) & 1] & (1 << (c % 64)) == 0
+                {
+                    continue;
+                }
+                let Ok(w) = std::str::from_utf8(&word[..n]) else {
+                    return true;
+                };
+                if self.typed_columns.contains(w) || (star && self.narrow_tables.contains(w)) {
+                    return true;
+                }
+                continue;
+            }
+            if c >= 0x80 || c == b'"' {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
 }
 
 /// Generations are counted for the whole process, so that two databases never share one.
@@ -60,9 +179,9 @@ impl TableTypes {
     /// A snapshot of these tables, for tests: each `(table, [(column, declared type)])`.
     #[must_use]
     pub fn of(tables: &[(&str, &[(&str, &str)])]) -> TableTypes {
-        TableTypes {
-            generation: NEXT_GENERATION.fetch_add(1, Ordering::AcqRel),
-            tables: tables
+        TableTypes::new(
+            NEXT_GENERATION.fetch_add(1, Ordering::AcqRel),
+            tables
                 .iter()
                 .map(|(t, cols)| {
                     let cols: Vec<ColumnType> = cols
@@ -77,7 +196,7 @@ impl TableTypes {
                     (t.to_lowercase(), Arc::from(cols))
                 })
                 .collect(),
-        }
+        )
     }
 
     fn read(q: &Connection) -> TableTypes {
@@ -134,10 +253,10 @@ impl TableTypes {
                 rowid,
             });
         }
-        TableTypes {
-            generation: NEXT_GENERATION.fetch_add(1, Ordering::AcqRel),
-            tables: all.into_iter().map(|(t, c)| (t, Arc::from(c))).collect(),
-        }
+        TableTypes::new(
+            NEXT_GENERATION.fetch_add(1, Ordering::AcqRel),
+            all.into_iter().map(|(t, c)| (t, Arc::from(c))).collect(),
+        )
     }
 }
 
@@ -198,5 +317,27 @@ mod tests {
         assert!(t.table("u").unwrap().iter().all(|c| !c.rowid));
         assert_eq!(t.table("v").unwrap()[1].decl, "timestamptz");
         assert!(t.table("w").is_none());
+    }
+
+    #[test]
+    fn typed_columns_take_a_statement_off_the_fast_path() {
+        let t = TableTypes::of(&[
+            (
+                "kv",
+                &[
+                    ("id", "INTEGER"),
+                    ("v", "TEXT"),
+                    ("ts", "timestamptz"),
+                    ("n", "DECIMALTEXT(12,2)"),
+                ],
+            ),
+            ("w", &[("i", "INTEGER"), ("b", "BIGINT")]),
+        ]);
+        assert!(!t.typed_differs("SELECT v, n FROM kv WHERE v = 'ts'"));
+        assert!(t.typed_differs("SELECT v FROM kv WHERE ts > '2024-01-02'"));
+        assert!(t.typed_differs("SELECT b FROM w WHERE i = 1"));
+        assert!(t.typed_differs("SELECT * FROM w"));
+        assert!(!t.typed_differs("SELECT b FROM w WHERE b = 6"));
+        assert!(!TableTypes::of(&[("t", &[("a", "TEXT")])]).typed_differs("SELECT * FROM t"));
     }
 }

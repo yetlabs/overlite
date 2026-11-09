@@ -68,6 +68,16 @@ type Typed = (&'static str, fn(&[String], &[String]) -> (Vec<String>, Vec<String
 
 const TYPED: &[Typed] = &[
     (
+        "avg of integers is a numeric, their sum over their count at Postgres' scale, where SQLite's is a double",
+        |o, n| {
+            let m = plain_avg(n);
+            if m.len() == n.len() {
+                return (o.to_vec(), n.to_vec());
+            }
+            (o.to_vec(), m)
+        },
+    ),
+    (
         "the session's TimeZone is read where Postgres reads it, whatever the zone: a typed translation is \
          kept across sessions, where the engine wrote overlite_tz_in, overlite_tz_wall, overlite_tz_text and \
          overlite_current_date only in a session whose zone is not UTC",
@@ -178,6 +188,17 @@ const TYPED: &[Typed] = &[
         },
     ),
     (
+        "arithmetic with a float side is a float's, as Postgres casts a numeric beside a real: the engine's pass \
+         made it exact by the numeric side alone",
+        |o, n| {
+            let count = |t: &[String]| t.iter().filter(|x| *x == "overlite_numeric_op").count();
+            if count(n) >= count(o) {
+                return (o.to_vec(), n.to_vec());
+            }
+            (plain_numeric_ops(o), plain_numeric_ops(n))
+        },
+    ),
+    (
         "date, time and interval arithmetic over a term the text pass did not read as one (a CASE, a sum in \
          parentheses, a product with an interval) is the engine's, each side's kind named",
         |o, n| {
@@ -217,7 +238,202 @@ const TYPED: &[Typed] = &[
             }
         },
     ),
+    (
+        "a cast to an array type is the engine's assignment to it whatever its operand, which reads an array in \
+         either form and makes each element its type: the text pass dropped the cast of a column, a call or a \
+         constructor, and left CAST ... AS type[] to SQLite, which reads it as text",
+        |o, n| {
+            if !n.iter().any(|x| x == "overlite_assign") {
+                return (o.to_vec(), n.to_vec());
+            }
+            (unwrap_array_casts(o), unwrap_array_casts(n))
+        },
+    ),
+    (
+        "array_agg is the JSON array an array is stored as, NULL over no rows: the engine's aggregate wrote \
+         Postgres' text form, which the array functions, the operators and the binary format do not read",
+        |o, n| {
+            let m = plain_array_agg(n);
+            if m.len() == n.len() {
+                return (o.to_vec(), n.to_vec());
+            }
+            (unwrap_json_bools(o), unwrap_json_bools(&m))
+        },
+    ),
+    (
+        "a window's ORDER BY sorts NULLs as Postgres does, and EXCLUDE NO OTHERS, the default, goes unsaid: the \
+         text pass left a key before a frame without its NULLS, and the clause to SQLite, which has no such words",
+        |o, n| {
+            if !n.iter().any(|x| x == "over") {
+                return (o.to_vec(), n.to_vec());
+            }
+            let norm = |t: &[String]| -> Vec<String> {
+                let mut out: Vec<String> = Vec::new();
+                let mut i = 0;
+                while i < t.len() {
+                    if t[i] == "nulls" && i + 1 < t.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if t[i] == "exclude" && t.get(i + 1).is_some_and(|x| x == "no") {
+                        i += 3;
+                        continue;
+                    }
+                    out.push(t[i].clone());
+                    i += 1;
+                }
+                out
+            };
+            (norm(o), norm(n))
+        },
+    ),
+    (
+        "an aggregate's FILTER follows its call: the text pass wrote it after the cast to jsonb around a jsonb \
+         aggregate, which SQLite rejects",
+        |o, n| {
+            let has = |t: &[String]| t.iter().any(|x| x == "filter");
+            if !has(o) || !has(n) {
+                return (o.to_vec(), n.to_vec());
+            }
+            (without_filters(o), without_filters(n))
+        },
+    ),
 ];
+
+/// t with each array cast unwrapped: `overlite_assign ( X , 'T[]' )` and `CAST ( X
+/// T [ ] )` (the tokens drop AS) as X.
+fn unwrap_array_casts(t: &[String]) -> Vec<String> {
+    let mut t = t.to_vec();
+    let mut i = 0;
+    while i + 1 < t.len() {
+        if t[i] == "overlite_assign"
+            && t[i + 1] == "("
+            && let Some(close) = closing(&t, i + 1)
+            && close >= 2
+            && t[close - 2] == ","
+            && t[close - 1].ends_with("[]")
+        {
+            t.drain(close - 2..=close);
+            t.drain(i..=i + 1);
+            continue;
+        }
+        if t[i] == "cast"
+            && t[i + 1] == "("
+            && let Some(close) = closing(&t, i + 1)
+            && close >= i + 5
+            && t[close - 2] == "["
+            && t[close - 1] == "]"
+        {
+            t.drain(close - 3..=close);
+            t.drain(i..=i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    t
+}
+
+/// t with each `overlite_cast ( overlite_numeric_op ( sum ( X ) , count ( X ) , '/' ) ,
+/// T )` written `avg ( X )`.
+fn plain_avg(t: &[String]) -> Vec<String> {
+    let mut n = t.to_vec();
+    let head = ["overlite_cast", "(", "overlite_numeric_op", "(", "sum", "("];
+    let mut i = 0;
+    while i + head.len() < n.len() {
+        if n[i..i + head.len()].iter().map(String::as_str).eq(head)
+            && let Some(sum_close) = closing(&n, i + 5)
+            && let Some(cast_close) = closing(&n, i + 1)
+            && n.get(sum_close + 1..sum_close + 4)
+                .is_some_and(|w| w[0] == "," && w[1] == "count" && w[2] == "(")
+            && let Some(op_close) = closing(&n, i + 3)
+            && n[op_close - 1] == "'/'"
+        {
+            let x: Vec<String> = n[i + 6..sum_close].to_vec();
+            let mut repl = vec!["avg".to_string(), "(".to_string()];
+            repl.extend(x);
+            repl.push(")".to_string());
+            n.splice(i..=cast_close, repl);
+            continue;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// t with `overlite_array ( nullif ( json_group_array ( ... ) [FILTER, OVER] , '[]' ) )`
+/// written `array_agg ( ... ) [FILTER, OVER]`.
+fn plain_array_agg(t: &[String]) -> Vec<String> {
+    let mut n = t.to_vec();
+    let head = ["overlite_array", "(", "nullif", "(", "json_group_array"];
+    let mut i = 0;
+    while i + head.len() < n.len() {
+        if n[i..i + head.len()].iter().map(String::as_str).eq(head)
+            && let Some(outer) = closing(&n, i + 1)
+            && outer >= 4
+            && n[outer - 3] == ","
+            && n[outer - 2] == "'[]'"
+        {
+            n.drain(outer - 3..=outer);
+            n.drain(i..i + 4);
+            n[i] = "array_agg".to_string();
+            continue;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// t with each `CASE WHEN x IS NULL THEN NULL WHEN x THEN json('true') ELSE
+/// json('false') END`, a boolean as a JSON array's element, written x.
+fn unwrap_json_bools(t: &[String]) -> Vec<String> {
+    let mut t = t.to_vec();
+    let mut i = 0;
+    while i + 1 < t.len() {
+        if t[i] == "case"
+            && t[i + 1] == "when"
+            && let Some(end) = t[i..].iter().position(|x| x == "end")
+            && t[i..i + end].iter().any(|x| x == "'false'")
+            && let Some(is) = t[i..i + end].iter().position(|x| x == "is")
+        {
+            let x: Vec<String> = t[i + 2..i + is].to_vec();
+            t.splice(i..=i + end, x);
+            continue;
+        }
+        i += 1;
+    }
+    t
+}
+
+/// t without its FILTER clauses, and the filters sorted after it, so that one written
+/// elsewhere compares the same.
+fn without_filters(t: &[String]) -> Vec<String> {
+    let mut rest = Vec::new();
+    let mut filters: Vec<Vec<String>> = Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] == "filter"
+            && t.get(i + 1).is_some_and(|x| x == "(")
+            && let Some(close) = closing(t, i + 1)
+        {
+            filters.push(
+                t[i..=close]
+                    .iter()
+                    .filter(|x| *x != "(" && *x != ")")
+                    .cloned()
+                    .collect(),
+            );
+            i = close + 1;
+            continue;
+        }
+        if t[i] != "(" && t[i] != ")" {
+            rest.push(t[i].clone());
+        }
+        i += 1;
+    }
+    filters.sort();
+    rest.extend(filters.into_iter().flatten());
+    rest
+}
 
 /// t with `overlite_cast ( overlite_cast ( X , T ) , T )` written once.
 fn single_casts(t: &[String]) -> Vec<String> {
@@ -545,6 +761,116 @@ type Intended = (&'static str, fn(&[String], &[String]) -> bool);
 
 const INTENDED: &[Intended] = &[
     (
+        "a set operation on the right of another is read from a subquery, as Postgres groups it: SQLite read \
+         the compound left to right, `1 UNION 2 INTERSECT 3` as `(1 UNION 2) INTERSECT 3`",
+        |old, new| {
+            let head = ["select", "*", "from", "(", "select"];
+            let Some(at) = new.windows(5).position(|w| w.iter().map(String::as_str).eq(head)) else {
+                return false;
+            };
+            let set_op = |t: &[String]| t.iter().any(|x| matches!(x.as_str(), "union" | "intersect" | "except"));
+            let n: Vec<String> = [&new[..at], &new[at + 3..]].concat();
+            set_op(old) && without_parens(old) == without_parens(&n)
+        },
+    ),
+    (
+        "label: a subscript is labelled by its array, as Postgres' FigureColname names it, where the text path \
+         said ?column?",
+        |old, new| {
+            let (o, n) = (without_parens(old), without_parens(new));
+            o.len() == n.len()
+                && new.iter().any(|x| x == "json_extract")
+                && o.iter().zip(&n).all(|(a, b)| a == b || *a == "\"?column?\"")
+        },
+    ),
+    (
+        "a path operator over a cast to jsonb reads the cast's value: the text pass took the cast's type name for \
+         the path function's operand and wrote what SQLite rejects",
+        |old, new| {
+            old.iter().any(|x| x == "'overlite_jsonb_path'") && !new.iter().any(|x| x == "'overlite_jsonb_path'")
+        },
+    ),
+    (
+        "Postgres' syntax the text pass left in place, which SQLite rejects (a subscript of an expression, a \
+         slice, ARRAY(subquery) in parentheses, `<> ALL (subquery)`, `@>` of arrays), is written in SQLite's",
+        |old, new| {
+            let pg = |t: &[String]| {
+                t.iter().any(|x| x == "[")
+                    || t.windows(2).any(|w| {
+                        ((w[0] == "array" || w[0] == "all") && w[1] == "(")
+                            || (w[0] == "@" && w[1] == ">")
+                            || (w[0] == "<" && w[1] == "@")
+                            || w[0] == ":"
+                    })
+            };
+            pg(old) && !pg(new)
+        },
+    ),
+    (
+        "a row-locking clause is the session's (take_row_locks) and is dropped wherever it stands: the text pass \
+         looked for ` FOR ` between spaces, and a clause on lines of its own reached SQLite, a syntax error",
+        |old, new| {
+            let Some(at) = old
+                .windows(2)
+                .rposition(|w| w[0] == "for" && matches!(w[1].as_str(), "update" | "share" | "no" | "key"))
+            else {
+                return false;
+            };
+            without_parens(&old[..at]) == without_parens(new)
+        },
+    ),
+    (
+        "ctid is the rowid of a table, and a column a subquery or another arm names ctid keeps that name: the text \
+         pass renamed every ctid, a quoted one not at all",
+        |old, new| {
+            let norm = |t: &[String]| -> Vec<String> {
+                let mut out: Vec<String> = Vec::new();
+                for x in t {
+                    if x == "ctid" && out.last().is_some_and(|l| l == "rowid" || l == "ctid") {
+                        continue;
+                    }
+                    out.push(if x == "rowid" { "ctid".to_string() } else { x.clone() });
+                }
+                out.retain(|x| x != "(" && x != ")");
+                out
+            };
+            new.iter().any(|x| x == "rowid" || x == "ctid") && norm(old) == norm(new)
+        },
+    ),
+    (
+        "a SELECT before ON CONFLICT takes a WHERE, as SQLite asks: without one SQLite read ON CONFLICT as a \
+         join's ON, a syntax error",
+        |old, new| {
+            let Some(at) = new
+                .windows(4)
+                .position(|w| w[0] == "where" && w[1] == "true" && w[2] == "on" && w[3] == "conflict")
+            else {
+                return false;
+            };
+            let n = [&new[..at], &new[at + 2..]].concat();
+            without_parens(old) == without_parens(&n)
+        },
+    ),
+    (
+        "DISTINCT ON keeps the first row of each group before LIMIT and OFFSET count rows: the text pass limited \
+         the rows before choosing among them",
+        |old, new| {
+            let Some(close) = old
+                .windows(5)
+                .position(|w| w[0] == ")" && w[1] == "_ov" && w[2] == "where" && w[3] == "_ov_rn")
+            else {
+                return false;
+            };
+            let Some(limit) = old[..close].iter().rposition(|x| x == "limit") else {
+                return false;
+            };
+            let tail: Vec<String> = old[limit..close].to_vec();
+            let mut o = [&old[..limit], &old[close..]].concat();
+            o.extend(tail);
+            without_parens(&o) == without_parens(new)
+        },
+    ),
+    (
         "a range operator over ranges is overlite_range_op, which reads their bounds: the text path took `@>` \
          for jsonb's containment and compared ranges as their texts",
         |old, new| {
@@ -717,10 +1043,27 @@ fn tokens(sql: &str) -> Vec<String> {
     out
 }
 
-/// The type name of each overlite_cast, as the engine reads it: `'UUID'`, `'int'` and
-/// `'integer'` are one type to it.
+/// The type name of each overlite_cast, and of each array overlite_assign, as the engine
+/// reads it: `'UUID'`, `'int'` and `'integer'` are one type to it, `'int[]'` and
+/// `'integer[]'` one array type.
 fn same_cast_types(mut t: Vec<String>) -> Vec<String> {
     for i in 0..t.len() {
+        if t[i] == "overlite_assign"
+            && let Some(close) = closing(&t, i + 1)
+            && close >= 1
+            && let Some(name) = t[close - 1].strip_prefix('\'').and_then(|n| n.strip_suffix("[]'"))
+        {
+            let name = match name {
+                "dec" => "numeric",
+                "bool" => "boolean",
+                n => n,
+            };
+            t[close - 1] = match overlite_engine::CastType::parse(name) {
+                Some(ty) => format!("{ty:?}[]"),
+                None => format!("{name}[]"),
+            };
+            continue;
+        }
         if t[i] != "overlite_cast" {
             continue;
         }

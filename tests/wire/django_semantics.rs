@@ -137,7 +137,8 @@ fn an_array_literal_goes_out_as_an_array() {
         &conn,
         r#"SELECT '{awef}'::text[], '{1,2}'::int[], '{"a b",NULL}'::varchar[]"#,
     );
-    assert_eq!(oids, [1009, 1016, 1009]);
+    // int[] is int4[], as Postgres sends it.
+    assert_eq!(oids, [1009, 1007, 1009]);
     assert_eq!(
         rows[0],
         [

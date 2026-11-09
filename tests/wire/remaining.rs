@@ -73,8 +73,9 @@ fn range() {
     assert!(inside);
     assert!(!outside); // upper bound exclusive
 
-    let empty: i64 = conn.query_row(r#"SELECT isempty(int4range(5,5))"#, &[]).scan().unwrap();
-    assert_eq!(empty, 1);
+    // isempty is a boolean, as Postgres types it.
+    let empty: bool = conn.query_row(r#"SELECT isempty(int4range(5,5))"#, &[]).scan().unwrap();
+    assert!(empty);
 
     // A range column round-trips.
     conn.exec(r#"CREATE TABLE t (r int4range)"#, &[]).unwrap();

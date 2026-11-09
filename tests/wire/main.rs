@@ -15,6 +15,7 @@ mod alter;
 mod alteractions;
 mod array;
 mod ast_fixes;
+mod ast_shapes;
 mod ast_types;
 mod auth;
 mod binaryshape;

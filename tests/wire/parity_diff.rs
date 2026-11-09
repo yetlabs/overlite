@@ -107,6 +107,12 @@ const QUOTED_DATABASE_NAME: usize = 37;
 /// for a text that is none, and 22009 for an offset of 16 hours or more.
 const CAST_BY_AFFINITY: usize = 78;
 
+/// `CAST(text AS TEXT[])` of a JSON array's text: the old server left it to SQLite's
+/// CAST, which kept the text; the AST path reads it as the array it spells and sends a
+/// text[] (stage 4 of docs/adr/0001-sql-ast.md). Postgres refuses either literal
+/// (malformed array literal), which neither does.
+const CAST_TO_ARRAY: usize = 30;
+
 /// COMMENT ON a table that is not there: the old server answered success, where
 /// Postgres answers 42P01, and 42601 for the one that does not scan.
 const COMMENT_ON_NOTHING: usize = 21;
@@ -185,7 +191,7 @@ fn boolean_outcome(want: &str, got: &[u8], shown: &str, binary: bool) -> bool {
 /// it (count, ?column?, the operand of a cast), where the old server sent SQLite's
 /// label, the text of the expression after its rewrite. Twelve reads of ts rows that
 /// held a timestamp past any offset are not here: those writes are refused now.
-const POSTGRES_LABEL: usize = 138;
+const POSTGRES_LABEL: usize = 123;
 
 /// An outcome without its column labels: each `"name":oid ` before the rows.
 fn unlabelled(outcome: &[u8]) -> Vec<u8> {
@@ -313,6 +319,7 @@ fn parity_diff() {
     let (mut total, mut diffs, mut expected) = (0, Vec::new(), 0);
     let mut binary_send = 0;
     let (mut nul_in_query, mut quoted_database, mut cast_by_affinity, mut comment_on_nothing) = (0, 0, 0, 0);
+    let mut cast_to_array = 0;
     let (mut bad_regex, mut state_by_kind, mut time_column, mut offset_literal) = (0, 0, 0, 0);
     let mut refused_rows = 0;
     let (mut boolean_result, mut postgres_label) = (0, 0);
@@ -362,6 +369,11 @@ fn parity_diff() {
                         .any(|w| quoted.contains(w))
                 {
                     cast_by_affinity += 1;
+                    expected += 1;
+                    continue;
+                }
+                if differs && quoted.contains("AS TEXT[])") {
+                    cast_to_array += 1;
                     expected += 1;
                     continue;
                 }
@@ -435,6 +447,7 @@ fn parity_diff() {
         "database statements with a quoted name"
     );
     assert_eq!(cast_by_affinity, CAST_BY_AFFINITY, "casts SQLite took by affinity");
+    assert_eq!(cast_to_array, CAST_TO_ARRAY, "casts of a JSON text to an array");
     assert_eq!(comment_on_nothing, COMMENT_ON_NOTHING, "comments on what is not there");
     assert_eq!(bad_regex, BAD_REGEX, "regular expressions that do not compile");
     assert_eq!(state_by_kind, STATE_BY_KIND, "errors that took another SQLSTATE");

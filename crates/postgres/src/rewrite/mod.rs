@@ -96,7 +96,7 @@ use overlite_core::text::find_from;
 /// fast path, which a plain lookup with an ORDER BY or a LIKE takes: each is one scan
 /// of the tokens, made only when its word is there.
 pub fn rewrite(sql: &str) -> String {
-    if needs_no_rewrite(sql) {
+    if fast_path(sql) {
         return text_tail(sql);
     }
     cache::cached(sql, || {
@@ -120,7 +120,7 @@ pub(crate) fn rewrite_expanded(raw: &str, expanded: &str) -> String {
     let key = [raw, "\0", expanded].concat();
     cache::cached(&key, || {
         if *crate::ast::ENABLED
-            && !needs_no_rewrite(expanded)
+            && !fast_path(expanded)
             && let Some(labels) = crate::ast::result_labels(raw)
             && let Some(out) = crate::ast::translate_labelled(expanded, &labels)
         {
@@ -128,6 +128,14 @@ pub(crate) fn rewrite_expanded(raw: &str, expanded: &str) -> String {
         }
         apply_labels(&rewrite(expanded), &result_labels(raw))
     })
+}
+
+/// Whether sql takes the fast path: the text passes would leave it as it is, and the
+/// AST path's typed translation would say nothing else of it under the thread's
+/// context (a column of a date or time type, an array, a range or a narrow integer
+/// leaves it, `TableTypes::typed_differs`).
+pub(crate) fn fast_path(sql: &str) -> bool {
+    needs_no_rewrite(sql) && !(*crate::ast::ENABLED && crate::ast::env::typed_differs(sql))
 }
 
 /// What runs after the text passes, and alone on the fast path: NULLS ordering and
@@ -718,7 +726,7 @@ pub(crate) mod tests {
                 ("SELECT coração::text", r#"SELECT CAST("coração" AS text) AS "coração""#),
                 (
                     "INSERT INTO t VALUES (E'çã', ARRAY['é','ü'])",
-                    "INSERT INTO t VALUES ('çã', json_array('é','ü'))",
+                    "INSERT INTO t VALUES ('çã', json_array('é', 'ü'))",
                 ),
             ],
         );
