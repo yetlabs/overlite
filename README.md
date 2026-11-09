@@ -98,8 +98,9 @@ meet:
 
 ### Not implemented
 
-- ⬜ **PL/pgSQL**: `CREATE FUNCTION ... LANGUAGE plpgsql` and trigger functions are
-  accepted but not run (`LANGUAGE sql` functions are).
+- ⬜ **PL/pgSQL**: `CREATE FUNCTION ... LANGUAGE plpgsql` is accepted but calling it
+  fails, and a PostgreSQL-style `CREATE TRIGGER ... EXECUTE FUNCTION` is refused
+  (`LANGUAGE sql` functions and SQLite-syntax triggers work).
 - ⬜ **Deferred `UNIQUE`** constraints are checked at each statement (deferred foreign
   keys are checked at commit).
 - ⬜ **Composite and geometric types**, planner statistics, `ts_headline`, table
