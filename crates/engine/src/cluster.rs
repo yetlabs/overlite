@@ -1,7 +1,7 @@
 //! The set of databases one process serves: a directory of `<name>.db` files opened
 //! on demand, or a single engine.
 
-use crate::catalog::schema::filepath_base;
+use crate::catalog::schema::{filepath_base, is_path_separator};
 use crate::db_state::forget_state;
 use crate::error::{Error, ErrorKind, Result, errf};
 use crate::sqlite::Sqlite;
@@ -105,14 +105,15 @@ fn database_of_file(stem: &str) -> Option<String> {
     (valid_database_name(&name) && file_stem(&name) == stem).then_some(name)
 }
 
-/// Normalizes a Unix path: no `.`, no `a/..`, no repeated or trailing slash.
+/// Normalizes a path: no `.`, no `a/..`, no repeated or trailing separator. The result
+/// separates with `/`, which Windows takes as well.
 fn filepath_clean(p: &str) -> String {
     if p.is_empty() {
         return ".".to_string();
     }
-    let rooted = p.starts_with('/');
+    let rooted = p.starts_with(is_path_separator);
     let mut out: Vec<&str> = Vec::new();
-    for seg in p.split('/') {
+    for seg in p.split(is_path_separator) {
         match seg {
             "" | "." => {}
             ".." => match out.last() {
@@ -129,6 +130,10 @@ fn filepath_clean(p: &str) -> String {
         }
     }
     let joined = out.join("/");
+    // `C:` alone is the current directory of drive C, not its root.
+    if cfg!(windows) && !rooted && out.len() == 1 && joined.len() == 2 && joined.ends_with(':') {
+        return format!("{joined}/");
+    }
     if rooted {
         format!("/{joined}")
     } else if joined.is_empty() {
@@ -138,9 +143,9 @@ fn filepath_clean(p: &str) -> String {
     }
 }
 
-/// The directory of a Unix path.
+/// The directory of a path.
 fn filepath_dir(p: &str) -> String {
-    match p.rfind('/') {
+    match p.rfind(is_path_separator) {
         Some(i) => filepath_clean(&p[..=i]),
         None => ".".to_string(),
     }

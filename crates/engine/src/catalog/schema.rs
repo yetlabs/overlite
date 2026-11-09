@@ -79,16 +79,22 @@ fn env_or(key: &str, def: &str) -> String {
     }
 }
 
-/// The last element of a Unix path.
+/// Whether c separates the elements of a path: `/`, and on Windows `\` as well, which
+/// is what its own paths use (`C:\data\shop.db`).
+pub(crate) fn is_path_separator(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
+/// The last element of a path.
 pub(crate) fn filepath_base(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
     }
-    let p = path.trim_end_matches('/');
+    let p = path.trim_end_matches(is_path_separator);
     if p.is_empty() {
         return "/".to_string();
     }
-    match p.rfind('/') {
+    match p.rfind(is_path_separator) {
         Some(i) => p[i + 1..].to_string(),
         None => p.to_string(),
     }
