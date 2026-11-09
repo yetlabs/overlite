@@ -290,7 +290,8 @@ and behave differently.
    folds ASCII only.
 5. **SQLite's typing decides where the translation cannot see a type**: `1/0` is
    NULL, `'abc'` fits in an integer column.
-6. **A column-level `GRANT` grants the whole table.**
+6. **A `LANGUAGE sql` function reads with no privilege check**: its body runs
+   inlined, so a role can read a table it has no grant on through one.
 7. **`ANALYZE`, `SECURITY DEFINER` and isolation levels are accepted** and change
    nothing.
 8. **Identity and serial keys follow the highest row**, so an explicit id moves
