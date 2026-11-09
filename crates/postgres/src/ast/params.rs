@@ -356,6 +356,17 @@ impl Walker {
             .collect()
     }
 
+    /// The parameters of one row compared with another, each meeting its member.
+    fn row_params(&mut self, l: &[pb::Node], r: &[pb::Node]) {
+        for (x, y) in l.iter().zip(r) {
+            if let (Some(cols), Some(NodeEnum::ParamRef(p))) = (Self::column(n(x)), n(y)) {
+                self.push_param(p.number, &cols, Meets::Value, false);
+            } else if let (Some(NodeEnum::ParamRef(p)), Some(cols)) = (n(x), Self::column(n(y))) {
+                self.push_param(p.number, &cols, Meets::Value, false);
+            }
+        }
+    }
+
     fn expr(&mut self, e: &NodeEnum) {
         match e {
             NodeEnum::AExpr(a) => {
@@ -363,6 +374,20 @@ impl Walker {
                 let l = nb(a.lexpr.as_deref());
                 let r = nb(a.rexpr.as_deref());
                 match K::try_from(a.kind) {
+                    Ok(K::AexprOp) if matches!((l, r), (Some(NodeEnum::RowExpr(_)), Some(NodeEnum::RowExpr(_)))) => {
+                        if let (Some(NodeEnum::RowExpr(x)), Some(NodeEnum::RowExpr(y))) = (l, r) {
+                            self.row_params(&x.args, &y.args);
+                        }
+                    }
+                    Ok(K::AexprIn) if matches!(l, Some(NodeEnum::RowExpr(_))) => {
+                        if let (Some(NodeEnum::RowExpr(x)), Some(NodeEnum::List(items))) = (l, r) {
+                            for y in &items.items {
+                                if let Some(NodeEnum::RowExpr(y)) = n(y) {
+                                    self.row_params(&x.args, &y.args);
+                                }
+                            }
+                        }
+                    }
                     Ok(K::AexprOp | K::AexprDistinct | K::AexprNotDistinct) => {
                         if let (Some(cols), Some(NodeEnum::ParamRef(p))) = (Self::column(l), r) {
                             self.push_param(p.number, &cols, Meets::Value, false);
@@ -392,6 +417,7 @@ impl Walker {
             }
             NodeEnum::BoolExpr(b) => b.args.iter().filter_map(n).for_each(|x| self.expr(x)),
             NodeEnum::List(l) => l.items.iter().filter_map(n).for_each(|x| self.expr(x)),
+            NodeEnum::RowExpr(r) => r.args.iter().filter_map(n).for_each(|x| self.expr(x)),
             NodeEnum::NullTest(t) => self.opt_expr(t.arg.as_deref()),
             NodeEnum::TypeCast(t) => self.opt_expr(t.arg.as_deref()),
             NodeEnum::FuncCall(f) => f.args.iter().filter_map(n).for_each(|x| self.expr(x)),

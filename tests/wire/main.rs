@@ -59,6 +59,7 @@ mod dbeaver_compat;
 mod describe_sqlstate;
 mod describedtypes;
 mod distinct_on_star;
+mod django_regressions;
 mod django_schema;
 mod django_semantics;
 mod django_silent;

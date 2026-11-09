@@ -3210,6 +3210,21 @@ impl<'a> Emitter<'a> {
                     return self.expr(r, Prec::Unary);
                 };
                 let l = node(l)?;
+                if let (NodeEnum::RowExpr(lr), NodeEnum::RowExpr(rr)) = (l, r) {
+                    return self.row_comparison(op, &lr.args, &rr.args, a.location);
+                }
+                // `(a, b) < (SELECT x, y ...)`: SQLite's row value against the
+                // subquery's row, compared in Postgres' order.
+                if let (NodeEnum::RowExpr(_), NodeEnum::SubLink(sub)) = (l, r)
+                    && sub.sub_link_type == SubLinkType::ExprSublink as i32
+                    && matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+                {
+                    self.row_or_expr(l)?;
+                    self.push(" ");
+                    self.push(if op == "!=" { "<>" } else { op });
+                    self.push(" ");
+                    return self.subquery(sub);
+                }
                 if matches!(op, "~" | "~*" | "!~" | "!~*") {
                     return self.regex(op, l, r);
                 }
@@ -3294,6 +3309,17 @@ impl<'a> Emitter<'a> {
                     return Err("IN list");
                 };
                 let l = boxed(a.lexpr.as_deref())?;
+                if let NodeEnum::RowExpr(row) = l {
+                    let rows = items
+                        .items
+                        .iter()
+                        .map(|x| match node(x)? {
+                            NodeEnum::RowExpr(r) => Ok(r.args.as_slice()),
+                            _ => Err("row IN a list of what is not a row"),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return self.row_in_list(&row.args, &rows, op == "<>", a.location);
+                }
                 let tl = self.ty(l);
                 self.expr(l, Prec::Compare)?;
                 self.push(if op == "<>" { " NOT IN (" } else { " IN (" });
@@ -3395,6 +3421,96 @@ impl<'a> Emitter<'a> {
                 self.value(node(hi)?, tl, Prec::Compare)
             }
             _ => Err("operator kind"),
+        }
+    }
+
+    /// A comparison of two rows, as Postgres makes it of their members: `=` all of
+    /// them equal, `<>` any of them not, and the order ones the first pair that is not
+    /// equal deciding, each pair compared as two values of its types are. NULL where a
+    /// pair that decides is NULL, as in Postgres.
+    fn row_comparison(&mut self, op: &str, l: &[pb::Node], r: &[pb::Node], at: i32) -> Out {
+        if l.len() != r.len() {
+            return Err(refuse(Refusal {
+                state: overlite_core::SqlState::SYNTAX_ERROR,
+                message: "unequal number of entries in row expressions".to_string(),
+                hint: None,
+                location: location(at),
+            }));
+        }
+        let l: Vec<&NodeEnum> = l.iter().map(node).collect::<Result<_, _>>()?;
+        let r: Vec<&NodeEnum> = r.iter().map(node).collect::<Result<_, _>>()?;
+        self.push("(");
+        match op {
+            "=" | "<>" | "!=" => {
+                let join = if op == "=" { " AND " } else { " OR " };
+                for (i, (x, y)) in l.iter().zip(&r).enumerate() {
+                    if i > 0 {
+                        self.push(join);
+                    }
+                    self.row_pair(op, x, y)?;
+                }
+            }
+            "<" | "<=" | ">" | ">=" => {
+                // a1 < b1 OR (a1 = b1 AND (a2 < b2 OR (a2 = b2 AND ... an <= bn)))
+                let strict = &op[..1];
+                let last = l.len() - 1;
+                for i in 0..last {
+                    self.row_pair(strict, l[i], r[i])?;
+                    self.push(" OR (");
+                    self.row_pair("=", l[i], r[i])?;
+                    self.push(" AND (");
+                }
+                self.row_pair(op, l[last], r[last])?;
+                for _ in 0..last {
+                    self.push("))");
+                }
+            }
+            _ => {
+                return Err(refuse(Refusal {
+                    state: overlite_core::SqlState::UNDEFINED_FUNCTION,
+                    message: format!("could not determine interpretation of row comparison operator {op}"),
+                    hint: None,
+                    location: location(at),
+                }));
+            }
+        }
+        self.push(")");
+        Ok(())
+    }
+
+    /// One pair of members of two rows compared, in parentheses.
+    fn row_pair(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+        self.push("(");
+        if self.typed() {
+            self.comparison(op, l, r)?;
+        } else {
+            let p = binary_prec(op).ok_or("operator")?;
+            self.expr(l, next(p))?;
+            self.push(" ");
+            self.push(op);
+            self.push(" ");
+            self.expr(r, next(p))?;
+        }
+        self.push(")");
+        Ok(())
+    }
+
+    /// `(a, b) IN ((1, 2), (3, 4))`: the row equal to any of them, NOT IN unequal to
+    /// all, as Postgres reads it. The terms are joined two by two, so that a long list
+    /// nests no deeper than its logarithm (SQLite bounds an expression's depth).
+    fn row_in_list(&mut self, l: &[pb::Node], rows: &[&[pb::Node]], not: bool, at: i32) -> Out {
+        match rows {
+            [] => Err("empty IN list"),
+            [one] => self.row_comparison(if not { "<>" } else { "=" }, l, one, at),
+            _ => {
+                let (a, b) = rows.split_at(rows.len() / 2);
+                self.push("(");
+                self.row_in_list(l, a, not, at)?;
+                self.push(if not { " AND " } else { " OR " });
+                self.row_in_list(l, b, not, at)?;
+                self.push(")");
+                Ok(())
+            }
         }
     }
 
@@ -4689,6 +4805,17 @@ impl<'a> Emitter<'a> {
         self.expr(test, Prec::Compare)?;
         self.push(if not { " NOT IN " } else { " IN " });
         self.subquery(s)
+    }
+
+    /// A row as SQLite's row value, `(a, b)`, or an expression as one compares.
+    fn row_or_expr(&mut self, n: &NodeEnum) -> Out {
+        let NodeEnum::RowExpr(row) = n else {
+            return self.expr(n, Prec::Compare);
+        };
+        self.push("(");
+        self.list(&row.args, Self::expr_node)?;
+        self.push(")");
+        Ok(())
     }
 
     fn subquery(&mut self, s: &pb::SubLink) -> Out {
