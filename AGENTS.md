@@ -34,8 +34,11 @@ A plain `cargo test` or `cargo clippy` at the root covers the binary only: pass
 
 `cargo clippy --fix` removes imports only tests use. Check the test build after it.
 
-On a machine without cargo, run it in a container:
+On a machine without cargo, run it in a container. pg_query's build needs libclang
+(bindgen), and the wire tests that drive `pg_dump` and `psql` skip without them:
 
     docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/target \
       -v ol-rs-target:/target -v ol-rs-cargo:/usr/local/cargo/registry \
-      docker.io/library/rust:1 make check
+      docker.io/library/rust:1 sh -c 'apt-get update -qq &&
+        apt-get install -y -qq libclang-dev postgresql-client &&
+        rustup component add rustfmt clippy && make check'

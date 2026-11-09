@@ -18,7 +18,16 @@ is no cargo, as CI's Linux is:
 
     docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/target \
       -v ol-rs-target:/target -v ol-rs-cargo:/usr/local/cargo/registry \
-      docker.io/library/rust:1 cargo build --release
+      docker.io/library/rust:1 sh -c 'apt-get update -qq &&
+        apt-get install -y -qq libclang-dev && cargo build --release'
+
+pg_query compiles Postgres' parser (C) and generates its bindings with bindgen, which
+loads libclang: `libclang-dev` on Debian and Ubuntu, Xcode's on macOS, LLVM's
+`libclang.dll` with `LIBCLANG_PATH` on Windows (`.github/actions/libclang` does it for
+CI). A Windows binary can be cross-built in the same container with
+`gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 clang` added and
+`cargo build --release --target x86_64-pc-windows-gnu`; its unit tests run under Wine.
+The wire suite builds on Windows but runs on Unix only: it signals the server.
 
 The binary is at target/release/overlite (/target/release/overlite in the container). Same flags as the old server:
 `overlite --host 0.0.0.0 --port 5432 --db /data/cnpj.db`.
