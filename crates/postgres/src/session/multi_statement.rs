@@ -7,17 +7,12 @@
 use crate::ddl::alter_actions::split_alter_actions;
 use crate::ddl::database::is_database_ddl;
 use crate::error::Result;
-use crate::rewrite::blank::{
-    is_blank_statement, skip_block_comment, skip_line_comment, statement_text, strip_leading_comments,
-};
-use crate::rewrite::catalog::is_word_byte;
-use crate::rewrite::default_expr::skip_quoted;
-use crate::rewrite::index_from;
+use crate::rewrite::blank::{is_blank_statement, statement_text};
 use crate::session::Session;
 use crate::session::utility::{SavepointKind, TxControl};
 use overlite_core::SqlState;
-use overlite_core::text::{split_words, text_from_bytes, text_to_bytes, trim_end_chars};
-use overlite_engine::code_only;
+use overlite_core::text::{text_from_bytes, text_to_bytes, trim_end_chars};
+use pg_query::protobuf::Token;
 
 impl Session {
     /// Runs a Query message, statement by statement.
@@ -79,153 +74,71 @@ impl Session {
     }
 }
 
-/// Cuts sql at the semicolons that end statements, leaving alone those inside
-/// string literals, quoted identifiers, dollar-quoted bodies and comments. Pieces
-/// with nothing executable in them are dropped.
+/// Cuts sql at the semicolons that end statements, as Postgres' scanner reads it, so
+/// that one inside a string literal of any kind, a quoted name, a dollar-quoted body
+/// or a comment ends nothing; nor does one inside the BEGIN ... END body of a CREATE
+/// TRIGGER (SQLite's form) or a function's BEGIN ATOMIC. Pieces with nothing
+/// executable in them are dropped. A text the scanner refuses (a literal never
+/// closed) is one statement, which its parse refuses.
 fn split_statements(sql: &str) -> Vec<String> {
-    let s = sql.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let add = |out: &mut Vec<String>, st: &str| {
         if !is_blank_statement(st) {
             out.push(st.trim().to_string());
         }
     };
+    let Ok(scanned) = pg_query::scan(sql) else {
+        add(&mut out, sql);
+        return out;
+    };
+    let toks: Vec<(Token, usize, usize)> = scanned
+        .tokens
+        .iter()
+        .map(|t| {
+            (
+                Token::try_from(t.token).unwrap_or(Token::Nul),
+                usize::try_from(t.start).unwrap_or(0),
+                usize::try_from(t.end).unwrap_or(0),
+            )
+        })
+        .collect();
     let mut start = 0;
-    let mut i = 0;
-    while i < s.len() {
-        let c = s[i];
-        if c == b'\'' {
-            if i > 0 && (s[i - 1] == b'e' || s[i - 1] == b'E') && (i < 2 || !is_word_byte(s[i - 2])) {
-                i = skip_escape_string(sql, i) - 1;
-            } else {
-                i = skip_quoted(sql, i, b'\'') - 1;
+    // Where the current statement's tokens begin, and how deep in a body it is.
+    let mut first = 0;
+    let mut depth = 0i32;
+    for (k, &(t, at, end)) in toks.iter().enumerate() {
+        match t {
+            Token::BeginP | Token::Case if has_body(&toks[first..k]) => depth += 1,
+            Token::EndP if depth > 0 => depth -= 1,
+            Token::Ascii59 if depth == 0 => {
+                add(&mut out, &sql[start..at]);
+                start = end;
+                first = k + 1;
             }
-        } else if c == b'"' {
-            i = skip_quoted(sql, i, b'"') - 1;
-        } else if c == b'-' && i + 1 < s.len() && s[i + 1] == b'-' {
-            i = skip_line_comment(sql, i) - 1;
-        } else if c == b'/' && i + 1 < s.len() && s[i + 1] == b'*' {
-            let (j, _) = skip_block_comment(sql, i);
-            i = j - 1;
-        } else if c == b'$' {
-            let tag = dollar_tag(sql, i);
-            if !tag.is_empty() {
-                match index_from(sql, tag, i + tag.len()) {
-                    Some(j) => i = j + tag.len() - 1,
-                    None => i = s.len() - 1,
-                }
-            }
-        } else if c == b';' && !open_body(&sql[start..i]) {
-            // (a semicolon with the body open is inside a trigger's BEGIN … END)
-            add(&mut out, &sql[start..i]);
-            start = i + 1;
+            _ => {}
         }
-        i += 1;
     }
     add(&mut out, &sql[start..]);
     out
 }
 
-/// Reports whether stmt is a CREATE TRIGGER, FUNCTION or PROCEDURE whose BEGIN …
-/// END body (SQLite's trigger form, or BEGIN ATOMIC) is still open, so a semicolon
-/// at its end belongs to the body. CASE … END is counted too, since the same END
-/// closes it.
-fn open_body(stmt: &str) -> bool {
-    // A BEGIN or an END in a comment or a literal opens and closes nothing.
-    let up = code_only(strip_leading_comments(stmt)).to_uppercase();
-    let all = split_words(&up);
-    let mut f: &[&str] = &all;
-    if f.len() < 2 || f[0] != "CREATE" {
+/// Whether the tokens of a statement so far open CREATE [OR REPLACE] [TEMP] TRIGGER,
+/// FUNCTION or PROCEDURE, whose BEGIN ... END body holds statements of its own (CASE
+/// ... END is counted too, since the same END closes it).
+fn has_body(toks: &[(Token, usize, usize)]) -> bool {
+    let mut k = toks.iter().map(|t| t.0);
+    if k.next() != Some(Token::Create) {
         return false;
     }
-    f = &f[1..];
-    if f.len() > 2 && f[0] == "OR" && f[1] == "REPLACE" {
-        f = &f[2..];
+    let mut next = k.next();
+    if next == Some(Token::Or) {
+        k.next();
+        next = k.next();
     }
-    if f.len() > 1 && (f[0] == "TEMP" || f[0] == "TEMPORARY") {
-        f = &f[1..];
+    if matches!(next, Some(Token::Temp | Token::Temporary)) {
+        next = k.next();
     }
-    if f.is_empty() || (f[0] != "TRIGGER" && f[0] != "FUNCTION" && f[0] != "PROCEDURE") {
-        return false;
-    }
-    let low = stmt.to_ascii_lowercase();
-    let s = stmt.as_bytes();
-    let mut depth = 0;
-    let mut i = 0;
-    while i < s.len() {
-        let c = s[i];
-        if c == b'\'' || c == b'"' {
-            i = skip_quoted(stmt, i, c) - 1;
-        } else if c == b'-' && i + 1 < s.len() && s[i + 1] == b'-' {
-            i = skip_line_comment(stmt, i) - 1;
-        } else if c == b'/' && i + 1 < s.len() && s[i + 1] == b'*' {
-            let (j, _) = skip_block_comment(stmt, i);
-            i = j - 1;
-        } else if c == b'$' {
-            let tag = dollar_tag(stmt, i);
-            if !tag.is_empty() {
-                match index_from(stmt, tag, i + tag.len()) {
-                    Some(j) => i = j + tag.len() - 1,
-                    None => return false,
-                }
-            }
-        } else if is_word_byte(c) && (i == 0 || !is_word_byte(s[i - 1])) {
-            let mut j = i;
-            while j < s.len() && is_word_byte(s[j]) {
-                j += 1;
-            }
-            match &low[i..j] {
-                "begin" | "case" => depth += 1,
-                "end" => depth -= 1,
-                _ => {}
-            }
-            i = j - 1;
-        }
-        i += 1;
-    }
-    depth > 0
-}
-
-/// Returns the $tag$ (or $$) opening a dollar-quoted string at i, or "" when the
-/// $ starts something else, such as the parameter $1.
-fn dollar_tag(sql: &str, i: usize) -> &str {
-    let s = sql.as_bytes();
-    if i > 0 && is_word_byte(s[i - 1]) {
-        return ""; // part of an identifier, e.g. a$b
-    }
-    let mut j = i + 1;
-    while j < s.len() && s[j] != b'$' {
-        if !is_word_byte(s[j]) || (j == i + 1 && s[j].is_ascii_digit()) {
-            return "";
-        }
-        j += 1;
-    }
-    if j >= s.len() {
-        return "";
-    }
-    &sql[i..=j]
-}
-
-/// Returns the index just past the E'…' string whose quote is at i, where a
-/// backslash escapes the character after it.
-fn skip_escape_string(sql: &str, i: usize) -> usize {
-    let s = sql.as_bytes();
-    let mut j = i + 1;
-    while j < s.len() {
-        match s[j] {
-            b'\\' => j += 1,
-            b'\'' => {
-                if j + 1 < s.len() && s[j + 1] == b'\'' {
-                    j += 2;
-                    continue;
-                }
-                return j + 1;
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-    s.len()
+    matches!(next, Some(Token::Trigger | Token::Function | Token::Procedure))
 }
 
 #[cfg(test)]

@@ -7,7 +7,6 @@ pub(crate) mod blank;
 pub(crate) mod cache;
 pub(crate) mod catalog;
 pub(crate) mod ddl_syntax;
-pub(crate) mod default_expr;
 pub(crate) mod fastpath;
 pub(crate) mod functions;
 pub(crate) mod operators;
