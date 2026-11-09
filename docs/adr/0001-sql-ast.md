@@ -1,6 +1,6 @@
 # 0001: Translate SQL from a parse tree, not from text
 
-Status: accepted; stages 0, 1 and 2 landed on main (below), stage 1's week of the owner's apps pending
+Status: accepted; stages 0 to 3 landed on main (below), stage 1's week of the owner's apps pending
 Date: 2026-11-08
 
 ## Context
@@ -504,6 +504,124 @@ order of this plan: `result_labels`/`apply_labels`, the regexes of `param_types.
 which is what stage 2 can do while the text passes route exists; they go when that
 route does (stage 5), or each as soon as `rewrite_full` counts no statement needing
 it.
+
+## Stage 3 result
+
+A statement the AST path translates with a session's context is now typed from its
+tree and the catalog, and the printer writes from the types what the engine's type
+passes wrote from guesses; those passes (`resolve/time_zone.rs`'s AT TIME ZONE and
+offset values, `tsvector.rs`, `temporal.rs` with `numeric.rs`, `booleans.rs`) no longer
+run on its output. They still run for the statements on the fast path, those left to
+the text passes and those translated without a context (the session's own probes).
+
+- **The environment.** The engine keeps each database's columns with their declared
+  types (`table_types.rs`, `TableTypes`: which booleans may hold text, which column is
+  the rowid), read once and dropped by every CREATE, ALTER or DROP this server runs and
+  by a rollback. The session gives each translation a context (`ast/env.rs`): that
+  snapshot and the search_path, under whose stamp the translation cache keeps the
+  result. `ast/types.rs` types each expression: a column by the table of its own scope
+  through aliases, joins, subqueries in FROM and CTEs, an expression by Postgres' result
+  types for the operators and functions of the slice, a literal by its form and then by
+  what it meets. A typed translation ends in the engine's mark (`TYPED_MARK`), which
+  also carries the result columns' integer widths.
+- **What moved onto it**: numerics (exact arithmetic with a numeric side, the numeric
+  form around a numeric that is not a column, a scalar subquery included, dec_greatest
+  and dec_least, long literals); date, time and interval arithmetic and comparison
+  (overlite_tadd/tsub/tmul with each side's kind, interval_cmp and the INTERVAL
+  collation, a date beside a timestamp at its midnight, a literal or a parameter beside
+  a date, timestamp or timestamptz read as one, in `=`, `<`, IN and BETWEEN); the
+  session's TimeZone, written whatever the zone and read when the statement runs
+  (overlite_tz_in, overlite_tz_text, and overlite_tz_wall, new, the wall clock in the
+  zone), so one cached translation serves every session; AT TIME ZONE, EXTRACT,
+  date_part and DATE_TRUNC by their operand's type; booleans met by a string,
+  bool_and and bool_or (a statement reading a boolean column that may hold text goes
+  to the text passes); tsvector length and `||`; `%` as similarity on text and a
+  remainder on integers; json operators where the left side is known json; range
+  operators and comparisons (overlite_range_op) and array comparison
+  (overlite_array_cmp, new); the select-list casts that tell the protocol a computed
+  column's type; integer widths of result columns; parameter types for Describe.
+- **The slice, wider**: `~`, `~*`, `!~`, `!~*`; `->`, `->>`, `#>`, `#>>`, `@>`, `<@`,
+  `?`, `?|`, `?&` over json; `-|-`, `<<`, `>>`, `&<`, `&>`, `&&` over ranges; AT TIME
+  ZONE, EXTRACT, date_part, now() and its kin, CURRENT_DATE and CURRENT_TIMESTAMP.
+
+**The corpus** (`make ast-corpus` added 377 statements: 16030), main d2c13ca against
+stage 3:
+
+| | fast path | text passes | AST path |
+|---|---|---|---|
+| before stage 3 | 3878 | 8032 | 4120 |
+| stage 3 | 3878 | 5360 | 6792 |
+
+The differential test now compares the typed translation with the text passes' output
+finished by the engine's type passes (`type_passes_without_tables`), both under an
+empty catalog, as the corpus' schemas are not here. Of the 6792: identical 4885,
+identical but parentheses 1626, intended 281, unexplained 0. The intended differences
+the types make, by reason (compare.rs, `TYPED` and `INTENDED`): 133 the session's zone
+written whatever the zone; 33 AT TIME ZONE by its operand's type, its cast kept,
+labelled `timezone`; 32 select-list items cast to a type the text pass did not read
+(EXTRACT under an aggregate, ROUND with digits, a subquery's column); 3 temporal
+arithmetic over a CASE or a parenthesized sum; 2 `~` that rewrite_full left in place;
+1 each: an interval literal compared by span, a literal read as a timestamp, `%`
+around the right operands, a range operator over ranges. The rest are stage 1 and 2's
+(23 NOT IN, 19 jsonb spelling, 13 labels, 10 set members, 4 casts of casts, 2 LIKE,
+2 parenthesized columns, 1 quoted name). Refusals that depend on the catalog (`%`,
+json and range operators over what is not known, 190 under the empty catalog) are not
+remembered by shape.
+
+**Bugs fixed**, each a test in tests/wire/ast_types.rs that fails on d2c13ca and is
+held to Postgres 17: a date column compared with a timestamp or timestamptz column
+without the words the pass looked for; a literal compared with a date, timestamp or
+timestamptz (`'2024-01-02'`, a `T`, `'Jan 2 2024'`, an offset in IN and BETWEEN, a
+parameter); an interval column compared with `'23 hours'`; an interval times a CASE;
+AT TIME ZONE of a CASE; `%` between text columns; a timestamp compared with a
+timestamptz, and date_part of one, in a non-UTC session; ranges compared by bounds and
+in another spelling, and the range operators that were syntax errors; arrays compared
+element by element; integer widths.
+
+**Client-visible changes** (NOTES.md, Behavior): integer result columns at their width
+(int2, int4, int8) in typed statements, a rowid key int8; AT TIME ZONE labelled
+`timezone`; COALESCE of a double and a numeric a double; ROUND with digits a numeric
+(ROUND(365, -1) is 370); stddev and variance of integers numerics. pgx scans an int4
+into int64, int32 and int as from Postgres; psycopg reads any width as int; Django's
+inspectdb reads `SELECT * FROM t LIMIT 1`, which is on the fast path, unchanged.
+
+**Performance.** pgbench as before (4 clients, 4 threads, 8 s, each binary on its own
+copy of a 100,000-row `kv (id int PRIMARY KEY, v text, ts timestamptz, n
+numeric(12,2))`, the order swapped in round 2), main d2c13ca against stage 3, tps per
+round; `lookup3` is `SELECT id, v FROM kv WHERE id = :id AND ts >= '2024-01-01
+00:00:00+00' AND n > 0.5`:
+
+| script, mode | main | stage 3 | means |
+|---|---|---|---|
+| lookup (fast path), simple | 114632 / 113473 / 113940 | 112982 / 112815 / 114928 | −0.4% |
+| lookup (fast path), prepared | 96892 / 96085 / 97914 | 96165 / 95682 / 96934 | −0.7% |
+| lookup2 (AST slice), simple | 73882 / 72374 / 74287 | 80545 / 79241 / 81000 | +9.2% |
+| lookup2 (AST slice), prepared | 69838 / 70760 / 69628 | 85161 / 86051 / 81790 | +20.3% |
+| mix, simple | 12996 / 12878 / 13080 | 13359 / 13245 / 13438 | +2.8% |
+| mix, prepared | 12887 / 13012 / 13022 | 13723 / 13703 / 12869 | +3.5% |
+| lookup3, simple | 71640 / 71419 / 68231 | 77913 / 80216 / 79496 | +12.5% |
+| lookup3, prepared | 67303 / 67862 / 67039 | 84588 / 85730 / 84707 | +26.1% |
+
+The fast path is within the spread of its rounds. A typed statement no longer pays the
+engine's type passes and their probes on each execution, which is the gain of lookup2
+and lookup3.
+
+**Exit criteria.** `make check` green, the differential at zero unexplained, the
+corpus share translated up by 2672: met. "Those passes and their engine counterparts
+deleted": not met. The engine's type passes still serve the fast path, the text
+passes' 5360 statements and the context-less translations; they go with those routes.
+Also not done: the fast path does not consult the environment, so a plain lookup such
+as `WHERE tz > '2024-01-02'` keeps its text comparison and int8; ARRAY_AGG and array
+literals are not in the slice; a function the environment does not type, and json,
+range or `%` operators over what the catalog does not know, go to the text passes;
+sum(bigint) and avg(int) stay int8 and double.
+
+**Stage 4 should start with** the fast path: `needs_no_rewrite` answers for the text
+passes, and now that a typed translation differs from the text, a lookup over a date,
+time, timestamptz, boolean, array or range column should leave the fast path when the
+environment would print it differently (a per-table flag in `TableTypes` keeps `kv`
+lookups where they are). Then the planned query shapes, with arrays (ARRAY[...],
+`= ANY`, ARRAY_AGG and its typing) among them.
 
 ## Risks
 

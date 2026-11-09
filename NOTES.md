@@ -392,12 +392,46 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   defaults.
 - An unmatched ON CONFLICT target is 42P10, a ProgrammingError to psycopg, where
   SQLite's message went out as XX000.
+- A statement the AST path translates is typed from its tree and the catalog
+  (docs/adr/0001-sql-ast.md, stage 3), and answers as Postgres 17 does where the text
+  passes guessed (tests/wire/ast_types.rs): a date column compared with a timestamp
+  column at its midnight, whatever words the statement has; an untyped literal or a
+  parameter compared with a date, timestamp or timestamptz read by that type's input
+  function (`'2024-01-02'` is midnight, `'2024-01-02T00:00:00'` and `'Jan 2 2024'` are
+  what they say), in `=`, `<`, IN and BETWEEN; an interval column compared with a
+  literal by its span; an interval times a CASE; AT TIME ZONE of any expression by its
+  type; `%` between two text columns as pg_trgm's similarity; a timestamp compared
+  with a timestamptz, and date_part of a timestamptz, in the session's zone; ranges
+  compared by their bounds, a range in another spelling equal to its canonical one,
+  and `-|-`, `<<`, `>>`, `&<`, `&>` taken; arrays compared element by element. Each
+  was a silent wrong answer, or an error for the range operators.
+- Client-visible, in a statement the AST path translates: an integer result column
+  goes out at its width, int2, int4 or int8, by its column's type or its expression's
+  (`i + 1`, `length(t)` int4, `count(*)` int8), as Postgres sends it, where every
+  integer was int8; a table's rowid key keeps int8 (a serial and a bigserial key are
+  both INTEGER PRIMARY KEY in SQLite). pgx scans an int4 into int64, int32 and int as
+  from Postgres, and into an interface{} as int32; psycopg reads any width as int.
+  AT TIME ZONE is labelled `timezone`, as Postgres labels it (it was its operand's
+  name). COALESCE of a double and a numeric is a double, ROUND with digits a numeric
+  (ROUND(365, -1) is 370, where SQLite's gave 365.0), stddev and variance of integers
+  numerics. The fast path's statements and those left to the text passes keep the
+  int8 and the labels they had.
 
 ## Limits
 
 Intentional, each for a case not worth more code. Grouped by what a client sees, the
 silent ones first: those answer without an error, so nothing tells a client it got
 something other than what Postgres gives.
+
+Since stage 3 of the AST migration (docs/adr/0001-sql-ast.md), a statement the AST
+path translates is typed from its tree and the catalog, and the limits below that
+come from a type the translation cannot see hold for the others only: a statement the
+fast path runs as written (a plain lookup such as `SELECT id FROM t WHERE tz >
+'2024-01-02'`, whose literal stays text), one left to the text passes (its shape not
+yet in the slice), and the server's own probes. In a typed statement what is still
+not known is a column of a table the catalog does not have, a function the
+environment does not type, and a json, range or `%` operator over such a value, which
+go to the text passes.
 
 ### Silent: a different answer and no error
 
@@ -421,9 +455,10 @@ something other than what Postgres gives.
   statement, to the millisecond, and so is statement_timestamp(). The implicit
   transaction of a multi-statement Query message does not hold them.
 - A date compared with a timestamp, and an interval compared with an interval, are
-  typed only in a statement that says `date`, `interval` or ORDER BY somewhere or does
-  date arithmetic: a point lookup pays no probe of its columns. Elsewhere, two bare
-  columns of those types (`d < tz`) compare as their text (silent).
+  typed by the engine's pass only in a statement that says `date`, `interval` or ORDER
+  BY somewhere or does date arithmetic: a point lookup pays no probe of its columns.
+  Elsewhere, two bare columns of those types (`d < tz`) compare as their text (silent),
+  outside the AST path's typed statements.
 - An interval compares by its span (a month as 30 days) where the statement types a side
   as an interval (a column, a cast, a sum or product), and an interval ORDER BY key by
   the INTERVAL collation; an interval only a literal says (`'1 mon' > '29 days'`) compares
@@ -456,7 +491,8 @@ something other than what Postgres gives.
   Postgres; its comparisons do not.
 - jsonb compares and sorts as jsonb where `->`, `#>` or a cast to jsonb gives it (the
   JSONB collation); a jsonb column compared with a string literal is still text to text.
-- In a mixed boolean column, a boolean is known by name: a qualified one by the table
+- A statement reading a boolean column that may hold text (a mixed one) is left to the
+  text passes, whose readings follow. In a mixed boolean column, a boolean is known by name: a qualified one by the table
   its qualifier names, a bare one when every table of the statement that has a column so
   named declares it boolean, and not where the statement labels something else with that
   name. A column renamed on the way (`WITH x AS (SELECT b AS flag ...)`) is not followed,
@@ -513,12 +549,12 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 
 - Arrays (silent): ARRAY_AGG goes out as text (OID 25) with FILTER, a window or ORDER BY,
   timestamptz[] and range[] elements go out untyped, `<` and `>` of arrays compare the
-  JSON text, `&&` in HAVING over ARRAY_AGG finds nothing, and JSONB_AGG over no rows is
+  JSON text outside a typed statement (ARRAY_AGG is not in the AST slice yet), `&&` in HAVING over ARRAY_AGG finds nothing, and JSONB_AGG over no rows is
   `[]` where Postgres gives NULL.
 - Ranges (silent): a range goes out as text (OID 25) with no binary form; lower() and
-  upper() of a daterange or tsrange are text; `<`, `>` and `=` of ranges compare text;
-  `@>` between two casts is a syntax error (an error); `-|-`, `<<`, `>>`, `&<`, `&>` as
-  operators are a syntax error (an error); a range stored before canonical ranges keeps
+  upper() of a daterange or tsrange are text; outside a typed statement, `<`, `>` and `=`
+  of ranges compare text, `@>` between two casts is a syntax error (an error) and `-|-`,
+  `<<`, `>>`, `&<`, `&>` as operators are a syntax error (an error); a range stored before canonical ranges keeps
   its text (`[1,5]` beside `[1,6)`).
 - Full-text search (silent): tsquery `&&` and `||` combine into a wrong query; `!!` is a
   syntax error.
@@ -637,9 +673,14 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 
 ### Catalogs and what is reported
 
-- An integer column goes out as int8 whatever its width, as its values are sampled, so
-  Django's inspectdb reads an IntegerField as a BigIntegerField and an AutoField as a
-  BigAutoField. The catalogs have the declared width.
+- An integer column goes out as int8 whatever its width, as its values are sampled, in
+  a statement the fast path or the text passes run, so Django's inspectdb, whose
+  `SELECT * FROM t LIMIT 1` is on the fast path, reads an IntegerField as a
+  BigIntegerField and an AutoField as a BigAutoField. A statement the AST path types
+  sends the width, but for a rowid key, int8 there too. The catalogs have the declared
+  width.
+- Postgres' sum of a bigint and avg of integers are numerics; here they are an int8
+  and a double, as SQLite computes them, in a typed statement too.
 - Two UNIQUE constraints over the same key are both in pg_constraint, but SQLite makes
   one index for them, so pg_index lists one.
 - A renamed table's key, UNIQUE and sequence names follow its new name, where Postgres

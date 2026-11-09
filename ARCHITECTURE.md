@@ -4,7 +4,8 @@ overlite speaks the PostgreSQL wire protocol on the front and stores everything 
 SQLite files on the back. There is no planner. A statement is classified by looking at its
 text and run by SQLite; it is translated from Postgres' parse tree where the AST path
 covers it (`ast`, a slice of DML that grows by stages: docs/adr/0001-sql-ast.md), with
-its labels and parameter types read from that tree, and by text rewrites elsewhere.
+its labels, parameter types and the types of its expressions read from that tree and
+the catalog, and by text rewrites elsewhere.
 
 ## Crates
 
@@ -38,6 +39,12 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
 - `blank`: `blank_literals`, `code_only` and `blank_comments`, the literal-blanking
   rule (below).
 - `column_types`: the type of a computed result column, read from the select list.
+- `table_types`: `TableTypes`, the columns of every table and view of a database with
+  their declared types, which booleans may hold text and which column is the rowid:
+  what the AST path's type environment knows of the catalog. Kept in `DbState`, read
+  once by the first connection that asks, dropped by every CREATE, ALTER or DROP this
+  server runs and by a rollback; one read across another connection's change is used
+  for its statement and not kept.
 - `cluster`: the `Cluster` trait, the set of databases of a process. `Dir` serves every
   `<name>.db` in a directory, opening on demand, and finds a database by its file's exact
   name, also where the filesystem does not tell case apart; `Single` serves one engine, as for
@@ -60,7 +67,10 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   tsquery in their text form, matching, ts_rank and ts_rank_cd).
 - `resolve`: per-statement name resolution, for the answers that depend on the
   session: schema qualification, search_path, `current_schema()`,
-  `current_database()`, `to_regclass()`, and `time_zone`, which prepares a probe over a
+  `current_database()`, `to_regclass()` (`resolve_names`, run on every statement), and
+  the type passes (`resolve_types`), which run on every statement but one the AST path
+  typed, which ends in `TYPED_MARK` (`split_typed` takes the mark off, and with it
+  the integer widths of the result columns it may carry): `time_zone`, which prepares a probe over a
   statement's FROM to read a column's declared type: which way an AT TIME ZONE goes, and
   whether a timestamp with an offset is a time or a text. `names` reads the tables of a
   statement with their aliases, at any depth, and the column each parameter meets;
@@ -125,7 +135,7 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   The order matters, and comments in `rewrite_full` say why where it does. `tokens`
   is the crate's shared tokenizer (`code_tokens`): words, literals and quoted names,
   punctuation, each with its depth, comments left out.
-- `ast` (docs/adr/0001-sql-ast.md, stage 2): a statement parsed by Postgres' grammar
+- `ast` (docs/adr/0001-sql-ast.md, stage 3): a statement parsed by Postgres' grammar
   (libpg_query, called directly by `parse`, without the pg_query crate's summary walk)
   and printed as SQLite SQL (`emit`), for a slice of SELECT, INSERT, UPDATE and DELETE;
   `rewrite` takes it when it covers the statement and runs `rewrite_full` otherwise.
@@ -134,13 +144,28 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   its tree (`params::facts`) alone. The text readers of each (`rewrite::labels`,
   `rewrite_like`, `rewrite_null_order`, the regexes of `types::param_types`) run only
   for the statements left to the text passes and on the fast path.
+  `types` is the type environment: the type of each expression, a column's by the
+  table of its own scope (through aliases, joins, subqueries in FROM and CTEs, from
+  the catalog the session's context gives, `env`), an expression's by Postgres'
+  result types for the operators and functions of the slice. With a context the
+  printer writes from it what depends on a type (numeric exactness and the numeric
+  form, date and time arithmetic and comparison, the session's TimeZone read when the
+  statement runs, AT TIME ZONE, booleans met by a string, tsvector, `%`, json and range
+  operators, array comparison, the select-list casts, integer widths) and ends the
+  statement in the engine's mark: its output is final, and the engine's type passes
+  do not read it. Without one (the session's own probes) it prints the untyped
+  translation, which those passes finish. `env` holds the context of the translation
+  running on the thread, set by the session (`type_context`): the connection's
+  `TableTypes` and the search_path, and the stamp the cache keeps the translation under.
   `shape` remembers, by the statement with its literals' values left out, what the
   slice does not cover, so that such a statement is not parsed again only to be
-  refused. `labels` gives unnamed result columns Postgres' names, also those of a
+  refused; a refusal that depends on the catalog is not remembered. `labels` gives unnamed result columns Postgres' names, also those of a
   statement the session expands (`rewrite::rewrite_expanded`), `params` the column
   each `$n` meets by scope, `compare` holds the two routes' outputs side by side, which
-  the differential test (`diff`, over tests/fixtures/ast-corpus, in `make check`) and
-  OVERLITE_AST_SHADOW (`shadow`: one translation in n compared on a live server, a
+  the differential test (`diff`, over tests/fixtures/ast-corpus, in `make check`: the
+  typed translation against the text passes' output finished by the engine's type
+  passes, both under an empty catalog) and OVERLITE_AST_SHADOW (`shadow`: one
+  translation in n compared on a live server, untyped against the text passes', a
   difference logged) use. `record` keeps every statement clients send when
   OVERLITE_RECORD_STATEMENTS names a file, which `make ast-corpus` uses to grow the
   corpus from the wire suite. `OVERLITE_AST=0` turns the AST path off.
@@ -151,9 +176,12 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   carries the generation of the collation registry it was made under, the one piece
   of state a translation reads. A statement the session expanded is kept by the
   statement as sent and its expansion together, since its labels are the first's.
-  Everything else that depends on the session or the schema (search_path, TimeZone,
-  the catalog's types) is applied after `rewrite` on every execution; the module lists it and tests/wire/translation_cache.rs
-  holds it. `OVERLITE_REWRITE_CACHE=0` turns it off.
+  A translation the AST path typed depends on the catalog's columns and the
+  search_path: it is kept under its context's stamp, in its hash and generation, so
+  another database, snapshot or search_path is another entry. Everything else that
+  depends on the session or the schema (search_path's table names, TimeZone, and for
+  the text passes' translations the catalog's types) is applied after `rewrite` on every
+  execution; the module lists it and tests/wire/translation_cache.rs holds it. `OVERLITE_REWRITE_CACHE=0` turns it off.
 - `types`: OIDs, and per type the rewrites and the text and binary encodings:
   arrays, numeric, hstore, timestamps, booleans, parameter types.
 
@@ -218,7 +246,8 @@ one run inside an implicit transaction. Each statement takes this route through
    the labels of the statement as sent), which answers from the translation cache or
    translates (the AST path, else the text passes).
 6. `Session::exec` arms the canceler and hands the text to `DbSession`. `execute` runs
-   function DDL, then the `resolve` passes, and prepares, binds
+   function DDL, then the `resolve` passes (the type passes only for a statement
+   without the AST path's mark), and prepares, binds
    and steps the statement. Nothing is cached: a statement is prepared and finalized
    on every execution. A computed column has no decltype, so `computed_types`
    (`column_types.rs`) reads the select list: a cast decides the column's type, and the rest speak for it only when
@@ -274,7 +303,9 @@ long as a transaction that only reads stays open.
 ### The fast path contract
 
 `needs_no_rewrite` answers true only if `rewrite_full` would return the statement
-unchanged. It recognizes a narrow shape in one allocation-free pass; anything else
+unchanged. It does not ask the type environment: a statement on the fast path reaches
+the engine untyped, and its type passes run on it as they do for the text passes'
+output (docs/adr/0001-sql-ast.md, stage 3, on what that leaves). It recognizes a narrow shape in one allocation-free pass; anything else
 answers false, so it can only be wrong by being slow. `rewrite` trusts it, so a false
 true silently skips a translation.
 
@@ -413,7 +444,9 @@ object; what the type's input function does not read is refused with its code (2
 22007, 22008, 22009, 22023, 42601). `assign` in `builtins/casts.rs` and
 `builtins/canonical.rs` hold the forms.
 
-The readings of `resolve/booleans.rs` follow from it. A boolean column in the format
+The readings of `resolve/booleans.rs` follow from it (for a statement the AST path
+types, its printer writes the same for a column in the format, and leaves a statement
+reading a mixed column to the text passes). A boolean column in the format
 holds 1 and 0, which SQLite compares as they are: `col = $1` and `col = true` stay as
 written and search an index on col, and only a string compared with one (`col = 'f'`,
 `col IN ('t', $1)`) becomes the 1 or 0 it reads as, or `pg_bool('...')`, 22P02. A mixed
@@ -475,7 +508,9 @@ timestamptz is stored as bare UTC whatever the zone. The protocol renders one in
 zone with its offset; resolve/temporal.rs reads what a client gives as a timestamptz
 without an offset (overlite_tz_in) in the zone, and a timestamptz read from a column
 going on to a cast or a write with its offset (overlite_tz_text), so no zone misreads
-it. The session restores the zone a rolled-back SET or a SET LOCAL changed, and
+it. The AST path writes the same from its types whatever the zone, and a wall clock
+there as overlite_tz_wall, so that one translation, cached, serves every session:
+each of these functions reads the zone when the statement runs. The session restores the zone a rolled-back SET or a SET LOCAL changed, and
 reports each change with ParameterStatus. now() holds the transaction's start the same
 way, in a thread local the session marks at BEGIN and clears at its end.
 
