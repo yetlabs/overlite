@@ -2722,10 +2722,22 @@ impl<'a> Emitter<'a> {
         let r = self.expr(arg, Prec::Or);
         std::mem::swap(&mut self.out, &mut out);
         r?;
+        // What is not a column may be an array in Postgres' text (string_to_array's):
+        // the JSON array of it.
+        if !matches!(arg, NodeEnum::ColumnRef(_)) {
+            out = ["overlite_array_json(", &out, ")"].concat();
+        }
+        // A json or jsonb array's element may be an array itself.
+        let json_elements = self.typed() && matches!(self.ty(arg).base, Base::Json | Base::Jsonb);
+        // The subscripts of a run of them (`a[1][2]`), read as one path.
+        let mut plain: Vec<String> = Vec::new();
         for x in &i.indirection {
             let NodeEnum::AIndices(ix) = node(x)? else {
                 return Err("field selection");
             };
+            if ix.is_slice && !plain.is_empty() {
+                out = element(&out, &std::mem::take(&mut plain), json_elements);
+            }
             let bound = |me: &mut Self, b: Option<&pb::Node>| -> Result<Option<String>, Unsupported> {
                 let Some(b) = b else { return Ok(None) };
                 let b = node(b)?;
@@ -2776,17 +2788,11 @@ impl<'a> Emitter<'a> {
                 .concat();
             } else {
                 let idx = hi.ok_or("subscript")?;
-                out = [
-                    "CASE WHEN json_valid(",
-                    &out,
-                    ") THEN json_extract(",
-                    &out,
-                    ", '$[' || ((",
-                    &idx,
-                    ")-1) || ']') END",
-                ]
-                .concat();
+                plain.push(idx);
             }
+        }
+        if !plain.is_empty() {
+            out = element(&out, &plain, json_elements);
         }
         self.push(&out);
         Ok(())
@@ -4925,6 +4931,45 @@ impl<'a> Emitter<'a> {
         self.push(")");
         Ok(())
     }
+}
+
+/// The element of array a at the 1-based subscripts idx, as array_ref reads it: NULL
+/// for a subscript out of its bounds, and NULL where fewer subscripts than the array
+/// has dimensions leave an array (unless its elements are json, which may be arrays).
+fn element(a: &str, idx: &[String], json_elements: bool) -> String {
+    let mut path = String::from("'$'");
+    let mut bounds = Vec::new();
+    for i in idx {
+        path.push_str(" || '[' || ((");
+        path.push_str(i);
+        path.push_str(")-1) || ']'");
+        bounds.push(["(", i, ") >= 1"].concat());
+    }
+    let extract = ["json_extract(", a, ", ", &path, ")"].concat();
+    let value = if json_elements {
+        extract
+    } else {
+        [
+            "CASE WHEN json_type(",
+            a,
+            ", ",
+            &path,
+            ") <> 'array' THEN ",
+            &extract,
+            " END",
+        ]
+        .concat()
+    };
+    [
+        "CASE WHEN ",
+        &bounds.join(" AND "),
+        " THEN CASE WHEN json_valid(",
+        a,
+        ") THEN ",
+        &value,
+        " END END",
+    ]
+    .concat()
 }
 
 /// The operator of `x op ANY (subquery)`.

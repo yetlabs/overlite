@@ -484,6 +484,8 @@ pub fn assign(v: &Value, decl: &str) -> Result<Value> {
         return Ok(Value::Null);
     }
     if let Some(element) = decl.strip_suffix("[]") {
+        // `int[][]` is an array of ints, of any dimensions, as in Postgres.
+        let element = element.trim_end_matches("[]");
         return crate::builtins::canonical::canonical_array(v, element);
     }
     if decl == "boolean" {

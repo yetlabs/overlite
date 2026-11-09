@@ -515,3 +515,38 @@ fn jsonb_agg_aggregates_json() {
     assert_eq!(texts(&conn, q).0, [3802, 3802, 114]);
     assert_eq!(rows(&conn, q), [r#"NULL|["<empty>"]|NULL"#]);
 }
+
+// A subscript of a subscript compared an element of an int[][] stored as strings with
+// a number, so `(g)[1][1] = 1` found nothing; a subscript of string_to_array, which
+// gives Postgres' array text, read no JSON and was NULL; fewer subscripts than an
+// array has dimensions gave an array where Postgres gives NULL.
+#[test]
+fn subscripts_read_elements() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE TABLE sb (id int, f int[], g int[][])");
+    must_exec(
+        &conn,
+        "INSERT INTO sb VALUES (1, '{1,2}', '{{1,2},{3,4}}'), (2, '{3,1}', '{{5,6},{7,8}}'), (3, NULL, NULL)",
+    );
+    assert_eq!(rows(&conn, "SELECT id FROM sb WHERE (g)[1][1] = 1"), ["1"]);
+    assert_eq!(rows(&conn, "SELECT id FROM sb WHERE g[2][2] > 5"), ["2"]);
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT id FROM sb WHERE (f)[1] = ((string_to_array('1;2', ';'))[1])::integer"
+        ),
+        ["1"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT g[1], f[0], f[3], g[1][5], (string_to_array('x;y', ';'))[2] FROM sb WHERE id = 1"
+        ),
+        ["NULL|NULL|NULL|NULL|y"]
+    );
+    assert_eq!(
+        texts(&conn, "SELECT (g)[1][1] FROM sb WHERE id = 1"),
+        (vec![23], vec![vec!["1".to_string()]])
+    );
+}
