@@ -160,10 +160,12 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   TRIGGER needs the table's ownership or TRIGGER, DROP TRIGGER its ownership. An
   UPDATE's or DELETE's subqueries, FROM and USING are read through their tables'
   policies. A statement Postgres' grammar refuses (`INSERT OR REPLACE ... SELECT`) is
-  held to SELECT on what it reads after FROM, JOIN and USING, besides its target. The
-  server's own tables (`_overlite_*`, where the roles, the grants and the policies
-  are), sqlite_dbpage, writing `sqlite_*`, PRAGMA, ATTACH, DETACH and VACUUM INTO are a
-  superuser's: before, any role could make itself one with `UPDATE _overlite_roles`.
+  refused with Postgres' syntax error before any grant is read (since stage 5c; it
+  was held to SELECT on what it read). The server's own tables (`_overlite_*`, where
+  the roles, the grants and the policies are), sqlite_dbpage and writing `sqlite_*`
+  are a superuser's: before, any role could make itself one with `UPDATE
+  _overlite_roles`. PRAGMA, ATTACH, DETACH and VACUUM INTO, which were a superuser's,
+  are syntax errors for every role since stage 5c.
   Checked and unchanged: cursors, PREPARE/EXECUTE's reads, COPY (query) TO, SELECT
   INTO (refused before it runs), a DEFAULT, CHECK or generated column calling a
   function that reads (SQLite takes no subquery there, so the table is refused). There
@@ -488,6 +490,39 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   a CAST to numeric (the text passes wrote the column type DECIMALTEXT into it). A
   function's DDL is stored as written (the text passes added NULLS LAST after a body
   ending in ORDER BY).
+- Since stage 5c (docs/adr/0001-sql-ast.md) there are no text passes: a statement is
+  translated from its tree, refused, or (SQLite's trigger) run as written. A
+  statement Postgres' grammar refuses is answered as Postgres answers it, before any
+  classifier or grant reads it, an open transaction's abort included: its message
+  (`syntax error at or near "SELEC"`, `unterminated quoted string at or near "'abc"`),
+  the position the ErrorResponse's P field gives, its HINT where Postgres has one
+  (`LIMIT #,# syntax is not supported`), its code (42601, or the grammar's own:
+  `CREATE ROLE public` is 42939), where SQLite's message came before (`near "b":
+  syntax error`). A statement nested past 1000 messages of the tree (subqueries some 165
+  deep, a sum of some 500 terms) is 54001 `stack depth limit exceeded`; a UNION of 200
+  members, which the decoder's recursion limit refused past 99, runs. A node the
+  translation has no form for is 0A000 `<what> is not supported`
+  (tests/wire/ast_refusals.rs).
+- Client-visible since stage 5c: SQLite's own dialect is refused as Postgres refuses
+  it, the owner's decision: `INTEGER PRIMARY KEY AUTOINCREMENT` (use serial or
+  GENERATED ... AS IDENTITY), EXPLAIN QUERY PLAN (EXPLAIN answers in Postgres' shape),
+  `LIMIT a, b`, PRAGMA, ATTACH, VACUUM INTO, INSERT OR IGNORE/REPLACE, DROP TRIGGER
+  without ON, `current_user()`, `PREPARE p AS <DDL>`; each ran on SQLite before. SQLite's
+  `CREATE TRIGGER ... BEGIN ... END` is kept, run as written without translation: it
+  is the only trigger while PL/pgSQL does not run; its head (timing, events, table,
+  FOR EACH, WHEN) must read as a Postgres trigger's, so SQLite's TEMP, IF NOT EXISTS
+  and a WHEN without parentheses are taken, a trigger without BEFORE or AFTER is not.
+  Postgres' `CREATE TRIGGER ... EXECUTE FUNCTION` is 0A000 as before.
+- Since stage 5c, also from the tree: hstore's `->` gives a value as text and of an
+  array of keys their values, `?|`, `?&`, `@>` and `<@` read an hstore column as one;
+  hstore's `->>`, which hstore has not, is 42883 (it read the stored JSON); a json
+  operator over an array (`a -> 0` of an int[]) is 42883 `operator does not exist:
+  integer[] -> integer` with its position (it read the array's JSON); AT TIME ZONE of
+  a date is of its midnight in the session's zone, a timestamp (as Postgres casts
+  it); a derived column list longer than its relation's columns is 42P10 with
+  Postgres' message; a boolean column holding text is read as before (every spelling
+  of a truth value), now by the printer. A json, range or `%` operator over operands
+  of known types Postgres has no such operator for is 42883 (it reached SQLite).
 
 ## Limits
 
@@ -496,13 +531,11 @@ silent ones first: those answer without an error, so nothing tells a client it g
 something other than what Postgres gives.
 
 Since stage 3 of the AST migration (docs/adr/0001-sql-ast.md), a statement the AST
-path translates is typed from its tree and the catalog, and the limits below that
-come from a type the translation cannot see hold for the others only: a statement the
-fast path runs as written (since stage 4 only one over columns whose types it reads
-the same), one left to the text passes (since stage 5b, what Postgres' grammar
-does not read: SQLite's own dialect and what Postgres refuses, and a statement whose
-typing depends on what the catalog cannot tell, such as a boolean column holding
-text), and the server's own probes. In a typed
+path translates is typed from its tree and the catalog, and since stage 5c every
+statement is (the fast path runs as written only a statement over columns whose types
+the translation reads the same, and SQLite's trigger runs as written): the limits
+below that come from a type the translation cannot see hold where the catalog does
+not know a column. In a typed
 statement what is still not known is a column of a table the catalog does not have,
 a function the environment does not type; a json, range, array or `%` operator over
 such a value is read as the text passes read it.

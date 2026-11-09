@@ -372,20 +372,17 @@ impl Session {
         if self.tx != TxState::Open {
             return Ok(false);
         }
-        let Some(lock) = crate::rewrite::row_lock::row_lock(raw) else {
+        let Some((lock, table)) = row_lock(raw) else {
             return Ok(false);
         };
-        let got = self.db.begin_writing(lock != crate::rewrite::row_lock::RowLock::Wait)?;
+        let got = self.db.begin_writing(lock != LockWaitPolicy::LockWaitBlock)?;
         match lock {
             _ if got => Ok(false),
-            crate::rewrite::row_lock::RowLock::SkipLocked => Ok(true),
-            _ => {
-                let table = crate::rewrite::row_lock::locked_table(raw);
-                Err(errf!(
-                    SqlState::LOCK_NOT_AVAILABLE,
-                    "could not obtain lock on row in relation \"{table}\""
-                ))
-            }
+            LockWaitPolicy::LockWaitSkip => Ok(true),
+            _ => Err(errf!(
+                SqlState::LOCK_NOT_AVAILABLE,
+                "could not obtain lock on row in relation \"{table}\""
+            )),
         }
     }
 
@@ -1390,6 +1387,59 @@ fn highest_in(code: &str) -> usize {
         i = start + digits;
     }
     max
+}
+
+use pg_query::protobuf::LockWaitPolicy;
+
+/// The row-locking clause of a SELECT (FOR UPDATE, FOR SHARE..., of it or of a member
+/// of its set operation), read from its tree: how it waits, the strictest of them, and
+/// the first table the SELECT reads, which Postgres names in 55P03. None for a
+/// statement without one, which a statement without the word FOR is, unparsed.
+fn row_lock(raw: &str) -> Option<(LockWaitPolicy, String)> {
+    fn walk(s: &pg_query::protobuf::SelectStmt, lock: &mut Option<LockWaitPolicy>, table: &mut String) {
+        for c in &s.locking_clause {
+            let Some(pg_query::NodeEnum::LockingClause(c)) = &c.node else {
+                continue;
+            };
+            let w = LockWaitPolicy::try_from(c.wait_policy).unwrap_or(LockWaitPolicy::LockWaitBlock);
+            *lock = Some(match (*lock, w) {
+                (Some(LockWaitPolicy::LockWaitSkip), _) | (_, LockWaitPolicy::LockWaitSkip) => {
+                    LockWaitPolicy::LockWaitSkip
+                }
+                (Some(LockWaitPolicy::LockWaitError), _) | (_, LockWaitPolicy::LockWaitError) => {
+                    LockWaitPolicy::LockWaitError
+                }
+                _ => LockWaitPolicy::LockWaitBlock,
+            });
+        }
+        if table.is_empty() {
+            let first = s.from_clause.iter().find_map(|f| match &f.node {
+                Some(pg_query::NodeEnum::RangeVar(r)) => Some(r.relname.clone()),
+                Some(pg_query::NodeEnum::JoinExpr(j)) => match j.larg.as_deref().and_then(|l| l.node.as_ref()) {
+                    Some(pg_query::NodeEnum::RangeVar(r)) => Some(r.relname.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+            if let Some(t) = first {
+                *table = t;
+            }
+        }
+        for arm in [&s.larg, &s.rarg].into_iter().flatten() {
+            walk(arm, lock, table);
+        }
+    }
+    if !raw.as_bytes().windows(3).any(|w| w.eq_ignore_ascii_case(b"for")) {
+        return None;
+    }
+    let parsed = crate::ast::parse::shared(raw).ok()?;
+    let [stmt] = parsed.stmts.as_slice() else { return None };
+    let pg_query::NodeEnum::SelectStmt(top) = stmt.stmt.as_deref()?.node.as_ref()? else {
+        return None;
+    };
+    let (mut lock, mut table) = (None, String::new());
+    walk(top, &mut lock, &mut table);
+    lock.map(|l| (l, table))
 }
 
 /// SQLite's syntax error for a statement Postgres' grammar refuses too, which the fast

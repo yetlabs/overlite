@@ -97,6 +97,9 @@ meet:
 - ⬜ **PL/pgSQL**: `CREATE FUNCTION ... LANGUAGE plpgsql` is accepted but calling it
   fails, and a PostgreSQL-style `CREATE TRIGGER ... EXECUTE FUNCTION` is refused
   (`LANGUAGE sql` functions and SQLite-syntax triggers work).
+- 🟡 **SQLite's own syntax** is refused with PostgreSQL's syntax error
+  (`AUTOINCREMENT`, `EXPLAIN QUERY PLAN`, `LIMIT a, b`, `PRAGMA`, `INSERT OR ...`);
+  SQLite-syntax triggers (`CREATE TRIGGER ... BEGIN ... END`) are the exception.
 - ⬜ **Deferred `UNIQUE`** constraints are checked at each statement (deferred foreign
   keys are checked at commit).
 - ⬜ **Composite and geometric types**, planner statistics, `ts_headline`, table
@@ -106,7 +109,8 @@ meet:
 
 - 🟡 Integer columns go out as `int8` whatever their width.
 - 🟡 `EXPLAIN` gives SQLite's plan in PostgreSQL's shape, with all costs at 0.
-- 🟡 Error codes are PostgreSQL's; the text of errors that come from SQLite is SQLite's.
+- 🟡 Error codes are PostgreSQL's; the text of errors that come from SQLite is SQLite's
+  (a syntax error is PostgreSQL's own, with its position).
 
 ## Quick start
 

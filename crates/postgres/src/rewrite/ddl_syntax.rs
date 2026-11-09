@@ -1,20 +1,6 @@
 //! Column and index syntax in DDL: SERIAL, USING `<method>` and a key's deferral.
 
 use crate::rewrite::tokens::code_tokens;
-use overlite_core::lazy_regex;
-
-// Matches the access-method clause "USING <method>" that pg_dump
-// puts in a CREATE INDEX (SQLite has no such clause and only btree anyway).
-// IF EXISTS and ONLY, which SQLite does not take. The session has settled the first
-// by now, and ONLY is about inheritance, which does not exist here.
-lazy_regex!(
-    RE_ALTER_TABLE_MODIFIERS,
-    r"(?is)^(\s*ALTER\s+TABLE\s+)(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
-);
-
-lazy_regex!(RE_INDEX_USING, r"(?i)\bUSING\s+\w+\s+(\()");
-
-lazy_regex!(RE_INDEX_USING_METHOD, r"(?i)\bUSING\s+(\w+)\s+\(");
 
 /// What a key column of a NULLS NOT DISTINCT index is wrapped in: a NULL becomes a
 /// blob no column holds, so two NULLs are one key, as Postgres has them.
@@ -92,9 +78,3 @@ pub(crate) fn mark_key_deferral(sql: &str) -> String {
     out.push_str(&sql[at..]);
     out
 }
-
-// Postgres names the table a trigger is on; SQLite takes the trigger's name alone.
-lazy_regex!(
-    RE_DROP_TRIGGER,
-    r#"(?is)^(\s*DROP\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?(?:"[^"]+"|[\w.]+))\s+ON\s+(?:"[^"]+"|[\w.]+)(?:\s+(?:CASCADE|RESTRICT))?\s*;?\s*$"#
-);

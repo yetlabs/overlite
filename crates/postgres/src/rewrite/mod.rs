@@ -12,7 +12,6 @@ pub(crate) mod distinct_on;
 pub(crate) mod fastpath;
 pub(crate) mod functions;
 pub(crate) mod operators;
-pub(crate) mod row_lock;
 pub(crate) mod strings;
 pub(crate) mod tokens;
 

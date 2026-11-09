@@ -4,10 +4,6 @@ use crate::rewrite::strings::map_outside_strings;
 use overlite_core::lazy_regex;
 use overlite_core::text::{replace_all_func, trim_chars};
 
-// Matches Postgres' explicit operator syntax, e.g.
-// "OPERATOR(pg_catalog.~)", which psql emits for pattern matching.
-lazy_regex!(RE_OPERATOR_CALL, r"(?i)OPERATOR\s*\(\s*([^)]+?)\s*\)");
-
 // Matches a COLLATE clause with an optionally schema-qualified,
 // optionally double-quoted collation name.
 lazy_regex!(RE_COLLATE, r#"(?i)\s+COLLATE\s+("[^"]*"|\w+)(?:\.("[^"]*"|\w+))?"#);
