@@ -279,6 +279,13 @@ pub(crate) fn oid_for_column(col: &Column, rows: &[Vec<Value>], idx: usize) -> O
     if BOOL_CATALOG_COLUMNS.contains(col.name.as_str()) {
         return OID_BOOL;
     }
+    // An integer's width, from the AST path's type environment (the engine's mark).
+    match col.decl_type.as_str() {
+        "PG_INT2" => return OID_INT2,
+        "PG_INT4" => return OID_INT4,
+        "PG_INT8" => return OID_INT8,
+        _ => {}
+    }
     // pg_constraint's key columns, int2[] held as JSON arrays.
     if matches!(col.name.as_str(), "conkey" | "confkey") {
         return OID_INT2_ARR;

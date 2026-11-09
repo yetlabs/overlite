@@ -54,10 +54,15 @@ pub(crate) fn param_types(sql: &str) -> Option<Vec<types::Ty>> {
 /// sql between prefix and suffix, the mark of a typed translation kept at its end, where
 /// the engine reads it.
 pub(crate) fn wrap_typed(sql: &str, prefix: &str, suffix: &str) -> String {
-    let mark = [" ", overlite_engine::TYPED_MARK, "*/"].concat();
-    match sql.strip_suffix(&mark) {
-        Some(body) => [prefix, body, suffix, &mark].concat(),
-        None => [prefix, sql, suffix].concat(),
+    let (body, mark) = split_mark(sql);
+    [prefix, body, suffix, mark].concat()
+}
+
+/// A translation and the engine's mark it ends in, which is empty for an untyped one.
+pub(crate) fn split_mark(sql: &str) -> (&str, &str) {
+    match sql.rfind(&[" ", overlite_engine::TYPED_MARK].concat()) {
+        Some(at) if sql.ends_with("*/") => sql.split_at(at),
+        _ => (sql, ""),
     }
 }
 

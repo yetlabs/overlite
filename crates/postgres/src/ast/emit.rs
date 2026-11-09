@@ -193,7 +193,13 @@ fn print(stmt: &NodeEnum, labels: Option<&[Option<String>]>, typer: Option<Typer
         NodeEnum::DeleteStmt(s) => e.delete(s)?,
         _ => return Err("statement kind"),
     }
-    if let Some(t) = &e.typer {
+    if let Some(t) = &mut e.typer {
+        // The result columns' integer widths, which a declared INTEGER does not tell
+        // the protocol (the engine's mark carries them).
+        let marks: Vec<&str> = result_cols(t, stmt)
+            .iter()
+            .map(|c| if c.rowid { "" } else { c.ty.mark() })
+            .collect();
         // A boolean column that may hold text keeps the text passes' readings of both
         // forms (resolve/booleans.rs).
         if t.mixed {
@@ -201,12 +207,50 @@ fn print(stmt: &NodeEnum, labels: Option<&[Option<String>]>, typer: Option<Typer
         }
         e.out.push(' ');
         e.out.push_str(overlite_engine::TYPED_MARK);
+        if marks.iter().any(|m| !m.is_empty()) {
+            e.out.push(' ');
+            e.out.push_str(&marks.join(","));
+        }
         e.out.push_str("*/");
     }
     Ok(Printed {
         sql: e.out,
         params: e.params,
     })
+}
+
+/// The columns of a statement's result: a SELECT's, a set operation's where its arms
+/// agree, a write's RETURNING.
+fn result_cols(t: &mut Typer, stmt: &NodeEnum) -> Vec<types::Col> {
+    fn select(t: &mut Typer, s: &pb::SelectStmt) -> Vec<types::Col> {
+        let (Some(l), Some(r)) = (&s.larg, &s.rarg) else {
+            return t.select_cols(s);
+        };
+        let ctes = t.push_with(s.with_clause.as_ref());
+        let mut cols = select(t, l);
+        let right = select(t, r);
+        t.pop_with(ctes);
+        for (c, o) in cols.iter_mut().zip(&right) {
+            if c.ty != o.ty || o.rowid {
+                c.ty = Ty::ANY;
+            }
+        }
+        cols
+    }
+    let (rel, ret) = match stmt {
+        NodeEnum::SelectStmt(s) => return select(t, s),
+        NodeEnum::InsertStmt(s) => (s.relation.as_ref(), s.returning_clause.as_ref()),
+        NodeEnum::UpdateStmt(s) => (s.relation.as_ref(), s.returning_clause.as_ref()),
+        NodeEnum::DeleteStmt(s) => (s.relation.as_ref(), s.returning_clause.as_ref()),
+        _ => return Vec::new(),
+    };
+    let (Some(rel), Some(ret)) = (rel, ret) else {
+        return Vec::new();
+    };
+    t.push_target(rel);
+    let cols = t.targets(&ret.exprs);
+    t.pop_scope();
+    cols
 }
 
 struct Emitter<'a> {

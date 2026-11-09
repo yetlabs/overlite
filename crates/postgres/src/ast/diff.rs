@@ -69,8 +69,7 @@ pub(crate) fn empty_context() -> Option<crate::ast::env::Context> {
 /// The AST path's typed translation without the engine's mark.
 pub(crate) fn typed(sql: &str) -> Result<String, &'static str> {
     let out = crate::ast::env::with(empty_context(), || try_translate(sql))?;
-    let mark = [" ", overlite_engine::TYPED_MARK, "*/"].concat();
-    Ok(out.strip_suffix(&mark).map_or(out.clone(), str::to_string))
+    Ok(crate::ast::split_mark(&out).0.to_string())
 }
 
 /// The text route as `rewrite` runs it, then the engine's type passes, which finish
@@ -434,9 +433,9 @@ fn the_typed_printer_writes_from_the_catalog() {
     let t = |sql: &str, sp: Option<&[String]>| {
         let ctx = crate::ast::env::Context::new(types.clone(), sp);
         let out = crate::ast::env::with(Some(ctx), || try_translate(sql)).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        let mark = [" ", overlite_engine::TYPED_MARK, "*/"].concat();
-        assert!(out.ends_with(&mark), "{out}");
-        out[..out.len() - mark.len()].to_string()
+        let (body, mark) = crate::ast::split_mark(&out);
+        assert!(!mark.is_empty(), "{out}");
+        body.to_string()
     };
     for (sql, want) in [
         // Exact arithmetic beside a numeric column, in the form a numeric column has.
@@ -480,6 +479,13 @@ fn the_typed_printer_writes_from_the_catalog() {
     ] {
         assert_eq!(t(sql, None), want, "{sql}");
     }
+    // The result columns' integer widths ride on the mark; a rowid's is not known.
+    let ctx = crate::ast::env::Context::new(types.clone(), None);
+    let out = crate::ast::env::with(Some(ctx), || {
+        try_translate("SELECT id, count(*), n, id + 1 FROM t GROUP BY id, n")
+    })
+    .unwrap_or_default();
+    assert!(out.ends_with(" /*overlite typed int4,int8,,int4*/"), "{out}");
     // An unqualified table is the search_path's.
     let sp = ["s1".to_string()];
     assert_eq!(

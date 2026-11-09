@@ -151,6 +151,17 @@ impl Ty {
         })
     }
 
+    /// What the result-column mark says of this type (`overlite_engine::TYPED_MARK`):
+    /// an integer's width, which a declared INTEGER does not tell the protocol.
+    pub(crate) fn mark(self) -> &'static str {
+        match self {
+            t if t.is(Base::Int2) => "int2",
+            t if t.is(Base::Int4) => "int4",
+            t if t.is(Base::Int8) => "int8",
+            _ => "",
+        }
+    }
+
     /// A declared type of this type, as a parameter's is read (types::param_types),
     /// empty for one with none.
     pub(crate) fn decl(self) -> &'static str {
@@ -842,7 +853,7 @@ impl Typer {
                 }
             }
             "dec_add" | "dec_sub" | "dec_mul" | "dec_div" => Ty::of(Base::Numeric),
-            "dec_cmp" | "length" | "char_length" | "octet_length" | "strpos" | "ascii" => Ty::of(Base::Int4),
+            "length" | "char_length" | "octet_length" | "strpos" | "ascii" => Ty::of(Base::Int4),
             "lower" | "upper" | "replace" | "substr" | "split_part" | "lpad" | "rpad" | "left" | "right"
             | "reverse" | "repeat" | "concat" | "initcap" | "chr" | "md5" | "hex" | "typeof" | "to_char" => Ty::TEXT,
             // Of integers and numerics a numeric, of floats a double.

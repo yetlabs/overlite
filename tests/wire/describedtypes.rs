@@ -68,8 +68,8 @@ fn catalog_query_not_in_a_literal() {
 }
 
 // With no row to sample, a computed column's type is what the statement shows: a cast,
-// the call around it. Each OID is the one Postgres 17 described, but that an integer
-// is int8 here, as an integer column is.
+// the call around it. Each OID is the one Postgres 17 described, an integer's width
+// included (the AST path's type environment says it).
 #[test]
 fn computed_columns_with_no_row() {
     let server = start_server();
@@ -91,8 +91,8 @@ fn computed_columns_with_no_row() {
         ("a::bytea", 17),
         ("a::varchar", 1043),
         ("CAST(a AS timestamp)", 1114),
-        ("a::int", 20),
-        ("a::int AS labelled", 20),
+        ("a::int", 23),
+        ("a::int AS labelled", 23),
         ("count(*)", 20),
         ("lower(a)", 25),
         ("'x'", 25),

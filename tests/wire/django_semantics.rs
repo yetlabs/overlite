@@ -407,7 +407,7 @@ fn date_and_interval_arithmetic_and_types() {
             &format!(
                 "SELECT s + d, e - s, tm - '11:15:00'::time, s - d, dt + 1, dt - '2010-06-20'::date, dt + d, tz + d FROM {t} WHERE id = 1"
             ),
-            &[1114, 1186, 1186, 1114, 1082, 20, 1114, 1184],
+            &[1114, 1186, 1186, 1114, 1082, 23, 1114, 1184],
             &[
                 "2010-06-26 14:15:30",
                 "1 day 00:00:01",

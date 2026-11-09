@@ -145,3 +145,45 @@ fn a_timestamp_compared_with_a_timestamptz_is_read_in_the_session_zone() {
     let other = connect(&server);
     assert_eq!(col(&other, sql), ["0"]);
 }
+
+/// The type OIDs of a statement's result columns, over the simple protocol and over
+/// Describe.
+#[track_caller]
+fn oids(server: &Server, sql: &str) -> (Vec<u32>, Vec<u32>) {
+    let simple = connect(server).pg_exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let described = connect_extended(server)
+        .prepare("", sql)
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    (
+        simple[0].fields.iter().map(|f| f.data_type_oid).collect(),
+        described.fields.iter().map(|f| f.data_type_oid).collect(),
+    )
+}
+
+// An integer goes out at its width, as Postgres sends it: int2, int4 or int8 by its
+// column's type or its expression's, where every integer was int8 by its sampled value.
+// A key that is the table's rowid keeps int8, as a serial and a bigserial key are both
+// INTEGER there.
+#[test]
+fn an_integer_goes_out_at_its_width() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(
+        &conn,
+        "CREATE TABLE w (k serial PRIMARY KEY, i int, s smallint, b bigint, t text)",
+    );
+    must_exec(&conn, "INSERT INTO w (i, s, b, t) VALUES (1, 2, 3, 'x')");
+    for (sql, want) in [
+        (
+            "SELECT i, s, b, i + 1, length(t), count(*) FROM w GROUP BY i, s, b, t",
+            vec![23, 21, 20, 23, 23, 20],
+        ),
+        ("SELECT k, i, lower(t) FROM w ORDER BY k", vec![20, 23, 25]),
+        ("SELECT i FROM w UNION SELECT b FROM w", vec![20]),
+        ("UPDATE w SET i = 2 RETURNING s, i", vec![21, 23]),
+    ] {
+        let (simple, described) = oids(&server, sql);
+        assert_eq!(simple, want, "{sql}");
+        assert_eq!(described, want, "{sql} described");
+    }
+}
