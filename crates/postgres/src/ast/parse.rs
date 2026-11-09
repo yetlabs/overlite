@@ -48,8 +48,10 @@ unsafe extern "C" {
 ///
 /// # Errors
 ///
-/// "parse error" when Postgres would refuse the text (or it holds a NUL byte), and
-/// "decode error" if the protobuf does not decode, which would be a version skew.
+/// "parse error" when Postgres would refuse the text (or it holds a NUL byte),
+/// [`TOO_DEEP`] for a tree nested past [`MAX_NESTING`] or refused by libpg_query's
+/// own depth checks, and "decode error" if the protobuf does not decode, which would
+/// be a version skew.
 pub(crate) fn parse(sql: &str) -> Result<ParseResult, &'static str> {
     let input = CString::new(sql).map_err(|_| "parse error")?;
     // SAFETY: input is a NUL-terminated string that outlives the call; 0 is
@@ -69,6 +71,10 @@ pub(crate) fn parse(sql: &str) -> Result<ParseResult, &'static str> {
         } else {
             ParseResult::decode(tree).map_err(|_| "decode error")
         }
+    } else if refused_too_deep(&result) {
+        // libpg_query's own depth checks, which fire before the bound above when the
+        // thread's stack is small (a test thread's 2 MiB is, on Windows).
+        Err(TOO_DEEP)
     } else {
         Err("parse error")
     };
@@ -76,6 +82,27 @@ pub(crate) fn parse(sql: &str) -> Result<ParseResult, &'static str> {
     // owns its own copy of everything decoded.
     unsafe { pg_query_free_protobuf_parse_result(result) };
     out
+}
+
+/// Whether the parse failed on one of libpg_query's depth checks.
+fn refused_too_deep(result: &PgQueryProtobufParseResult) -> bool {
+    if result.error.is_null() {
+        return false;
+    }
+    // SAFETY: error is non-null and points to the result's PgQueryError, whose
+    // message, when non-null, is a NUL-terminated string; both live until the result
+    // is freed, after this returns.
+    unsafe {
+        let message = (*result.error).message;
+        !message.is_null() && is_too_deep(&std::ffi::CStr::from_ptr(message).to_string_lossy())
+    }
+}
+
+/// Whether libpg_query's message refuses a statement for its depth: the grammar's
+/// stack check, or the protobuf encoder's, which gives up on a deep tree when the
+/// stack runs short as well as past its own depth limit.
+fn is_too_deep(message: &str) -> bool {
+    message.starts_with(TOO_DEEP) || message == "parse tree is nested too deeply to serialize to protobuf"
 }
 
 /// Postgres' own error for sql, which `parse` refused ("parse error" or [`TOO_DEEP`]):
@@ -114,8 +141,8 @@ pub(crate) fn error_of(sql: &str) -> Option<crate::error::Error> {
         };
         // The grammar's own hint for the one refusal that has one.
         let hint = (message == "LIMIT #,# syntax is not supported").then_some("Use separate LIMIT and OFFSET clauses.");
-        if message.starts_with(TOO_DEEP) {
-            // The grammar's own stack check, past what the protobuf bound sees.
+        if is_too_deep(&message) {
+            // libpg_query's own depth checks, past what the protobuf bound sees.
             return_after_free(result);
             return Some(too_deep());
         }
