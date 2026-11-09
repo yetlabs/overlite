@@ -188,7 +188,7 @@ impl Session {
         if cols.is_empty() {
             let describe = match self
                 .db
-                .describe(&("SELECT * FROM ".to_string() + &rewrite(&cs.table)), &[], None)
+                .describe(&rewrite(&("SELECT * FROM ".to_string() + &cs.table)), &[], None)
             {
                 Ok(d) => d,
                 Err(e) => {
@@ -233,8 +233,10 @@ impl Session {
     fn copy_insert(&mut self, cs: &CopyStmt, cols: &[String], data: &[u8]) -> Result<usize> {
         let rows = parse_copy_data(cs, cols.len(), data)?;
 
+        // A table's name as written, which the engine resolves: there is nothing in it
+        // to translate.
         let insert = "INSERT INTO ".to_string()
-            + &rewrite(&cs.table)
+            + &cs.table
             + " ("
             + &quote_cols(cols)
             + ") VALUES ("
