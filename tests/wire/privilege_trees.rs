@@ -43,7 +43,7 @@ fn a_table_named_with_a_space_is_owned_by_its_whole_name() {
     must_exec(&alice, r#"GRANT SELECT ON "order" TO PUBLIC"#);
     must_exec(&admin, "CREATE ROLE bob LOGIN PASSWORD 'b'");
     let bob = connect_as(&addr, "bob", "b");
-    assert!(strings(&bob, r#"SELECT a::text FROM "order""#).is_empty());
+    assert_eq!(strings(&bob, r#"SELECT a::text FROM "order""#), Vec::<String>::new());
 }
 
 // GRANT and REVOKE name their tables, columns and grantees as Postgres reads them.
@@ -117,7 +117,10 @@ fn role_ddl_reads_its_names_and_options() {
         ["Log In"]
     );
     must_exec(&admin, r#"DROP ROLE "Log In""#);
-    assert!(strings(&admin, "SELECT rolname FROM pg_roles WHERE rolname LIKE 'Log%'").is_empty());
+    assert_eq!(
+        strings(&admin, "SELECT rolname FROM pg_roles WHERE rolname LIKE 'Log%'"),
+        Vec::<String>::new()
+    );
     // A role without CREATEROLE manages none but its own password.
     let alice = connect_as(&addr, "alice", "a");
     denied(&alice, "CREATE ROLE eve");
@@ -143,7 +146,7 @@ fn policies_read_their_names_roles_and_actions() {
     let alice = connect_as(&addr, "alice", "a");
     assert_eq!(strings(&alice, "SELECT v FROM docs"), ["a1"]);
     must_exec(&admin, r#"DROP POLICY "Own rows" ON docs"#);
-    assert!(strings(&alice, "SELECT v FROM docs").is_empty());
+    assert_eq!(strings(&alice, "SELECT v FROM docs"), Vec::<String>::new());
 
     must_exec(&alice, "CREATE TABLE notes (v text)");
     must_exec(&alice, "INSERT INTO notes VALUES ('a'), ('b')");
