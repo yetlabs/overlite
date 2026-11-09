@@ -596,3 +596,30 @@ fn the_printer_knows_every_function_the_text_passes_rewrite() {
         "rewritten by the text passes, unknown to the printer: {missing:?}"
     );
 }
+
+/// Every statement of the corpus left to the text passes, one per line: its source,
+/// whether it reads or writes rows, the first node the printer refused, and the
+/// statement. `OVERLITE_LEFT=<file> cargo test --release -p overlite-postgres --lib
+/// list_what_the_text_passes_translate -- --ignored`.
+#[test]
+#[ignore = "a listing, not a check"]
+fn list_what_the_text_passes_translate() {
+    use std::io::Write;
+    let path = std::env::var_os("OVERLITE_LEFT").unwrap_or_else(|| "target/text-passes.txt".into());
+    let mut f = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    for (src, sql) in corpus() {
+        let sql = wrapped_query(&sql).unwrap_or(sql);
+        if needs_no_rewrite(&sql) {
+            continue;
+        }
+        if let Err(why) = typed(&sql) {
+            let rows = if crate::rewrite::cache::reads_or_writes_rows(&sql) {
+                "rows"
+            } else {
+                "utility"
+            };
+            let one = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            writeln!(f, "{src}\t{rows}\t{why}\t{one}").unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        }
+    }
+}

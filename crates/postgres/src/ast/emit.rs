@@ -29,6 +29,8 @@ pub(crate) const TYPE_REFUSAL_OPERANDS: Unsupported = "% of operands of unknown 
 pub(crate) const TYPE_REFUSAL_BOOLEAN: Unsupported = "boolean column holding text";
 pub(crate) const TYPE_REFUSAL_JSON: Unsupported = "json operator on what is not known to be json";
 pub(crate) const TYPE_REFUSAL_RANGE: Unsupported = "range operator with a side that is no range";
+pub(crate) const TYPE_REFUSAL_STAR: Unsupported =
+    "star of a relation the catalog does not know in a derived column list";
 
 type Out = Result<(), Unsupported>;
 
@@ -43,6 +45,9 @@ enum Prec {
     Equality,
     /// `<`, `>`, `<=`, `>=`.
     Compare,
+    /// `&`, `|`, `<<`, `>>`: SQLite binds them between a comparison and `+`, where
+    /// Postgres binds every operator of its own.
+    Bit,
     Add,
     Mul,
     /// `||`.
@@ -107,6 +112,26 @@ pub(crate) const REWRITTEN: &[&str] = &[
     "trim",
     "unnest",
 ];
+
+/// The catalog's functions the text passes rewrite by name, which the printer writes
+/// as they do (`Emitter::func_call`): a lookup of a comment or a definition, or an
+/// empty relation where overlite has no partitions and no foreign data.
+const CATALOG_CALLS: &[&str] = &[
+    "obj_description",
+    "shobj_description",
+    "col_description",
+    "pg_get_indexdef",
+    "pg_get_constraintdef",
+    "pg_partition_ancestors",
+    "pg_partition_tree",
+    "pg_partition_root",
+    "pg_options_to_table",
+    "json_typeof",
+    "jsonb_typeof",
+];
+
+/// pg_options_to_table's rows: none, as rewrite_pg_options_to_table writes them.
+const EMPTY_OPTIONS: &str = "(SELECT NULL AS option_name, NULL AS option_value WHERE 0)";
 
 /// The json and jsonb functions SQLite has under other names, and whether the value is
 /// jsonb (rewrite/json.rs, JSON_FUNC_MAP and JSONB_FUNCS).
@@ -176,6 +201,7 @@ fn print(stmt: &NodeEnum, labels: Option<&[Option<String>]>, typer: Option<Typer
         cte_names: Vec::new(),
         ctid_output: false,
         srfs: 0,
+        list_srfs: Vec::new(),
         srf_aliases: Vec::new(),
         aliases: 0,
         returning_table: None,
@@ -279,6 +305,9 @@ struct Emitter<'a> {
     ctid_output: bool,
     /// How many set-returning functions without an alias have been written (`_srf0`...).
     srfs: usize,
+    /// The set-returning functions of the select list being written, each call (by
+    /// address) and what reads its column of the set FROM gains (`select_core`).
+    list_srfs: Vec<(usize, String)>,
     /// The aliases of each FROM's set-returning functions, in the order they are
     /// written, innermost FROM last.
     srf_aliases: Vec<std::collections::VecDeque<String>>,
@@ -317,6 +346,37 @@ pub(crate) fn ident(name: &str) -> String {
         name.to_string()
     } else {
         quote_ident(name)
+    }
+}
+
+/// The information_schema views the engine makes, each a temp view whose name holds
+/// the dot (`"information_schema.tables"`), as rewrite_information_schema names them.
+const INFORMATION_SCHEMA: &[&str] = &[
+    "tables",
+    "columns",
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
+    "constraint_column_usage",
+    "check_constraints",
+    "views",
+    "schemata",
+    "sequences",
+    "routines",
+    "column_privileges",
+];
+
+/// A relation of the catalog as SQLite names it: pg_catalog's views under their bare
+/// names, information_schema's under the dotted name of their temp view; None for a
+/// relation of another schema, or one information_schema does not have here (written
+/// as it came, as the text passes leave it).
+fn catalog_relation(schema: &str, rel: &str) -> Option<String> {
+    match schema {
+        "pg_catalog" => Some(ident(rel)),
+        "information_schema" if INFORMATION_SCHEMA.contains(&rel) => {
+            Some(quote_ident(&["information_schema.", rel].concat()))
+        }
+        _ => None,
     }
 }
 
@@ -738,14 +798,67 @@ impl Emitter<'_> {
             }
             return Ok(());
         }
+        // Set-returning functions in the select list: the set moves into FROM, joined
+        // after its relations (lateral, as the engine's walkers are), and each call
+        // reads its column of it, as rewrite_set_returning writes it. Calls side by
+        // side step together, the shorter padded with NULLs (overlite_zip).
+        let mut calls = Vec::new();
+        for t in &s.target_list {
+            if let NodeEnum::ResTarget(t) = node(t)? {
+                list_srf_calls(boxed(t.val.as_deref())?, &mut calls);
+            }
+        }
+        let mut set = None;
+        if !calls.is_empty() {
+            let alias = format!("_srf{}", self.srfs);
+            self.srfs += 1;
+            let zipped = calls.len() > 1;
+            for (i, f) in calls.iter().enumerate() {
+                let srf = srf_of_call(f)?;
+                let read = if srf.pairs || srf.args.len() > 1 && srf.name == "unnest" {
+                    let what = [srf.name, " returning a record in a select list"].concat();
+                    ["overlite_unsupported(", &quote_literal(&what), ")"].concat()
+                } else if zipped {
+                    format!("json_extract({}.value, '$[{i}]')", ident(&alias))
+                } else {
+                    [ident(&alias).as_str(), ".value"].concat()
+                };
+                self.list_srfs.push((std::ptr::from_ref(*f) as usize, read));
+            }
+            set = Some((alias, calls));
+        }
         self.push("SELECT ");
         if !s.distinct_clause.is_empty() {
             self.push("DISTINCT ");
         }
-        self.targets(&s.target_list, top)?;
+        let listed = self.targets(&s.target_list, top);
+        if let Some((_, calls)) = &set {
+            self.list_srfs.truncate(self.list_srfs.len() - calls.len());
+        }
+        listed?;
         if !s.from_clause.is_empty() {
             self.push(" FROM ");
             self.list(&s.from_clause, Self::table_ref)?;
+        }
+        if let Some((alias, calls)) = set {
+            self.push(if s.from_clause.is_empty() { " FROM " } else { ", " });
+            let srfs: Vec<Srf> = calls.iter().map(|f| srf_of_call(f)).collect::<Result<_, _>>()?;
+            let pairs = srfs.len() == 1 && srfs[0].pairs;
+            self.push(if pairs { "overlite_pairs(" } else { "overlite_elements(" });
+            if srfs.len() > 1 {
+                self.push("overlite_zip(");
+            }
+            for (i, srf) in srfs.iter().enumerate() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                self.srf_source(srf)?;
+            }
+            if srfs.len() > 1 {
+                self.push(")");
+            }
+            self.push(") AS ");
+            self.push(&ident(&alias));
         }
         if let Some(w) = &s.where_clause {
             self.push(" WHERE ");
@@ -1076,6 +1189,11 @@ impl Emitter<'_> {
                 Some((ty, name)) => self.cast_item(val, ty, name)?,
                 None => self.expr(val, Prec::Or)?,
             }
+            if let NodeEnum::ColumnRef(c) = val
+                && matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(NodeEnum::AStar(_)))
+            {
+                self.star_renames(&c.fields)?;
+            }
             if !t.name.is_empty() {
                 self.push(" AS ");
                 self.push(&quote_ident(&t.name));
@@ -1098,6 +1216,41 @@ impl Emitter<'_> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// After a star over a FROM with a set-returning function written in place, the
+    /// function's columns under the names the statement gives them, which the star
+    /// does not hold (it holds SQLite's: value, ord), as rewrite_lateral adds them: a
+    /// query reading the star's columns by those names finds them.
+    fn star_renames(&mut self, fields: &[pb::Node]) -> Out {
+        let Some(aliases) = self.srf_aliases.last() else {
+            return Ok(());
+        };
+        let qualifier = match fields {
+            [_] => None,
+            [q, _] => Some(string(q)?),
+            _ => return Ok(()),
+        };
+        let mut extra = Vec::new();
+        for alias in aliases {
+            if qualifier.is_some_and(|q| q != alias) {
+                continue;
+            }
+            if let Some((_, cols)) = self.renames.iter().rev().find(|(a, _)| a == alias) {
+                for (name, col) in cols {
+                    if name != alias && *col != [ident(alias).as_str(), ".", &ident(name)].concat() {
+                        extra.push((name.clone(), col.clone()));
+                    }
+                }
+            }
+        }
+        for (name, col) in extra {
+            self.push(", ");
+            self.push(&col);
+            self.push(" AS ");
+            self.push(&quote_ident(&name));
         }
         Ok(())
     }
@@ -1267,8 +1420,21 @@ impl Emitter<'_> {
             NodeEnum::RangeVar(r) => self.range_var(r, true),
             NodeEnum::JoinExpr(j) => {
                 let jt = JoinType::try_from(j.jointype).map_err(|_| "join type")?;
-                if j.join_using_alias.is_some() || j.alias.is_some() {
+                if j.join_using_alias.is_some() {
                     return Err("join alias");
+                }
+                if let Some(a) = &j.alias {
+                    // A join named as a whole, which SQLite reads in parentheses.
+                    if !a.colnames.is_empty() {
+                        return Err("join alias");
+                    }
+                    let mut bare = j.as_ref().clone();
+                    bare.alias = None;
+                    self.push("(");
+                    self.table_ref(&NodeEnum::JoinExpr(Box::new(bare)))?;
+                    self.push(") AS ");
+                    self.push(&ident(&a.aliasname));
+                    return Ok(());
                 }
                 self.table_ref(boxed(j.larg.as_deref())?)?;
                 if j.is_natural {
@@ -1321,7 +1487,14 @@ impl Emitter<'_> {
                             .iter()
                             .map(|c| string(c).map(str::to_string))
                             .collect::<Result<_, _>>()?;
-                        let width = output_names(q)?;
+                        let width = match output_names(q) {
+                            Ok(w) => w,
+                            // A star's columns, where the catalog knows its relations.
+                            Err(why) => match &mut self.typer {
+                                Some(t) => t.star_names(q).ok_or(TYPE_REFUSAL_STAR)?,
+                                None => return Err(why),
+                            },
+                        };
                         if names.len() > width.len() {
                             return Err("derived column aliases");
                         }
@@ -1446,6 +1619,46 @@ impl Emitter<'_> {
                 return Err("FROM function");
             };
             let call = l.items.first().ok_or("FROM function")?;
+            if let NodeEnum::FuncCall(f) = node(call)?
+                && let Some(name) = func_name(f)
+                && matches!(
+                    name,
+                    "pg_partition_ancestors" | "pg_partition_tree" | "pg_partition_root" | "pg_options_to_table"
+                )
+                && !r.ordinality
+                && r.coldeflist.is_empty()
+            {
+                // No partitions and no foreign data: an empty relation with the
+                // function's columns, as rewrite_partition_srf and
+                // rewrite_pg_options_to_table write it.
+                let names: Vec<String> = match &r.alias {
+                    Some(a) if !a.colnames.is_empty() => a
+                        .colnames
+                        .iter()
+                        .map(|c| string(c).map(ident))
+                        .collect::<Result<_, _>>()?,
+                    _ if name == "pg_options_to_table" => Vec::new(),
+                    _ => vec![name.to_string()],
+                };
+                if names.is_empty() {
+                    self.push(EMPTY_OPTIONS);
+                } else {
+                    self.push("(SELECT ");
+                    for (i, n) in names.iter().enumerate() {
+                        if i > 0 {
+                            self.push(", ");
+                        }
+                        self.push("NULL AS ");
+                        self.push(n);
+                    }
+                    self.push(" WHERE 0)");
+                }
+                if let Some(a) = &r.alias {
+                    self.push(" AS ");
+                    self.push(&ident(&a.aliasname));
+                }
+                return Ok(());
+            }
             if r.ordinality || r.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) || !r.coldeflist.is_empty() {
                 return Err("FROM function with columns");
             }
@@ -1537,6 +1750,18 @@ impl Emitter<'_> {
                 self.push(")");
                 Ok(())
             }
+            // In a select list; in FROM it is a recursive CTE (`generate_series`).
+            "generate_series" => {
+                self.push("overlite_series(");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.expr(a, Prec::Or)?;
+                }
+                self.push(")");
+                Ok(())
+            }
             "json_object_keys" | "jsonb_object_keys" => {
                 self.push("overlite_json_keys(");
                 self.expr(args.first().ok_or("object keys")?, Prec::Or)?;
@@ -1567,9 +1792,6 @@ impl Emitter<'_> {
     /// generate_series of integers, as rewrite_generate_series writes it: a recursive
     /// CTE stepping from the start while the step's sign says the end is not passed.
     fn generate_series(&mut self, srf: &Srf) -> Out {
-        if srf.lateral {
-            return Err("generate_series reading a column");
-        }
         let (a, b, step) = match srf.args.as_slice() {
             [a, b] => (a, b, None),
             [a, b, s] => (a, b, Some(s)),
@@ -1654,24 +1876,17 @@ impl Emitter<'_> {
         if !r.catalogname.is_empty() {
             return Err("catalog-qualified name");
         }
-        // Catalog names are views and functions the text passes rewrite; a table
-        // named like one is theirs too.
-        if matches!(r.schemaname.as_str(), "pg_catalog" | "information_schema")
-            || r.relname.starts_with("pg_")
-            || r.relname.starts_with("_overlite")
-        {
-            return Err("catalog relation");
+        if let Some(name) = catalog_relation(&r.schemaname, &r.relname) {
+            self.push(&name);
+        } else {
+            if !r.schemaname.is_empty() {
+                self.push(&ident(&r.schemaname));
+                self.push(".");
+            }
+            // A quoted name holding a dot is written whole, as the text passes leave
+            // it: the stored name of a table of another schema reads the same.
+            self.push(&ident(&r.relname));
         }
-        // A stored name of another schema is `schema.table` in SQLite: the text passes
-        // read a quoted name with a dot.
-        if r.relname.contains('.') {
-            return Err("name with a dot");
-        }
-        if !r.schemaname.is_empty() {
-            self.push(&ident(&r.schemaname));
-            self.push(".");
-        }
-        self.push(&ident(&r.relname));
         if let Some(a) = &r.alias {
             if !alias {
                 return Err("alias of a written table");
@@ -1704,10 +1919,12 @@ impl Emitter<'_> {
     }
 
     fn insert(&mut self, s: &pb::InsertStmt) -> Out {
-        // OVERRIDING SYSTEM or USER VALUE decides what an identity column gets; the
-        // printer has no way to say it, so it is not dropped but left to the passes.
-        if s.r#override > pb::OverridingKind::OverridingNotSet as i32 {
-            return Err("OVERRIDING");
+        // OVERRIDING SYSTEM VALUE lets a value into a GENERATED ALWAYS column, which
+        // the session checks and takes out before translating (identity_insert): the
+        // value given is what SQLite stores. USER VALUE, which the session refuses,
+        // would ask for the default instead.
+        if s.r#override == pb::OverridingKind::OverridingUserValue as i32 {
+            return Err("OVERRIDING USER VALUE");
         }
         let ctes = self.write_with(s.with_clause.as_ref())?;
         self.push("INSERT INTO ");
@@ -1834,61 +2051,95 @@ impl Emitter<'_> {
     /// The `a = x, b = y` of an UPDATE or an ON CONFLICT DO UPDATE, each value's
     /// parameter typed by its column.
     fn set_list(&mut self, items: &[pb::Node]) -> Out {
-        for (i, t) in items.iter().enumerate() {
+        let mut i = 0;
+        while i < items.len() {
             if i > 0 {
                 self.push(", ");
             }
-            let NodeEnum::ResTarget(t) = node(t)? else {
+            let NodeEnum::ResTarget(t) = node(&items[i])? else {
                 return Err("SET item");
             };
             if !t.indirection.is_empty() {
                 return Err("SET indirection");
             }
             let val = boxed(t.val.as_deref())?;
-            if matches!(val, NodeEnum::MultiAssignRef(_)) {
-                return Err("SET (a, b) =");
+            if let NodeEnum::MultiAssignRef(m) = val {
+                // `SET (a, b) = (x, y)` or `= (SELECT ...)`: SQLite's row value, each
+                // item's parameter typed by its column.
+                let n = usize::try_from(m.ncolumns).map_err(|_| "SET (a, b) =")?;
+                let group = items.get(i..i + n).ok_or("SET (a, b) =")?;
+                let mut names = Vec::with_capacity(n);
+                for g in group {
+                    let NodeEnum::ResTarget(g) = node(g)? else {
+                        return Err("SET item");
+                    };
+                    if !g.indirection.is_empty() {
+                        return Err("SET indirection");
+                    }
+                    names.push(g.name.clone());
+                }
+                let source = boxed(m.source.as_deref())?;
+                self.push("(");
+                for (k, name) in names.iter().enumerate() {
+                    if k > 0 {
+                        self.push(", ");
+                    }
+                    self.push(&ident(name));
+                }
+                self.push(") = ");
+                match source {
+                    NodeEnum::RowExpr(row) if row.args.len() == n => {
+                        self.push("(");
+                        for (k, (x, name)) in row.args.iter().zip(&names).enumerate() {
+                            if k > 0 {
+                                self.push(", ");
+                            }
+                            let x = node(x)?;
+                            let ty = self.set_column_type(name);
+                            self.note_param(x, ty);
+                            self.expr(x, Prec::Or)?;
+                        }
+                        self.push(")");
+                    }
+                    NodeEnum::SubLink(l) if l.sub_link_type == SubLinkType::MultiexprSublink as i32 => {
+                        self.subquery(l)?;
+                    }
+                    _ => return Err("SET (a, b) ="),
+                }
+                i += n;
+                continue;
             }
-            if let Some(typer) = &mut self.typer {
-                let col = pb::Node {
-                    node: Some(NodeEnum::String(pb::String { sval: t.name.clone() })),
-                };
-                let ty = typer.column(std::slice::from_ref(&col)).map_or(Ty::ANY, |c| c.ty);
-                self.note_param(val, ty);
-            }
+            let ty = self.set_column_type(&t.name);
+            self.note_param(val, ty);
             self.push(&ident(&t.name));
             self.push(" = ");
             self.expr(val, Prec::Or)?;
+            i += 1;
         }
         Ok(())
     }
 
-    /// Whether a RETURNING reads only the written table: SQLite's sees no other, where
-    /// Postgres' sees those of FROM and USING too.
-    fn returns_target_only(s: Option<&pb::ReturningClause>, r: &pb::RangeVar) -> bool {
-        let Some(s) = s else { return true };
-        let names = [
-            r.relname.as_str(),
-            r.alias.as_ref().map_or("", |a| a.aliasname.as_str()),
-        ];
-        s.exprs.iter().all(|t| {
-            let Some(NodeEnum::ResTarget(t)) = t.node.as_ref() else {
-                return false;
-            };
-            match t.val.as_deref().and_then(|v| v.node.as_ref()) {
-                Some(NodeEnum::ColumnRef(c)) => match c.fields.as_slice() {
-                    [q, _] => matches!(string(q), Ok(q) if names.contains(&q)),
-                    _ => false,
-                },
-                _ => false,
-            }
-        })
+    /// The type of a column an UPDATE sets, as the environment knows it.
+    fn set_column_type(&mut self, name: &str) -> Ty {
+        let Some(typer) = &mut self.typer else {
+            return Ty::ANY;
+        };
+        let col = pb::Node {
+            node: Some(NodeEnum::String(pb::String { sval: name.to_string() })),
+        };
+        typer.column(std::slice::from_ref(&col)).map_or(Ty::ANY, |c| c.ty)
     }
 
+    /// Whether a RETURNING reads only the written table: SQLite's sees no other, where
+    /// Postgres' sees those of FROM and USING too.
     fn update(&mut self, s: &pb::UpdateStmt) -> Out {
         let r = s.relation.as_ref().ok_or("UPDATE target")?;
-        if !s.from_clause.is_empty() && !Self::returns_target_only(s.returning_clause.as_ref(), r) {
-            return Err("UPDATE FROM RETURNING");
-        }
+        let ret = joined_returning(
+            s.returning_clause.as_ref(),
+            r,
+            &s.from_clause,
+            s.where_clause.as_deref(),
+        );
         let ctes = self.write_with(s.with_clause.as_ref())?;
         self.push("UPDATE ");
         self.range_var(r, true)?;
@@ -1918,7 +2169,7 @@ impl Emitter<'_> {
             self.push(" WHERE ");
             self.expr(node(w)?, Prec::Or)?;
         }
-        self.returning_with_alias(r, s.returning_clause.as_ref())?;
+        self.returning_with_alias(r, ret.as_ref())?;
         self.renames.truncate(renamed);
         self.leave_from();
         self.pop_scope();
@@ -1953,9 +2204,6 @@ impl Emitter<'_> {
         } else {
             // DELETE ... USING, which SQLite has not: the rows of the join, by rowid,
             // as rewrite_delete_using writes it.
-            if !Self::returns_target_only(s.returning_clause.as_ref(), r) {
-                return Err("DELETE USING RETURNING");
-            }
             let mut bare = r.clone();
             bare.alias = None;
             self.range_var(&bare, false)?;
@@ -1976,7 +2224,13 @@ impl Emitter<'_> {
             }
             self.push(")");
         }
-        self.returning_with_alias(r, s.returning_clause.as_ref())?;
+        let ret = joined_returning(
+            s.returning_clause.as_ref(),
+            r,
+            &s.using_clause,
+            s.where_clause.as_deref(),
+        );
+        self.returning_with_alias(r, ret.as_ref())?;
         self.renames.truncate(renamed);
         self.leave_from();
         self.pop_scope();
@@ -2040,8 +2294,32 @@ impl Emitter<'_> {
     fn expr_bare(&mut self, n: &NodeEnum) -> Out {
         match n {
             NodeEnum::ColumnRef(c) => {
-                if c.fields.len() > 1 && matches!(string(&c.fields[0]), Ok("pg_catalog" | "information_schema")) {
-                    return Err("catalog column");
+                // A column of a catalog relation named with its schema: the relation as
+                // `catalog_relation` writes it, then the column.
+                if c.fields.len() > 2
+                    && let Ok(schema @ ("pg_catalog" | "information_schema")) = string(&c.fields[0])
+                    && let Ok(rel) = string(&c.fields[1])
+                    && let Some(name) = catalog_relation(schema, rel)
+                {
+                    self.push(&name);
+                    for f in &c.fields[2..] {
+                        self.push(".");
+                        match node(f)? {
+                            NodeEnum::String(s) => self.push(&ident(&s.sval)),
+                            NodeEnum::AStar(_) => self.push("*"),
+                            _ => return Err("column reference"),
+                        }
+                    }
+                    return Ok(());
+                }
+                if c.fields.len() == 2 && matches!(string(&c.fields[0]), Ok("pg_catalog")) {
+                    // `pg_catalog.x` names a column x of a relation pg_catalog, which no
+                    // table is: the text passes read it as a bare x.
+                    let NodeEnum::String(s) = node(&c.fields[1])? else {
+                        return Err("column reference");
+                    };
+                    self.push(&ident(&s.sval));
+                    return Ok(());
                 }
                 if let Some(t) = &mut self.typer
                     && !matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(NodeEnum::AStar(_)))
@@ -2065,9 +2343,9 @@ impl Emitter<'_> {
                     }
                     match node(f)? {
                         NodeEnum::String(s) => {
-                            if matches!(s.sval.as_str(), "xmin" | "xmax" | "oid" | "tableoid") {
-                                return Err("system column");
-                            }
+                            // A system column (oid, tableoid, xmin) is a column of the
+                            // catalog's views, which have them, or of a table with one
+                            // by that name: written as it came, as the text passes do.
                             // RETURNING names a written table by its name, not its alias.
                             match &self.returning_table {
                                 Some((alias, table)) if i == 0 && last > 0 && s.sval == *alias => {
@@ -2295,10 +2573,19 @@ impl Emitter<'_> {
             };
             let lo = bound(self, ix.lidx.as_deref())?;
             let hi = bound(self, ix.uidx.as_deref())?;
-            if ix.is_slice {
-                if !matches!(arg, NodeEnum::ColumnRef(_)) || i.indirection.len() > 1 {
-                    return Err("slice of what is no column");
-                }
+            if ix.is_slice && (!matches!(arg, NodeEnum::ColumnRef(_)) || i.indirection.len() > 1) {
+                // Of any other expression the engine's, which reads it once.
+                out = [
+                    "overlite_array(overlite_array_slice(",
+                    &out,
+                    ", ",
+                    lo.as_deref().unwrap_or("NULL"),
+                    ", ",
+                    hi.as_deref().unwrap_or("NULL"),
+                    "))",
+                ]
+                .concat();
+            } else if ix.is_slice {
                 let mut conds = Vec::new();
                 if let Some(lo) = lo {
                     conds.push(["key + 1 >= (", &lo, ")"].concat());
@@ -2386,6 +2673,8 @@ impl Emitter<'_> {
             // An output column named ctid, in the ORDER BY that reads it.
             ["ctid"] if self.ctid_output => Ok(Some("ctid".to_string())),
             ["ctid"] if !scope.is_empty() && scope.iter().all(|(_, table)| *table) => Ok(Some("rowid".to_string())),
+            // A CTE's or a subquery's column it names ctid (its table's rowid).
+            ["ctid"] if scope.len() == 1 => Ok(Some("ctid".to_string())),
             [q, "ctid"] => {
                 for scope in self.froms.iter().rev() {
                     if let Some((_, table)) = scope.iter().find(|(n, _)| n == q) {
@@ -2546,6 +2835,9 @@ impl Emitter<'_> {
             return Ok(());
         }
         let name = cast_type(ty)?;
+        if let Some(lookup) = reg_lookup(&name) {
+            return self.reg_cast(arg, &name, lookup);
+        }
         if self.typed() {
             let target = types::of_type_name(ty);
             self.note_param(arg, target);
@@ -2608,6 +2900,13 @@ impl Emitter<'_> {
                 self.expr(arg, Prec::Or)?;
                 self.push(", 'jsonb') COLLATE JSONB)");
             }
+            // An array goes to text in Postgres' form (`{a,b}`), not as the JSON array
+            // it is stored as.
+            "text" if self.yields_array(arg) => {
+                self.push("overlite_array_text(");
+                self.expr(arg, Prec::Or)?;
+                self.push(")");
+            }
             "text" => {
                 self.push("CAST(");
                 self.expr(arg, Prec::Or)?;
@@ -2629,11 +2928,65 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// A cast to an object identifier type that names its object (regclass, regtype,
+    /// ...), as rewrite_casts writes it: a number, quoted or not, is the oid; a quoted
+    /// name the oid of the object of that name, of any schema (and a system catalog's
+    /// own, which pg_class does not list); anything else an oid, written as the
+    /// object's name, which is how psql reads one.
+    fn reg_cast(&mut self, arg: &NodeEnum, name: &str, (col, table): (&str, &str)) -> Out {
+        if let NodeEnum::AConst(k) = arg {
+            match &k.val {
+                Some(Val::Ival(i)) => {
+                    self.push(&i.ival.to_string());
+                    return Ok(());
+                }
+                Some(Val::Sval(v)) => {
+                    let v = v.sval.trim();
+                    if !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()) {
+                        self.push(v);
+                        return Ok(());
+                    }
+                    if name == "regclass"
+                        && let Some(oid) = system_catalog_oid(v)
+                    {
+                        self.push(oid);
+                        return Ok(());
+                    }
+                    let (name, quoted) = object_name(v);
+                    self.push("(SELECT oid FROM ");
+                    self.push(table);
+                    self.push(" WHERE ");
+                    self.push(col);
+                    self.push(" = ");
+                    self.push(&quote_literal(&name));
+                    // An unquoted name is folded, and the catalog keeps a name as it
+                    // was created: SQLite's names are one whatever their case.
+                    if !quoted {
+                        self.push(" COLLATE NOCASE");
+                    }
+                    self.push(")");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        self.push("(SELECT ");
+        self.push(col);
+        self.push(" FROM ");
+        self.push(table);
+        self.push(" WHERE oid = ");
+        self.expr(arg, Prec::Compare)?;
+        self.push(")");
+        Ok(())
+    }
+
     fn a_expr(&mut self, a: &pb::AExpr) -> Out {
         use pb::AExprKind as K;
         let kind = K::try_from(a.kind).map_err(|_| "operator kind")?;
         let op = match a.name.as_slice() {
             [n] => string(n)?,
+            // OPERATOR(pg_catalog.~) is the operator a bare ~ names.
+            [schema, n] if string(schema)? == "pg_catalog" => string(n)?,
             _ => return Err("qualified operator"),
         };
         match kind {
@@ -2643,6 +2996,29 @@ impl Emitter<'_> {
                 };
                 let r = node(r)?;
                 let Some(l) = a.lexpr.as_deref() else {
+                    // Postgres' math prefixes, as rewrite_math_operators writes them.
+                    if let Some(f) = match op {
+                        "|/" => Some("sqrt("),
+                        "||/" => Some("cbrt("),
+                        "@" => Some("abs("),
+                        _ => None,
+                    } {
+                        self.push(f);
+                        self.expr(r, Prec::Or)?;
+                        self.push(")");
+                        return Ok(());
+                    }
+                    if op == "~" {
+                        self.push("~");
+                        return self.expr(r, Prec::Unary);
+                    }
+                    // A text search query negated (`!!` is tsquery's alone).
+                    if op == "!!" {
+                        self.push("overlite_tsquery_op('!', ");
+                        self.expr(r, Prec::Or)?;
+                        self.push(", NULL)");
+                        return Ok(());
+                    }
                     if !matches!(op, "-" | "+") {
                         return Err("prefix operator");
                     }
@@ -2656,6 +3032,49 @@ impl Emitter<'_> {
                 let l = node(l)?;
                 if matches!(op, "~" | "~*" | "!~" | "!~*") {
                     return self.regex(op, l, r);
+                }
+                if matches!(op, "=" | "<>" | "!=")
+                    && let Some(truth) = self.catalog_bool(l, r)
+                {
+                    self.expr(l, Prec::Compare)?;
+                    self.push(" ");
+                    self.push(op);
+                    self.push(if truth { " 1" } else { " 0" });
+                    return Ok(());
+                }
+                if matches!(op, "&&" | "||")
+                    && self.typed()
+                    && (self.ty(l).is(Base::Tsquery) || self.ty(r).is(Base::Tsquery))
+                {
+                    // Two text search queries joined, the engine's (the text pass took
+                    // `&&` for an overlap).
+                    self.push("overlite_tsquery_op(");
+                    self.push(if op == "&&" { "'&', " } else { "'|', " });
+                    self.expr(l, Prec::Or)?;
+                    self.push(", ");
+                    self.expr(r, Prec::Or)?;
+                    self.push(")");
+                    return Ok(());
+                }
+                if matches!(op, "#" | "^") && !(self.typed() && (self.is_range(l) || self.is_range(r))) {
+                    return self.math_call(op, l, r);
+                }
+                // pg_trgm's word similarity and distances, which only text has.
+                if let Some(f) = match op {
+                    "<%" | "%>" | "<<%" | "%>>" => Some("overlite_trgm_match("),
+                    "<->" | "<<->" | "<->>" | "<<<->" | "<->>>" => Some("overlite_trgm_dist("),
+                    _ => None,
+                } {
+                    self.note_param(l, Ty::TEXT);
+                    self.note_param(r, Ty::TEXT);
+                    self.push(f);
+                    self.expr(l, Prec::Or)?;
+                    self.push(", ");
+                    self.expr(r, Prec::Or)?;
+                    self.push(", ");
+                    self.push(&quote_literal(op));
+                    self.push(")");
+                    return Ok(());
                 }
                 if self.typed() {
                     return self.typed_op(a, op, l, r);
@@ -2799,6 +3218,48 @@ impl Emitter<'_> {
         }
     }
 
+    /// Whether n is an array: by its type, or by what makes one whatever its elements
+    /// (array_agg, ARRAY[...], ARRAY(subquery), a cast to an array type).
+    fn yields_array(&mut self, n: &NodeEnum) -> bool {
+        match n {
+            NodeEnum::FuncCall(f) if func_name(f) == Some("array_agg") => true,
+            NodeEnum::AArrayExpr(_) => true,
+            NodeEnum::SubLink(l) => l.sub_link_type == SubLinkType::ArraySublink as i32,
+            NodeEnum::TypeCast(t) => t.type_name.as_ref().is_some_and(|t| !t.array_bounds.is_empty()),
+            _ => self.typed() && self.ty(n).array,
+        }
+    }
+
+    /// `a # b` (xor of integers) and `a ^ b` (power), which SQLite has as functions, as
+    /// rewrite_math_operators writes them.
+    fn math_call(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+        self.push(if op == "#" { "overlite_xor(" } else { "power(" });
+        self.expr(l, Prec::Or)?;
+        self.push(", ");
+        self.expr(r, Prec::Or)?;
+        self.push(")");
+        Ok(())
+    }
+
+    /// The truth a string literal compared with a boolean column of the catalog says:
+    /// the catalog's views keep their booleans as 1 and 0, which SQLite does not
+    /// compare equal to 't' or 'f' (rewrite_catalog_bool_literals). A column of a table
+    /// the environment knows is read by its own type instead.
+    fn catalog_bool(&mut self, l: &NodeEnum, r: &NodeEnum) -> Option<bool> {
+        let NodeEnum::ColumnRef(c) = l else { return None };
+        let name = c.fields.last().and_then(|f| string(f).ok())?;
+        if !crate::types::BOOL_CATALOG_COLUMNS.contains(name) || self.ty(l).known() {
+            return None;
+        }
+        let NodeEnum::AConst(k) = r else { return None };
+        let Some(Val::Sval(v)) = &k.val else { return None };
+        match v.sval.to_ascii_lowercase().as_str() {
+            "t" | "true" | "y" | "yes" | "on" | "1" => Some(true),
+            "f" | "false" | "n" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        }
+    }
+
     /// The POSIX regular expression operators, as SQLite's REGEXP over the engine's
     /// regexp(): `~*` and `!~*` with the pattern's `(?i)`, as rewrite_match_operators
     /// writes them for the text passes.
@@ -2877,7 +3338,22 @@ impl Emitter<'_> {
             "@>" | "<@" | "&&" | "-|-" | "<<" | ">>" | "&<" | "&>" if self.is_range(l) || self.is_range(r) => {
                 self.range_op(op, l, r)
             }
+            // Only ranges have these here (and geometry, which overlite has not), and a
+            // shift beside a range's literal is a range's.
+            "-|-" | "&<" | "&>" => self.range_op(op, l, r),
+            "<<" | ">>" if is_range_literal(l) || is_range_literal(r) => self.range_op(op, l, r),
             "@>" | "<@" | "&&" if self.ty(l).array || self.ty(r).array => self.array_op(op, l, r),
+            // A range's literal containing what the catalog does not know, a range or an
+            // element: json_contains reads either.
+            "@>" | "<@" if is_range_literal(if op == "@>" { l } else { r }) => {
+                let (c, e) = if op == "@>" { (l, r) } else { (r, l) };
+                self.push("json_contains(");
+                self.expr(c, Prec::Or)?;
+                self.push(", ");
+                self.expr(e, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
             "->" | "->>" | "#>" | "#>>" | "@>" | "<@" | "?" | "?|" | "?&" => self.json_op(a, op, l, r),
             // Full-text search's match, the engine's (rewrite_fts), the vector first.
             "@@" => {
@@ -2898,6 +3374,15 @@ impl Emitter<'_> {
                 self.expr(r, Prec::Or)?;
                 self.push(")");
                 Ok(())
+            }
+            // The bitwise operators of integers, SQLite's own.
+            "&" | "|" | "<<" | ">>" => {
+                let p = binary_prec(op).ok_or("operator")?;
+                self.expr(l, p)?;
+                self.push(" ");
+                self.push(op);
+                self.push(" ");
+                self.expr(r, next(p))
             }
             "%" => {
                 // pg_trgm's similarity on text, a remainder on numbers: only the types tell.
@@ -2996,6 +3481,20 @@ impl Emitter<'_> {
     fn range_op(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
         let (tl, tr) = (self.ty(l), self.ty(r));
         let ok = |me: &mut Self, n: &NodeEnum, t: Ty| me.is_range(n) || matches!(t.base, Base::Unknown | Base::Any);
+        if matches!(op, "@>" | "<@") {
+            // A range containing an element: Postgres' anyrange @> anyelement, which
+            // json_contains reads of a range (the text passes' function).
+            let (c, e, tc, te) = if op == "@>" { (l, r, tl, tr) } else { (r, l, tr, tl) };
+            if (self.is_range(c) || tc.base == Base::Any) && !self.is_range(e) && !te.array && te.known() {
+                self.note_param(c, tc);
+                self.push("json_contains(");
+                self.expr(c, Prec::Or)?;
+                self.push(", ");
+                self.expr(e, Prec::Or)?;
+                self.push(")");
+                return Ok(());
+            }
+        }
         if !(ok(self, l, tl) && ok(self, r, tr)) {
             return Err(TYPE_REFUSAL_RANGE);
         }
@@ -3020,12 +3519,13 @@ impl Emitter<'_> {
     fn json_op(&mut self, a: &pb::AExpr, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
         let (tl, tr) = (self.ty(l), self.ty(r));
         // What the catalog does not know is taken for json, as the text passes take it:
-        // hstore, stored as JSON text, answers `->`, `?` and `@>` the same; containment
-        // of a known scalar is a range's.
-        let any_json = tl.base == Base::Any
-            && !tl.array
-            && (!matches!(op, "@>" | "<@") || matches!(tr.base, Base::Any | Base::Unknown | Base::Json | Base::Jsonb));
-        if !(tl.is(Base::Jsonb) || tl.is(Base::Json) || any_json) {
+        // hstore, stored as JSON text, answers `->`, `?` and `@>` the same. Containment
+        // is the container's to say, the right side of `<@`; over what the catalog does
+        // not know it is json_contains whatever the other side, which reads a range
+        // containing an element too.
+        let (lead, other) = if op == "<@" { (tr, tl) } else { (tl, tr) };
+        let any_json = lead.base == Base::Any && !lead.array && !(matches!(op, "@>" | "<@") && other.array);
+        if !(lead.is(Base::Jsonb) || lead.is(Base::Json) || any_json) {
             return Err(TYPE_REFUSAL_JSON);
         }
         match op {
@@ -3370,6 +3870,14 @@ impl Emitter<'_> {
     }
 
     fn func_call(&mut self, f: &pb::FuncCall) -> Out {
+        if !self.list_srfs.is_empty() {
+            let at = std::ptr::from_ref(f) as usize;
+            if let Some((_, read)) = self.list_srfs.iter().find(|(p, _)| *p == at) {
+                let read = read.clone();
+                self.push(&read);
+                return Ok(());
+            }
+        }
         if self.typed()
             && f.funcformat == pb::CoercionForm::CoerceSqlSyntax as i32
             && let [schema, name] = f.funcname.as_slice()
@@ -3438,7 +3946,50 @@ impl Emitter<'_> {
         if f.funcformat != pb::CoercionForm::CoerceExplicitCall as i32 {
             return Err("special function syntax");
         }
-        if REWRITTEN.contains(&name) && !JSON_RENAMES.iter().any(|(n, _, _)| *n == name) && name != "string_agg" {
+        if f.over.is_none() && f.agg_filter.is_none() && f.agg_order.is_empty() && !f.agg_star && !f.agg_distinct {
+            match (name, f.args.as_slice()) {
+                ("obj_description" | "shobj_description", [o, _]) => return self.description(node(o)?, None),
+                ("col_description", [o, n]) => return self.description(node(o)?, Some(node(n)?)),
+                ("pg_get_indexdef", [o, ..]) => return self.indexdef(node(o)?),
+                ("pg_get_constraintdef", [o, ..]) => return self.constraintdef(node(o)?),
+                ("pg_partition_ancestors" | "pg_partition_tree" | "pg_partition_root", _) => {
+                    self.push("(SELECT NULL AS ");
+                    self.push(name);
+                    self.push(" WHERE 0)");
+                    return Ok(());
+                }
+                // Postgres' names of a JSON value's type, from SQLite's json_type
+                // (the text pass wrote json_type alone: `integer` for a number).
+                ("json_typeof" | "jsonb_typeof", [x]) => {
+                    self.push("CASE json_type(");
+                    self.expr(node(x)?, Prec::Or)?;
+                    self.push(
+                        ") WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'string' \
+                         WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' ELSE json_type(",
+                    );
+                    self.expr(node(x)?, Prec::Or)?;
+                    self.push(") END");
+                    return Ok(());
+                }
+                ("pg_options_to_table", _) => {
+                    self.push(EMPTY_OPTIONS);
+                    return Ok(());
+                }
+                ("array_to_string", [a, sep, ..]) => {
+                    if let NodeEnum::SubLink(l) = node(a)?
+                        && l.sub_link_type == SubLinkType::ArraySublink as i32
+                    {
+                        return self.joined_subquery(l, node(sep)?);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if REWRITTEN.contains(&name)
+            && !JSON_RENAMES.iter().any(|(n, _, _)| *n == name)
+            && !matches!(name, "string_agg" | "array_to_string")
+            && !CATALOG_CALLS.contains(&name)
+        {
             return Err("function");
         }
         let clauses = f.over.is_some() || f.agg_filter.is_some() || !f.agg_order.is_empty();
@@ -3580,6 +4131,71 @@ impl Emitter<'_> {
         if jsonb {
             self.push(", 'jsonb') COLLATE JSONB)");
         }
+        Ok(())
+    }
+
+    /// obj_description, shobj_description and col_description: the comment
+    /// pg_description holds for the object (and column), as rewrite_obj_description
+    /// writes them.
+    fn description(&mut self, oid: &NodeEnum, column: Option<&NodeEnum>) -> Out {
+        self.push("(SELECT description FROM pg_description WHERE objoid = ");
+        self.expr(oid, Prec::Compare)?;
+        self.push(" AND objsubid = ");
+        match column {
+            Some(c) => self.expr(c, Prec::Compare)?,
+            None => self.push("0"),
+        }
+        self.push(" LIMIT 1)");
+        Ok(())
+    }
+
+    /// pg_get_indexdef: the CREATE INDEX the catalog's columns say, with the USING
+    /// psql looks for, as rewrite_object_defs writes it.
+    fn indexdef(&mut self, oid: &NodeEnum) -> Out {
+        self.push(
+            "(SELECT 'CREATE ' || CASE WHEN ix._u THEN 'UNIQUE ' ELSE '' END || 'INDEX ' || (SELECT relname FROM \
+             pg_class WHERE oid = ix._i) || ' ON ' || (SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN \
+             pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = ix._r) || ' USING btree (' || ix._c || ')' \
+             FROM (SELECT indexrelid AS _i, indrelid AS _r, indisunique AS _u, ov_cols AS _c FROM pg_index) ix \
+             WHERE ix._i = ",
+        );
+        self.expr(oid, Prec::Compare)?;
+        self.push(")");
+        Ok(())
+    }
+
+    /// pg_get_constraintdef: the constraint as its kind and the catalog's columns say,
+    /// as rewrite_object_defs writes it.
+    fn constraintdef(&mut self, oid: &NodeEnum) -> Out {
+        self.push(
+            "(SELECT CASE _t WHEN 'f' THEN 'FOREIGN KEY (' || _c || ') REFERENCES ' || _r WHEN 'p' THEN \
+             'PRIMARY KEY (' || _c || ')' WHEN 'u' THEN 'UNIQUE (' || _c || ')' WHEN 'c' THEN 'CHECK (' || _c || \
+             ')' WHEN 'x' THEN _c ELSE '' END FROM (SELECT oid AS _o, contype AS _t, ov_cols AS _c, ov_ref AS _r \
+             FROM pg_constraint) WHERE _o = ",
+        );
+        self.expr(oid, Prec::Compare)?;
+        self.push(")");
+        Ok(())
+    }
+
+    /// array_to_string(ARRAY(subquery), sep): the rows joined, in their order, as
+    /// rewrite_array_to_string_subquery writes it (psql's list of an enum's labels).
+    fn joined_subquery(&mut self, l: &pb::SubLink, sep: &NodeEnum) -> Out {
+        let NodeEnum::SelectStmt(q) = boxed(l.subselect.as_deref())? else {
+            return Err("subquery");
+        };
+        if q.op != SetOperation::SetopNone as i32 || q.target_list.len() != 1 || !q.values_lists.is_empty() {
+            return Err("ARRAY of a subquery of more than one column");
+        }
+        let mut q = q.as_ref().clone();
+        if let Some(NodeEnum::ResTarget(t)) = q.target_list[0].node.as_mut() {
+            t.name = "_v".to_string();
+        }
+        self.push("(SELECT group_concat(_v, ");
+        self.expr(sep, Prec::Or)?;
+        self.push(") FROM (");
+        self.select(&q, false)?;
+        self.push("))");
         Ok(())
     }
 
@@ -3866,7 +4482,9 @@ pub(crate) fn srf_from(r: &pb::RangeFunction) -> Result<Option<Srf<'_>>, Unsuppo
     }
     let width = if name == "unnest" { args.len() } else { 1 };
     let pairs = name.contains("_each");
-    let lateral = args.iter().any(|a| reads_column(a));
+    // generate_series is a recursive CTE in a subquery, which reads a column of an
+    // outer query but none to its left, as rewrite_generate_series writes it.
+    let lateral = name != "generate_series" && args.iter().any(|a| reads_column(a));
     let (alias, aliased) = match &r.alias {
         Some(a) => (a.aliasname.clone(), true),
         None => (name.to_string(), false),
@@ -3909,6 +4527,175 @@ pub(crate) fn srf_from(r: &pb::RangeFunction) -> Result<Option<Srf<'_>>, Unsuppo
         names,
         columns,
     }))
+}
+
+/// The set-returning functions an expression of a select list calls, outside its
+/// subqueries, in the order written.
+fn list_srf_calls<'a>(n: &'a NodeEnum, out: &mut Vec<&'a pb::FuncCall>) {
+    let mut each = |c: Option<&'a pb::Node>| {
+        if let Some(c) = c.and_then(|c| c.node.as_ref()) {
+            list_srf_calls(c, out);
+        }
+    };
+    match n {
+        NodeEnum::FuncCall(f) => {
+            if func_name(f).is_some_and(|name| SRFS.contains(&name)) && f.over.is_none() {
+                out.push(f);
+                return;
+            }
+            for a in &f.args {
+                each(Some(a));
+            }
+        }
+        NodeEnum::AExpr(a) => {
+            each(a.lexpr.as_deref());
+            each(a.rexpr.as_deref());
+        }
+        NodeEnum::TypeCast(t) => each(t.arg.as_deref()),
+        NodeEnum::CoalesceExpr(c) => c.args.iter().for_each(|a| each(Some(a))),
+        NodeEnum::CaseExpr(c) => {
+            each(c.arg.as_deref());
+            for w in &c.args {
+                if let Some(NodeEnum::CaseWhen(w)) = w.node.as_ref() {
+                    each(w.expr.as_deref());
+                    each(w.result.as_deref());
+                }
+            }
+            each(c.defresult.as_deref());
+        }
+        _ => {}
+    }
+}
+
+/// A set-returning function called in a select list, as `srf_source` builds its rows.
+fn srf_of_call(f: &pb::FuncCall) -> Result<Srf<'_>, Unsupported> {
+    let name = func_name(f)
+        .and_then(|n| SRFS.iter().find(|s| **s == n).copied())
+        .ok_or("function")?;
+    if f.agg_star || f.agg_distinct || f.agg_filter.is_some() || !f.agg_order.is_empty() {
+        return Err("set-returning function's clauses");
+    }
+    let args: Vec<&NodeEnum> = f.args.iter().map(node).collect::<Result<_, _>>()?;
+    if args.is_empty() {
+        return Err("set-returning function of nothing");
+    }
+    let mut inner = Vec::new();
+    for a in &args {
+        list_srf_calls(a, &mut inner);
+    }
+    if !inner.is_empty() {
+        return Err("set-returning function of a set");
+    }
+    Ok(Srf {
+        name,
+        args,
+        pairs: name.contains("_each"),
+        lateral: true,
+        alias: String::new(),
+        aliased: false,
+        names: Vec::new(),
+        columns: Vec::new(),
+    })
+}
+
+/// A write's RETURNING with its FROM or USING: an item reading a joined relation is
+/// a subquery over the join for the row written, as rewrite_update_from and
+/// rewrite_delete_using write it (SQLite's RETURNING sees the written table alone),
+/// under the name Postgres gives the item. The rest are as they came.
+fn joined_returning(
+    ret: Option<&pb::ReturningClause>,
+    target: &pb::RangeVar,
+    joined: &[pb::Node],
+    filter: Option<&pb::Node>,
+) -> Option<pb::ReturningClause> {
+    let ret = ret?;
+    if joined.is_empty() {
+        return Some(ret.clone());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for j in joined {
+        for (n, ..) in j.node.as_ref().map(NodeEnum::nodes).unwrap_or_default() {
+            match n {
+                pg_query::NodeRef::RangeVar(r) => {
+                    names.push(
+                        r.alias
+                            .as_ref()
+                            .map_or_else(|| r.relname.clone(), |a| a.aliasname.clone()),
+                    );
+                }
+                pg_query::NodeRef::RangeSubselect(pb::RangeSubselect { alias: Some(a), .. })
+                | pg_query::NodeRef::RangeFunction(pb::RangeFunction { alias: Some(a), .. }) => {
+                    names.push(a.aliasname.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    let target_name = target.alias.as_ref().map_or(&target.relname, |a| &a.aliasname);
+    names.retain(|n| n != target_name);
+    let reads_joined = |v: &NodeEnum| {
+        v.nodes().into_iter().any(|(n, ..)| {
+                matches!(n, pg_query::NodeRef::ColumnRef(c)
+                    if c.fields.len() > 1 && c.fields.first().and_then(|f| string(f).ok()).is_some_and(|q| names.iter().any(|n| n == q)))
+            })
+    };
+    let mut out = ret.clone();
+    for item in &mut out.exprs {
+        let Some(NodeEnum::ResTarget(t)) = item.node.as_mut() else {
+            continue;
+        };
+        let Some(v) = t.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            continue;
+        };
+        if !reads_joined(v) {
+            continue;
+        }
+        if t.name.is_empty() {
+            t.name = match figure_colname(v) {
+                Label::Named(l) => l,
+                Label::Itself => match v {
+                    NodeEnum::ColumnRef(c) => c
+                        .fields
+                        .last()
+                        .and_then(|f| string(f).ok())
+                        .unwrap_or("?column?")
+                        .to_string(),
+                    _ => "?column?".to_string(),
+                },
+            };
+        }
+        let one = pb::Node {
+            node: Some(NodeEnum::AConst(pb::AConst {
+                isnull: false,
+                val: Some(Val::Ival(pb::Integer { ival: 1 })),
+                location: 0,
+            })),
+        };
+        let sub = pb::SelectStmt {
+            target_list: vec![pb::Node {
+                node: Some(NodeEnum::ResTarget(Box::new(pb::ResTarget {
+                    val: t.val.clone(),
+                    ..Default::default()
+                }))),
+            }],
+            from_clause: joined.to_vec(),
+            where_clause: filter.map(|f| Box::new(f.clone())),
+            limit_count: Some(Box::new(one)),
+            limit_option: LimitOption::Count as i32,
+            op: SetOperation::SetopNone as i32,
+            ..Default::default()
+        };
+        t.val = Some(Box::new(pb::Node {
+            node: Some(NodeEnum::SubLink(Box::new(pb::SubLink {
+                sub_link_type: SubLinkType::ExprSublink as i32,
+                subselect: Some(Box::new(pb::Node {
+                    node: Some(NodeEnum::SelectStmt(Box::new(sub))),
+                })),
+                ..Default::default()
+            }))),
+        }));
+    }
+    Some(out)
 }
 
 /// Whether a select list has an output named ctid.
@@ -3979,6 +4766,7 @@ fn range_name(b: Base) -> Option<&'static str> {
 fn func_name(f: &pb::FuncCall) -> Option<&str> {
     match f.funcname.as_slice() {
         [n] => string(n).ok(),
+        [schema, n] if string(schema).ok() == Some("pg_catalog") => string(n).ok(),
         _ => None,
     }
 }
@@ -3987,6 +4775,7 @@ fn func_name(f: &pb::FuncCall) -> Option<&str> {
 fn op_name(a: &pb::AExpr) -> Option<&str> {
     match a.name.as_slice() {
         [n] => string(n).ok(),
+        [schema, n] if string(schema).ok() == Some("pg_catalog") => string(n).ok(),
         _ => None,
     }
 }
@@ -4009,6 +4798,7 @@ fn binary_prec(op: &str) -> Option<Prec> {
     Some(match op {
         "=" | "<>" | "!=" => Prec::Equality,
         "<" | ">" | "<=" | ">=" => Prec::Compare,
+        "&" | "|" | "<<" | ">>" => Prec::Bit,
         "+" | "-" => Prec::Add,
         // `%` is a remainder only where the environment says so: on text it is pg_trgm's
         // similarity, a call (`typed_op`), and without the environment it is refused.
@@ -4025,7 +4815,8 @@ fn next(p: Prec) -> Prec {
         Prec::And => Prec::Not,
         Prec::Not => Prec::Equality,
         Prec::Equality => Prec::Compare,
-        Prec::Compare => Prec::Add,
+        Prec::Compare => Prec::Bit,
+        Prec::Bit => Prec::Add,
         Prec::Add => Prec::Mul,
         Prec::Mul => Prec::Concat,
         Prec::Concat => Prec::Unary,
@@ -4039,13 +4830,13 @@ fn prec(n: &NodeEnum) -> Prec {
         NodeEnum::AExpr(a) => {
             use pb::AExprKind as K;
             match K::try_from(a.kind) {
-                Ok(K::AexprOp) => match (&a.lexpr, a.name.as_slice()) {
+                Ok(K::AexprOp) => match (&a.lexpr, op_name(a)) {
                     (None, _) => Prec::Unary,
-                    (Some(_), [op]) if matches!(string(op), Ok("~" | "~*")) => Prec::Equality,
-                    (Some(_), [op]) if matches!(string(op), Ok("!~" | "!~*")) => Prec::Not,
+                    (Some(_), Some("~" | "~*")) => Prec::Equality,
+                    (Some(_), Some("!~" | "!~*")) => Prec::Not,
                     // SQLite binds -> and ->> as tightly as ||.
-                    (Some(_), [op]) if matches!(string(op), Ok("->" | "->>")) => Prec::Concat,
-                    (Some(_), [op]) => string(op).ok().and_then(binary_prec).unwrap_or(Prec::Atom),
+                    (Some(_), Some("->" | "->>")) => Prec::Concat,
+                    (Some(_), Some(op)) => binary_prec(op).unwrap_or(Prec::Atom),
                     _ => Prec::Atom,
                 },
                 Ok(K::AexprNullif) => Prec::Atom,
@@ -4112,10 +4903,10 @@ fn cast_type(t: &pb::TypeName) -> Result<String, Unsupported> {
         "time" | "timetz" | "timestamp" | "timestamptz" => b,
         "float" => "double precision",
         "regconfig" | "tsquery" | "tsvector" => b,
-        // The catalog's reg* types are stage 5's; another name is the engine's to read
-        // or refuse (an enum, a type it does not know), as the text passes leave it.
-        b if b.starts_with("reg") || b == "oid" => return Err("cast type"),
-        b if names.len() == 1 && b.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric()) => b,
+        // The reg* types that name an object are looked up (`Emitter::reg_cast`); the
+        // others, oid and another name are the engine's to read or refuse (an enum, a
+        // type it does not know), as the text passes leave them.
+        b if b.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric()) => b,
         _ => return Err("cast type"),
     };
     Ok(match (base, mods.as_slice()) {
@@ -4128,6 +4919,75 @@ fn cast_type(t: &pb::TypeName) -> Result<String, Unsupported> {
         // what an unmarked number counts.
         _ => return Err("type modifier"),
     })
+}
+
+/// Whether n is a string literal written as a range is (`'[1,5)'`, `'empty'`).
+fn is_range_literal(n: &NodeEnum) -> bool {
+    matches!(n, NodeEnum::AConst(k) if matches!(&k.val, Some(Val::Sval(v))
+        if v.sval.starts_with(['[', '(']) && v.sval.ends_with([']', ')']) && v.sval.contains(',')
+            || v.sval.eq_ignore_ascii_case("empty")))
+}
+
+/// The column and the catalog view a reg* type names its objects by.
+fn reg_lookup(ty: &str) -> Option<(&'static str, &'static str)> {
+    Some(match ty {
+        "regclass" => ("relname", "pg_class"),
+        "regnamespace" => ("nspname", "pg_namespace"),
+        "regtype" => ("typname", "pg_type"),
+        "regrole" => ("rolname", "pg_roles"),
+        "regproc" | "regprocedure" => ("proname", "pg_proc"),
+        _ => return None,
+    })
+}
+
+/// The oid of a system catalog by its name, which pg_depend and pg_description go by as
+/// classid (`'pg_class'::regclass`): pg_class lists no catalog of its own.
+fn system_catalog_oid(name: &str) -> Option<&'static str> {
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    Some(match name {
+        "pg_class" => "1259",
+        "pg_type" => "1247",
+        "pg_attribute" => "1249",
+        "pg_proc" => "1255",
+        "pg_namespace" => "2615",
+        "pg_constraint" => "2606",
+        "pg_index" => "2610",
+        "pg_attrdef" => "2604",
+        "pg_trigger" => "2620",
+        "pg_rewrite" => "2618",
+        "pg_description" => "2609",
+        "pg_policy" => "3256",
+        "pg_database" => "1262",
+        "pg_authid" => "1260",
+        _ => return None,
+    })
+}
+
+/// The object a reg* literal names, without its schema, and whether it was quoted:
+/// `public."My Table"` is `My Table`, an unquoted name folded to lower case as
+/// Postgres reads one.
+fn object_name(lit: &str) -> (String, bool) {
+    let (mut cur, mut was_quoted) = (String::new(), false);
+    let (mut quoted, mut chars) = (false, lit.chars().peekable());
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                cur.push('"');
+            }
+            '"' => {
+                quoted = !quoted;
+                was_quoted = true;
+            }
+            '.' if !quoted => {
+                cur.clear();
+                was_quoted = false;
+            }
+            c if quoted => cur.push(c),
+            c => cur.extend(c.to_lowercase()),
+        }
+    }
+    (cur, was_quoted)
 }
 
 /// A string literal, which a cast reads with the type's input function.

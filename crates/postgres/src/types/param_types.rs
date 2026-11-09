@@ -133,6 +133,25 @@ fn atoi(s: &str) -> i64 {
     s.parse::<i64>().unwrap_or(i64::MAX)
 }
 
+/// Types each parameter still unspecified that meets a catalog column of a known type
+/// (the tree's reading of what the text reader's COMPARED and COMPARED_ANY find): a
+/// statement reading the catalog, whose views the type environment does not know.
+fn catalog_params(refs: &[overlite_engine::ParamColumn], oids: &mut [Oid]) {
+    for r in refs {
+        let Some(o) = r.param.checked_sub(1).and_then(|i| oids.get_mut(i)) else {
+            continue;
+        };
+        if !o.is_unspecified() {
+            continue;
+        }
+        *o = match (catalog_param_oid(&r.column), r.meets == Meets::Array) {
+            (OID_NAME, true) => OID_NAME_ARR,
+            (OID_OID, true) => OID_OID_ARR,
+            (oid, _) => oid,
+        };
+    }
+}
+
 fn catalog_param_oid(col: &str) -> Oid {
     CATALOG_PARAM_OIDS
         .get(col.to_lowercase().as_str())
@@ -159,6 +178,9 @@ impl Session {
                 for (o, t) in oids.iter_mut().zip(tys) {
                     *o = param_oid(t.decl());
                 }
+            }
+            if READS_CATALOG.is_match(sql) {
+                catalog_params(&facts.refs, &mut oids);
             }
             self.type_by_tree(facts, &mut oids);
         } else {

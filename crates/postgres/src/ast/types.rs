@@ -685,6 +685,35 @@ impl Typer {
     }
 
     /// The columns a target list gives, a star expanded.
+    /// The names of a plain select's output columns where a star in it is over
+    /// relations the catalog knows, None where one is not.
+    pub(crate) fn star_names(&mut self, s: &pb::SelectStmt) -> Option<Vec<String>> {
+        if s.op != SetOperation::SetopNone as i32 || !s.values_lists.is_empty() {
+            return None;
+        }
+        let popped = self.push_with(s.with_clause.as_ref());
+        self.push_from(&s.from_clause);
+        let known = s.target_list.iter().all(|t| match node(t) {
+            Some(NodeEnum::ResTarget(t)) => match boxed(t.val.as_deref()) {
+                Some(NodeEnum::ColumnRef(c)) if matches!(c.fields.last().and_then(node), Some(NodeEnum::AStar(_))) => {
+                    let quals: Vec<&str> = c.fields[..c.fields.len() - 1].iter().filter_map(string).collect();
+                    self.scopes.last().is_some_and(|scope| {
+                        scope
+                            .iter()
+                            .filter(|r| quals.is_empty() || quals.last() == Some(&r.name.as_str()))
+                            .all(|r| r.cols.is_some())
+                    })
+                }
+                _ => true,
+            },
+            _ => false,
+        });
+        let out = known.then(|| self.targets(&s.target_list).into_iter().map(|c| c.name).collect());
+        self.pop_scope();
+        self.pop_with(popped);
+        out
+    }
+
     pub(crate) fn targets(&mut self, items: &[pb::Node]) -> Vec<Col> {
         let mut out = Vec::new();
         for t in items {
@@ -904,10 +933,33 @@ impl Typer {
             Ok(K::AexprOp) => {
                 let r = boxed(a.rexpr.as_deref()).map_or(Ty::ANY, |r| self.ty(r));
                 let Some(l) = boxed(a.lexpr.as_deref()) else {
-                    return if matches!(op, "-" | "+") { r } else { Ty::ANY };
+                    return match op {
+                        "-" | "+" | "~" => r,
+                        "@" => r,
+                        "|/" | "||/" => Ty::of(Base::Float8),
+                        "!!" => Ty::of(Base::Tsquery),
+                        _ => Ty::ANY,
+                    };
                 };
                 let l = self.ty(l);
+                let tsquery = |t: Ty| t.is(Base::Tsquery);
+                if matches!(op, "&&" | "||") && (tsquery(l) || tsquery(r)) {
+                    return Ty::of(Base::Tsquery);
+                }
                 match op {
+                    // A shift keeps its left side's type; the others are of the wider.
+                    "<<" | ">>" if l.is_integer() && r.is_integer() => l,
+                    "&" | "|" | "#" if l.is_integer() && r.is_integer() => {
+                        if l.base == Base::Int8 || r.base == Base::Int8 {
+                            Ty::of(Base::Int8)
+                        } else if l.base == Base::Int4 || r.base == Base::Int4 {
+                            Ty::of(Base::Int4)
+                        } else {
+                            Ty::of(Base::Int2)
+                        }
+                    }
+                    "<%" | "%>" | "<<%" | "%>>" => Ty::BOOL,
+                    "<->" | "<<->" | "<->>" | "<<<->" | "<->>>" if l.is_texty() || r.is_texty() => Ty::of(Base::Float4),
                     "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "~" | "!~" | "~*" | "!~*" | "@>" | "<@" | "?"
                     | "?|" | "?&" | "&&" | "@@" => Ty::BOOL,
                     "%" if l.is_texty() || r.is_texty() || l.base == Base::Unknown || r.base == Base::Unknown => {

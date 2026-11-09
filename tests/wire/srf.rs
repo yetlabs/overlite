@@ -130,11 +130,13 @@ fn derived_table_column_lists() {
         &conn.exec("SELECT b FROM (VALUES (1, 2)) AS v(a)", &[]).unwrap_err(),
         "42703",
     );
-    // A star in a source hides what a shorter list leaves: an explicit no.
-    assert_sqlstate(
-        &conn.exec("SELECT * FROM (SELECT * FROM t) AS v(a)", &[]).unwrap_err(),
-        "0A000",
-    );
+    // A star over a table the catalog knows takes a shorter list as Postgres does: its
+    // first columns renamed, the rest under their own names.
+    let r = conn
+        .pg_exec("SELECT * FROM (SELECT * FROM t) AS v(a) ORDER BY 1")
+        .unwrap();
+    let names: Vec<&str> = r[0].fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["a", "val"]);
 }
 
 fn set_setup() -> (Server, Conn, Conn) {

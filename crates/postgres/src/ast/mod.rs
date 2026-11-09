@@ -36,11 +36,31 @@ pub(crate) static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("OVER
 /// first node outside the slice.
 pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
     let parsed = parse::parse(sql)?;
-    let stmt = one_statement(&parsed)?;
-    match env::current() {
+    let one = |stmt: &pg_query::NodeEnum| match env::current() {
         Some(ctx) => Ok(emit::typed(stmt, None, ctx)?.sql),
         None => emit::statement(stmt),
+    };
+    if parsed.stmts.len() > 1 {
+        // A Parse holding more than one statement (a Query's are split before): each
+        // translated, as the text passes run over them all.
+        // The engine reads the mark at the end only: the others' go.
+        let mut out = Vec::with_capacity(parsed.stmts.len());
+        for (i, raw) in parsed.stmts.iter().enumerate() {
+            let stmt = raw
+                .stmt
+                .as_deref()
+                .and_then(|s| s.node.as_ref())
+                .ok_or("empty statement")?;
+            let sql = one(stmt)?;
+            out.push(if i + 1 < parsed.stmts.len() {
+                split_mark(&sql).0.to_string()
+            } else {
+                sql
+            });
+        }
+        return Ok(out.join("; "));
     }
+    one(one_statement(&parsed)?)
 }
 
 /// The type the environment gives each parameter of sql, `$1` first, when the AST
@@ -94,7 +114,11 @@ fn outside(shape: u64) -> bool {
 fn remember_outside(shape: u64, why: &'static str) {
     if !matches!(
         why,
-        emit::TYPE_REFUSAL_OPERANDS | emit::TYPE_REFUSAL_BOOLEAN | emit::TYPE_REFUSAL_JSON | emit::TYPE_REFUSAL_RANGE
+        emit::TYPE_REFUSAL_OPERANDS
+            | emit::TYPE_REFUSAL_BOOLEAN
+            | emit::TYPE_REFUSAL_JSON
+            | emit::TYPE_REFUSAL_RANGE
+            | emit::TYPE_REFUSAL_STAR
     ) {
         shape::OUTSIDE.insert(shape ^ mode());
     }

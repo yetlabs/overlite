@@ -250,6 +250,17 @@ const TYPED: &[Typed] = &[
         },
     ),
     (
+        "an array cast to text is Postgres' text form of it (overlite_array_text, `{a,b}`): the text pass's \
+         CAST gave the JSON array it is stored as, Postgres' form only where the engine's array_agg had \
+         written it",
+        |o, n| {
+            (
+                o.to_vec(),
+                replace_call(n, "overlite_array_text", &["cast", "("], &["text", ")"]),
+            )
+        },
+    ),
+    (
         "array_agg is the JSON array an array is stored as, NULL over no rows: the engine's aggregate wrote \
          Postgres' text form, which the array functions, the operators and the binary format do not read",
         |o, n| {
@@ -916,6 +927,121 @@ const INTENDED: &[Intended] = &[
         |old, new| same_but_labels(&without_parens(old), &without_parens(new)),
     ),
     (
+        "label: FigureColname names a CASE by its ELSE and a cast by its operand, through casts and calls \
+         (`CASE ... ELSE x::regtype::text END` is x, `CASE ... ELSE array_to_string(...) END` \
+         array_to_string); the text path named it by the outermost cast's type or `case`",
+        |old, new| {
+            let (o, n) = (without_parens(old), without_parens(new));
+            let mut seen = false;
+            let label = |t: &[&String], i: usize| {
+                i > 0
+                    && matches!(t[i - 1].as_str(), "end" | ")")
+                    && t.get(i + 1).is_none_or(|x| *x == "," || *x == "from")
+            };
+            o.len() == n.len()
+                && (0..o.len()).all(|i| {
+                    o[i] == n[i] || {
+                        seen = true;
+                        label(&o, i) && label(&n, i)
+                    }
+                })
+                && seen
+        },
+    ),
+    (
+        "a set-returning function reading a column of a table to its left is written in place, its columns \
+         read under the walker's names (stage 4), where the text pass wrapped it in a subquery naming them, \
+         which reads the same row",
+        |old, new| {
+            let o = srf_in_place(old);
+            o.len() != old.len() && without_parens(&o) == without_parens(new)
+        },
+    ),
+    (
+        "array_to_string of ARRAY(subquery) is its rows joined in their order wherever it stands: the text \
+         pass joined the first such call and left the others to the engine's array_to_string over the JSON \
+         array, the same string",
+        |old, new| {
+            let o = joined_arrays(old);
+            o.len() != old.len() && without_parens(&o) == without_parens(new)
+        },
+    ),
+    (
+        "a quoted name holding a dot is a name, the stored name of a table of another schema here: the text \
+         pass quoted information_schema's view names again inside its quotes, a syntax error",
+        |old, new| {
+            old.iter().any(|x| x == "\"\"")
+                && !new.iter().any(|x| x == "\"\"")
+                && new.iter().any(|x| x.starts_with("\"information_schema."))
+        },
+    ),
+    (
+        "text search queries joined by `&&` and `||` and negated by `!!` are the engine's overlite_tsquery_op: \
+         the text pass took `&&` for an overlap of ranges or arrays and left `||` and `!!` to SQLite, a \
+         concatenation and a syntax error",
+        |old, new| {
+            let has = |t: &[String], w: &str| t.iter().any(|x| x == w);
+            has(new, "overlite_tsquery_op") && !has(old, "overlite_tsquery_op")
+        },
+    ),
+    (
+        "OVERRIDING SYSTEM VALUE is the session's (identity_insert checks it and takes it out before the \
+         statement is translated): the text pass left it to SQLite, which has no such clause",
+        |old, new| {
+            let Some(at) = old
+                .windows(3)
+                .position(|w| w[0] == "overriding" && w[1] == "system" && w[2] == "value")
+            else {
+                return false;
+            };
+            [&old[..at], &old[at + 3..]].concat() == new
+        },
+    ),
+    (
+        "jsonb_typeof and json_typeof name a value's type as Postgres does (number, string, boolean): the text \
+         pass wrote SQLite's json_type alone, which says integer, real, text, true and false",
+        |old, new| {
+            new.windows(2).any(|w| w[0] == "case" && w[1] == "json_type") && old.iter().any(|x| x == "json_type")
+        },
+    ),
+    (
+        "label: each statement of a string holding several is labelled as Postgres labels it: the text pass \
+         labelled the last one only",
+        |old, new| {
+            let statements = old
+                .iter()
+                .enumerate()
+                .filter(|(i, x)| *x == "select" && (*i == 0 || old[i - 1] != "("))
+                .count();
+            statements > 1 && same_but_new_labels(&without_parens(old), &without_parens(new))
+        },
+    ),
+    (
+        "a reg* literal names its object as Postgres reads a name, an unquoted one folded and compared without \
+         case (the catalog keeps a name as it was created), a quoted one whole: the text pass compared it with \
+         its case and cut `schema.\"Name\"` at its last quote",
+        |old, new| {
+            let mut n: Vec<String> = Vec::new();
+            for (i, x) in new.iter().enumerate() {
+                let folded = x == "collate"
+                    && new.get(i + 1).is_some_and(|y| y == "nocase")
+                    && i > 0
+                    && new[i - 1].starts_with('\'');
+                let after = x == "nocase" && i > 0 && new[i - 1] == "collate";
+                if !(folded || after) {
+                    n.push(x.to_lowercase());
+                }
+            }
+            let o = without_parens(old);
+            let n = without_parens(&n);
+            n.len() < without_parens(new).len()
+                && n.len() == o.len()
+                && o.iter()
+                    .zip(&n)
+                    .all(|(o, x)| o.to_lowercase() == **x || o.starts_with('\''))
+        },
+    ),
+    (
         "a LIKE's pattern is the whole expression: the text path cut a CASE at its first word",
         |old, new| {
             let cut = |t: &[String]| {
@@ -978,6 +1104,146 @@ const INTENDED: &[Intended] = &[
         },
     ),
 ];
+
+/// The text pass' subquery around a set-returning function, `( select value x , ord
+/// y from overlite_elements ( ... ) ) a`, written in place as the AST path writes it:
+/// the walker under the alias, `a . x` and a bare `x` as `a . value`.
+fn srf_in_place(t: &[String]) -> Vec<String> {
+    let mut out = t.to_vec();
+    let mut i = 0;
+    while i + 2 < out.len() {
+        if !(out[i] == "(" && out[i + 1] == "select") {
+            i += 1;
+            continue;
+        }
+        let Some(close) = closing(&out, i) else { break };
+        let Some(from) = (i + 2..close).find(|&k| out[k] == "from") else {
+            i += 1;
+            continue;
+        };
+        let walker = from + 1;
+        if !matches!(out[walker].as_str(), "overlite_elements" | "overlite_pairs")
+            || closing(&out, walker + 1) != Some(close - 1)
+            || close + 1 >= out.len()
+        {
+            i += 1;
+            continue;
+        }
+        let alias = out[close + 1].clone();
+        // The items: an expression of the walker's row and the name it is given.
+        let mut items: Vec<(Vec<String>, String)> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut depth = 0;
+        for x in &out[i + 2..from] {
+            match x.as_str() {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                "," if depth == 0 => {
+                    if let Some(name) = cur.pop() {
+                        items.push((std::mem::take(&mut cur), name));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(x.clone());
+        }
+        if let Some(name) = cur.pop() {
+            items.push((cur, name));
+        }
+        let qualified = |e: &[String]| -> Vec<String> {
+            e.iter()
+                .flat_map(|x| {
+                    if matches!(x.as_str(), "value" | "ord" | "key") {
+                        vec![alias.clone(), ".".to_string(), x.clone()]
+                    } else {
+                        vec![x.clone()]
+                    }
+                })
+                .collect()
+        };
+        let mut rest: Vec<String> = out[walker..close].to_vec();
+        rest.push(alias.clone());
+        let renamed = |part: &[String]| -> Vec<String> {
+            let mut done: Vec<String> = Vec::new();
+            let mut k = 0;
+            while k < part.len() {
+                let dotted = k + 2 < part.len() && part[k] == alias && part[k + 1] == ".";
+                let name_at = if dotted { k + 2 } else { k };
+                let bare = !dotted && (k == 0 || part[k - 1] != ".");
+                if (dotted || bare)
+                    && let Some((e, _)) = items.iter().find(|(_, n)| *n == part[name_at])
+                {
+                    done.extend(qualified(e));
+                    k = name_at + 1;
+                    continue;
+                }
+                done.push(part[k].clone());
+                k += 1;
+            }
+            done
+        };
+        let (head, tail) = (renamed(&out[..i]), renamed(&out[close + 2..]));
+        let at = head.len() + 1;
+        out = [head, rest, tail].concat();
+        i = at;
+    }
+    out
+}
+
+/// The text pass' array_to_string over ARRAY(subquery) left to the engine,
+/// `array_to_string ( overlite_array ( ( select json_group_array ( _a ) from ( select
+/// e _a ... ) ) ) , sep )`, as the rows joined: `( select group_concat ( _v , sep )
+/// from ( select e _v ... ) )`.
+fn joined_arrays(t: &[String]) -> Vec<String> {
+    let head = [
+        "array_to_string",
+        "(",
+        "overlite_array",
+        "(",
+        "(",
+        "select",
+        "json_group_array",
+        "(",
+        "_a",
+        ")",
+        "from",
+        "(",
+    ];
+    let mut out = t.to_vec();
+    let mut i = 0;
+    while i + head.len() < out.len() {
+        if !out[i..i + head.len()].iter().map(String::as_str).eq(head) {
+            i += 1;
+            continue;
+        }
+        let (Some(call_end), Some(array_end)) = (closing(&out, i + 1), closing(&out, i + 3)) else {
+            break;
+        };
+        if out.get(array_end + 1).map(String::as_str) != Some(",") {
+            i += 1;
+            continue;
+        }
+        let sep: Vec<String> = out[array_end + 2..call_end].to_vec();
+        let mut inner: Vec<String> = out[i + head.len() - 1..array_end - 1].to_vec();
+        for x in &mut inner {
+            if x == "_a" {
+                *x = "_v".to_string();
+            }
+        }
+        let mut repl: Vec<String> = ["(", "select", "group_concat", "(", "_v", ","]
+            .iter()
+            .map(|x| (*x).to_string())
+            .collect();
+        repl.extend(sep);
+        repl.extend([")".to_string(), "from".to_string()]);
+        repl.extend(inner);
+        repl.push(")".to_string());
+        out = [&out[..i], &repl[..], &out[call_end + 1..]].concat();
+        i += 1;
+    }
+    out
+}
 
 /// The tokens of a SQLite statement, normalized as the module says.
 fn tokens(sql: &str) -> Vec<String> {
