@@ -14,6 +14,7 @@ mod advisory;
 mod alter;
 mod alteractions;
 mod array;
+mod ast_fixes;
 mod auth;
 mod binaryshape;
 mod binarytime;

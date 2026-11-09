@@ -148,7 +148,63 @@ impl Session {
         if n == 0 {
             return oids;
         }
-        let top = n as i64;
+        // A statement the AST path translates is typed from its tree alone.
+        if *crate::ast::ENABLED
+            && let Some(facts) = crate::ast::params::facts(sql)
+        {
+            self.type_by_tree(facts, &mut oids);
+        } else {
+            self.type_by_text(sql, &mut oids);
+        }
+        for (i, oid) in declared.iter().enumerate() {
+            if i < n && !oid.is_unspecified() {
+                oids[i] = *oid;
+            }
+        }
+        oids
+    }
+
+    /// Types parameters from the tree's facts: the INSERT slot each fills, the column
+    /// each meets, and the row counts.
+    fn type_by_tree(&mut self, facts: crate::ast::params::Facts, oids: &mut [Oid]) {
+        use crate::ast::params::Slot;
+        if let Some((table, slots)) = &facts.insert
+            && !slots.is_empty()
+        {
+            let types = self.column_types(table);
+            let order = if slots.iter().any(|(_, s)| matches!(s, Slot::Position(_))) {
+                self.column_order(table)
+            } else {
+                Vec::new()
+            };
+            for (p, slot) in slots {
+                let col = match slot {
+                    Slot::Column(c) => c.to_lowercase(),
+                    Slot::Position(k) => match order.get(*k) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    },
+                };
+                if let Some(o) = p.checked_sub(1).and_then(|i| oids.get_mut(i))
+                    && o.is_unspecified()
+                {
+                    *o = param_oid(types.get(&col).map_or("", String::as_str));
+                }
+            }
+        }
+        self.type_by_refs(&facts.tables, facts.refs, oids);
+        for p in facts.row_counts {
+            if let Some(o) = p.checked_sub(1).and_then(|i| oids.get_mut(i))
+                && o.is_unspecified()
+            {
+                *o = OID_INT8;
+            }
+        }
+    }
+
+    /// Types parameters by reading the text, for statements outside the AST path.
+    fn type_by_text(&mut self, sql: &str, oids: &mut [Oid]) {
+        let top = oids.len() as i64;
         if READS_CATALOG.is_match(sql) {
             for (i, col) in compared_params(sql, &COMPARED) {
                 if i >= 1 && i <= top {
@@ -194,7 +250,7 @@ impl Session {
                 }
             }
         }
-        self.type_by_columns(sql, &mut oids);
+        self.type_by_columns(sql, oids);
         // A row count is a bigint, whatever else the statement says. Left
         // unspecified, tokio-postgres (Prisma) looks type 0 up in pg_type, finds
         // nothing, and fails the query; Prisma writes OFFSET $n on every findFirst.
@@ -204,12 +260,6 @@ impl Session {
                 oids[(i - 1) as usize] = OID_INT8;
             }
         }
-        for (i, oid) in declared.iter().enumerate() {
-            if i < n && !oid.is_unspecified() {
-                oids[i] = *oid;
-            }
-        }
-        oids
     }
 }
 
@@ -227,6 +277,14 @@ impl Session {
             .then(|| crate::ast::params::param_columns(sql))
             .flatten()
             .unwrap_or_else(|| statement_params(sql));
+        self.type_by_refs(&tables, refs, oids);
+    }
+
+    /// Types each parameter still unspecified by the column of these tables it meets.
+    fn type_by_refs(&mut self, tables: &[NamedTable], refs: Vec<overlite_engine::ParamColumn>, oids: &mut [Oid]) {
+        if oids.iter().all(|o| !o.is_unspecified()) {
+            return;
+        }
         if tables.is_empty() || refs.is_empty() {
             return;
         }
@@ -326,6 +384,25 @@ fn array_param_oid(elem: Oid) -> Oid {
         OID_UUID => OID_UUID_ARR,
         _ => Oid::UNSPECIFIED,
     }
+}
+
+/// What the text readers find in sql, as the tree's facts state it: the INSERT's
+/// table and each parameter's slot, and the row counts. For the differential test of
+/// parameter typing (ast/diff.rs).
+#[cfg(test)]
+pub(crate) fn text_slots(sql: &str) -> (String, Vec<(usize, crate::ast::params::Slot)>, Vec<usize>) {
+    use crate::ast::params::Slot;
+    let code = blank_literals(sql);
+    let (table, cols, _) = insert_columns(&code);
+    let mut slots: Vec<(usize, Slot)> = cols.into_iter().map(|(p, c)| (p as usize, Slot::Column(c))).collect();
+    if let Some(positions) = insert_positions(&code) {
+        slots.extend(positions.into_iter().map(|(p, k)| (p as usize, Slot::Position(k))));
+    }
+    slots.sort_by_key(|(p, _)| *p);
+    let mut counts: Vec<usize> = LIMIT_OFFSET.captures_iter(sql).map(|m| atoi(&m[1]) as usize).collect();
+    counts.sort_unstable();
+    counts.dedup();
+    (table, slots, counts)
 }
 
 /// The column each parameter re matches meets, by number.

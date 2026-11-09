@@ -87,28 +87,53 @@ use overlite_core::text::find_from;
 /// SQLite. It is intentionally small and syntactic; a full SQL transpiler is a
 /// non-goal.
 ///
-/// Where NULLs sort and what LIKE matches are settled after either: a plain lookup
-/// with an ORDER BY or a LIKE takes the fast path and still needs them, and each is
-/// one scan of the tokens, made only when its word is there.
-///
 /// A statement off the fast path goes to the AST path when it covers the statement
-/// (crate::ast), else to the text passes, and the result is kept in the process's
-/// translation cache (`cache`), which says what a translation depends on.
+/// (crate::ast), which writes every sort key's NULLS and every LIKE itself, else to the
+/// text passes, and the result is kept in the process's translation cache (`cache`),
+/// which says what a translation depends on.
+///
+/// Where NULLs sort and what LIKE matches are settled after the text passes and on the
+/// fast path, which a plain lookup with an ORDER BY or a LIKE takes: each is one scan
+/// of the tokens, made only when its word is there.
 pub fn rewrite(sql: &str) -> String {
     if needs_no_rewrite(sql) {
-        return rewrite_like(&rewrite_null_order(sql));
+        return text_tail(sql);
     }
     cache::cached(sql, || {
-        let post = |s: &str| rewrite_like(&rewrite_null_order(s));
         match crate::ast::ENABLED.then(|| crate::ast::translate(sql)).flatten() {
             Some(ast) => {
-                let out = post(&ast);
-                crate::ast::shadow::check(sql, &out, || post(&rewrite_full(sql)));
-                out
+                crate::ast::shadow::check(sql, &ast, || text_tail(&rewrite_full(sql)));
+                ast
             }
-            None => post(&rewrite_full(sql)),
+            None => text_tail(&rewrite_full(sql)),
         }
     })
+}
+
+/// `rewrite` of expanded, which the session made of raw by writing values into it
+/// (`current_user` as its name, `nextval('s')` as a number, an RLS filter), with raw's
+/// labels on its result columns: what nextval('s') became says nothing of its name.
+/// When the AST path covers expanded, it labels its tree with those of raw's tree;
+/// otherwise the text passes read raw's labels from its text, as before.
+pub(crate) fn rewrite_expanded(raw: &str, expanded: &str) -> String {
+    // Keyed by both: the labels are raw's, the translation expanded's.
+    let key = [raw, "\0", expanded].concat();
+    cache::cached(&key, || {
+        if *crate::ast::ENABLED
+            && !needs_no_rewrite(expanded)
+            && let Some(labels) = crate::ast::result_labels(raw)
+            && let Some(out) = crate::ast::translate_labelled(expanded, &labels)
+        {
+            return out;
+        }
+        apply_labels(&rewrite(expanded), &result_labels(raw))
+    })
+}
+
+/// What runs after the text passes, and alone on the fast path: NULLS ordering and
+/// LIKE, which the AST path writes itself.
+pub(crate) fn text_tail(sql: &str) -> String {
+    rewrite_like(&rewrite_null_order(sql))
 }
 
 /// Runs every pass. A pass reads the statement as text, so one that finds its words by

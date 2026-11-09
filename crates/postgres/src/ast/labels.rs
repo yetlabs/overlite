@@ -14,6 +14,41 @@ pub(crate) enum Label {
     Named(String),
 }
 
+/// One label per item of a statement's result list, None where the item is named
+/// already (an AS of its own) or names itself (a column, a star): the outermost select
+/// list (a set operation's first arm, whose names Postgres gives the result), or a
+/// write's RETURNING. None for a statement without such a list.
+pub(crate) fn result_labels(stmt: &NodeEnum) -> Option<Vec<Option<String>>> {
+    use pg_query::protobuf::SetOperation;
+    let items = match stmt {
+        NodeEnum::SelectStmt(s) => {
+            let mut s = s.as_ref();
+            while s.op != SetOperation::SetopNone as i32 {
+                s = s.larg.as_deref()?;
+            }
+            &s.target_list
+        }
+        NodeEnum::InsertStmt(s) => &s.returning_clause.as_ref()?.exprs,
+        NodeEnum::UpdateStmt(s) => &s.returning_clause.as_ref()?.exprs,
+        NodeEnum::DeleteStmt(s) => &s.returning_clause.as_ref()?.exprs,
+        _ => return None,
+    };
+    if items.is_empty() {
+        return None;
+    }
+    items
+        .iter()
+        .map(|t| match t.node.as_ref()? {
+            NodeEnum::ResTarget(t) if !t.name.is_empty() => Some(None),
+            NodeEnum::ResTarget(t) => match figure_colname(t.val.as_deref()?.node.as_ref()?) {
+                Label::Itself => Some(None),
+                Label::Named(l) => Some(Some(l)),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// The label of an unnamed select-list item.
 pub(crate) fn figure_colname(n: &NodeEnum) -> Label {
     match n {

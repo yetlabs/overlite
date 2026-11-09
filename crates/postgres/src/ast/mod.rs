@@ -33,15 +33,42 @@ pub(crate) static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("OVER
 /// first node outside the slice.
 pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
     let parsed = parse::parse(sql)?;
+    emit::statement(one_statement(&parsed)?)
+}
+
+/// The one statement sql holds, parsed.
+fn one_statement(parsed: &pg_query::protobuf::ParseResult) -> Result<&pg_query::NodeEnum, &'static str> {
     let [raw] = parsed.stmts.as_slice() else {
         return Err("not one statement");
     };
-    let stmt = raw
-        .stmt
+    raw.stmt
         .as_deref()
         .and_then(|s| s.node.as_ref())
-        .ok_or("empty statement")?;
-    emit::statement(stmt)
+        .ok_or("empty statement")
+}
+
+/// The labels of sql's result columns (`labels::result_labels`), read from its tree:
+/// those of a statement as the client sent it, before the session expands it.
+pub(crate) fn result_labels(sql: &str) -> Option<Vec<Option<String>>> {
+    let parsed = parse::parse(sql).ok()?;
+    labels::result_labels(one_statement(&parsed).ok()?)
+}
+
+/// sql as SQLite SQL with these labels on its result columns
+/// (`emit::statement_labelled`), when the AST path covers it.
+pub(crate) fn translate_labelled(sql: &str, labels: &[Option<String>]) -> Option<String> {
+    let shape = shape::of(sql);
+    if shape::OUTSIDE.holds(shape) {
+        return None;
+    }
+    let parsed = parse::parse(sql).ok()?;
+    let out = one_statement(&parsed)
+        .ok()
+        .and_then(|stmt| emit::statement_labelled(stmt, Some(labels)).ok());
+    if out.is_none() {
+        shape::OUTSIDE.insert(shape);
+    }
+    out
 }
 
 /// The statement as SQLite SQL, when the AST path covers all of it.

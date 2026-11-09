@@ -6,7 +6,7 @@
 use crate::ast::compare::{Verdict, compare};
 use crate::ast::try_translate;
 use crate::rewrite::blank::statement_text;
-use crate::rewrite::{needs_no_rewrite, rewrite_full};
+use crate::rewrite::{needs_no_rewrite, rewrite_full, text_tail};
 use std::collections::BTreeMap;
 
 const CORPUS: &[(&str, &str)] = &[
@@ -74,9 +74,8 @@ pub(crate) fn run() -> Tally {
             }
         };
         slot[2] += 1;
-        // What rewrite runs after either route.
-        let post = |s: &str| crate::rewrite::like::rewrite_like(&crate::rewrite::null_order::rewrite_null_order(s));
-        let (old, new) = (post(&rewrite_full(&sql)), post(&ast));
+        // The text route as rewrite runs it; the AST path's output is final.
+        let (old, new) = (text_tail(&rewrite_full(&sql)), ast);
         match compare(&old, &new) {
             Verdict::Identical => t.identical += 1,
             Verdict::IdenticalButParentheses => t.identical_but_parens += 1,
@@ -141,6 +140,23 @@ fn printer_writes_what_postgres_read() {
             overlite_cast(x, 'date') AS \"x\", CASE WHEN a THEN 1 END AS \"case\" FROM t"
         )
     );
+    // LIKE and ILIKE as the engine matches them, with their escape; the pattern is the
+    // whole expression, a CASE included.
+    assert_eq!(
+        t("SELECT a FROM t WHERE a LIKE CASE WHEN b THEN 'x%' END AND c NOT ILIKE $1 ESCAPE '!'").as_deref(),
+        Ok(
+            "SELECT a FROM t WHERE a GLOB overlite_like_glob(CASE WHEN b THEN 'x%' END, '\\') \
+            AND c NOT LIKE overlite_ilike_pattern($1, '!') ESCAPE '\\'"
+        )
+    );
+    // Casts to the types the engine reads, jsonb with its collation, hstore by hstore_in.
+    assert_eq!(
+        t("SELECT x::timestamptz(3), '{}'::JSONB, 'a=>1'::hstore, y::hstore FROM t").as_deref(),
+        Ok(
+            "SELECT overlite_cast(x, 'timestamptz(3)') AS \"x\", (overlite_cast('{}', 'jsonb') COLLATE JSONB) \
+            AS \"jsonb\", hstore_in('a=>1') AS \"hstore\", y AS \"y\" FROM t"
+        )
+    );
     // What only types tell apart, and groupings SQLite cannot write, go to the text passes.
     assert!(t("SELECT name FROM t WHERE name % 'x'").is_err());
     assert!(t("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3").is_err());
@@ -201,6 +217,66 @@ fn parameter_columns_over_the_corpus() {
     );
 }
 
+/// Parameter typing's differential: for every statement of the corpus the AST path
+/// translates, the INSERT slots and row counts the tree finds against those the text
+/// readers (`param_types`' regexes) find. The tree must find every one the text finds,
+/// in the same slot; where it finds more, the text missed it.
+#[test]
+fn parameter_slots_match_the_text_readers_over_the_corpus() {
+    use crate::ast::params::Slot;
+    use std::collections::BTreeSet;
+    let (mut with_params, mut same, mut more) = (0, 0, 0);
+    let mut fewer = Vec::new();
+    for (_, sql) in corpus() {
+        if !sql.contains('$') || needs_no_rewrite(&sql) {
+            continue;
+        }
+        let Some(facts) = crate::ast::params::facts(&sql) else {
+            continue;
+        };
+        let (text_table, text_slots, text_counts) = crate::types::param_types::text_slots(&sql);
+        let mut tree_slots = facts.insert.as_ref().map(|(_, s)| s.clone()).unwrap_or_default();
+        tree_slots.sort_by_key(|(p, _)| *p);
+        let mut tree_counts = facts.row_counts.clone();
+        tree_counts.sort_unstable();
+        tree_counts.dedup();
+        if text_slots.is_empty() && tree_slots.is_empty() && text_counts.is_empty() && tree_counts.is_empty() {
+            continue;
+        }
+        with_params += 1;
+        let key = |s: &Slot| match s {
+            Slot::Column(c) => c.trim_matches('"').to_lowercase(),
+            Slot::Position(k) => format!("#{k}"),
+        };
+        let t: BTreeSet<_> = text_slots.iter().map(|(p, s)| (*p, key(s))).collect();
+        let a: BTreeSet<_> = tree_slots.iter().map(|(p, s)| (*p, key(s))).collect();
+        let tc: BTreeSet<_> = text_counts.iter().collect();
+        let ac: BTreeSet<_> = tree_counts.iter().collect();
+        let name = |t: &str| t.replace('"', "").to_lowercase();
+        let tree_table = facts.insert.as_ref().map(|(t, _)| name(t));
+        let table_ok = text_table.is_empty() || tree_table.as_deref() == Some(&name(&text_table));
+        if a == t && ac == tc && table_ok {
+            same += 1;
+        } else if a.is_superset(&t) && ac.is_superset(&tc) && table_ok {
+            more += 1;
+            eprintln!("MORE {sql}\n  text {t:?} {tc:?}\n  tree {a:?} {ac:?}");
+        } else {
+            fewer.push(format!(
+                "{sql}\n  text {text_table} {t:?} {tc:?}\n  tree {tree_table:?} {a:?} {ac:?}"
+            ));
+        }
+    }
+    eprintln!(
+        "translated statements with INSERT slots or row counts {with_params}: same {same}, tree finds more {more}, fewer or other {}",
+        fewer.len()
+    );
+    assert!(
+        fewer.is_empty(),
+        "the tree misses what the text finds:\n{}",
+        fewer.join("\n")
+    );
+}
+
 /// The statement mix of the corpus through `rewrite`'s two routes, in alternating
 /// rounds: the text passes alone, the AST path without the translation cache (every
 /// statement parsed but those whose shape it already left to the text passes), and
@@ -209,8 +285,6 @@ fn parameter_columns_over_the_corpus() {
 #[test]
 #[ignore = "a measurement, not a check"]
 fn time_the_statement_mix() {
-    use crate::rewrite::like::rewrite_like;
-    use crate::rewrite::null_order::rewrite_null_order;
     use std::hint::black_box;
     use std::time::Instant;
     // OVERLITE_MIX_LEN takes the first n statements: a mix that fits the cache, as a
@@ -230,16 +304,15 @@ fn time_the_statement_mix() {
         .collect();
     let text = |s: &str| {
         if needs_no_rewrite(s) {
-            return rewrite_like(&rewrite_null_order(s));
+            return text_tail(s);
         }
-        rewrite_like(&rewrite_null_order(&rewrite_full(s)))
+        text_tail(&rewrite_full(s))
     };
     let ast = |s: &str| {
         if needs_no_rewrite(s) {
-            return rewrite_like(&rewrite_null_order(s));
+            return text_tail(s);
         }
-        let full = crate::ast::translate(s).unwrap_or_else(|| rewrite_full(s));
-        rewrite_like(&rewrite_null_order(&full))
+        crate::ast::translate(s).unwrap_or_else(|| text_tail(&rewrite_full(s)))
     };
     // Warm the cache, as a client's third round would find it: a statement is kept
     // the second time it is translated.

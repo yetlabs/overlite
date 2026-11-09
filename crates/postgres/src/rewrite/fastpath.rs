@@ -69,6 +69,13 @@ pub fn needs_no_rewrite(sql: &str) -> bool {
                     return false;
                 }
                 let next = skip_blanks(b, end);
+                // rewrite_like, which runs on the fast path too, reads a pattern up to
+                // a word that may end one: a pattern that is not a literal or a
+                // parameter (CASE, a call, a subquery) is the AST path's, which has it
+                // whole.
+                if w == "like" && !matches!(b.get(next), Some(b'\'' | b'$')) {
+                    return false;
+                }
                 if next < b.len() {
                     match b[next] {
                         b'(' if !is_plain_call(w) => return false,

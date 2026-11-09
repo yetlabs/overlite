@@ -41,15 +41,110 @@ enum Prec {
 }
 
 /// Functions the text passes leave as they are, by name: a call to one of them is
-/// written as it came.
+/// written as it came. None is named by any pass (each was looked for in the rewrite,
+/// types and session code), and the differential test holds those the corpus calls.
 const PLAIN_FUNCTIONS: &[&str] = &[
-    "count", "sum", "avg", "min", "max", "lower", "upper", "length", "abs", "round", "nullif", "coalesce",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "lower",
+    "upper",
+    "length",
+    "abs",
+    "round",
+    "nullif",
+    "coalesce",
+    // Strings.
+    "replace",
+    "substr",
+    "strpos",
+    "split_part",
+    "lpad",
+    "rpad",
+    "left",
+    "right",
+    "reverse",
+    "repeat",
+    "concat",
+    "char_length",
+    "octet_length",
+    "initcap",
+    "chr",
+    "ascii",
+    "md5",
+    "hex",
+    "typeof",
+    // Numbers.
+    "floor",
+    "ceil",
+    "ceiling",
+    "sign",
+    "sqrt",
+    "power",
+    "mod",
+    "exp",
+    "ln",
+    "pi",
+    "sin",
+    "cos",
+    "tan",
+    "cot",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "degrees",
+    "radians",
+    "dec_add",
+    "dec_sub",
+    "dec_mul",
+    "dec_div",
+    "dec_cmp",
+    // Aggregates.
+    "any_value",
+    "bool_and",
+    "bool_or",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "stddev_pop",
+    "stddev_samp",
+    "var_pop",
+    "var_samp",
+    "covar_pop",
+    "covar_samp",
+    "corr",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    // Time, on what the engine's own functions read.
+    "date_trunc",
+    "to_char",
+    "age",
 ];
 
 /// Writes a statement of the slice, or says which node it stopped at.
 pub(crate) fn statement(stmt: &NodeEnum) -> Result<String, Unsupported> {
+    statement_labelled(stmt, None)
+}
+
+/// Writes a statement of the slice whose result columns take the given labels, one
+/// per item of its result list (None: as the statement itself names it), when the
+/// list has as many items. The session expands some calls before translating
+/// (`current_user` into its value, `nextval('s')` into a number), and the labels are
+/// those of the statement as the client sent it (`labels::result_labels`).
+pub(crate) fn statement_labelled(stmt: &NodeEnum, labels: Option<&[Option<String>]>) -> Result<String, Unsupported> {
     let mut e = Emitter {
         out: String::with_capacity(128),
+        labels,
     };
     match stmt {
         NodeEnum::SelectStmt(s) => e.select(s, true)?,
@@ -61,8 +156,10 @@ pub(crate) fn statement(stmt: &NodeEnum) -> Result<String, Unsupported> {
     Ok(e.out)
 }
 
-struct Emitter {
+struct Emitter<'a> {
     out: String,
+    /// Labels for the result list in place of its own (`statement_labelled`).
+    labels: Option<&'a [Option<String>]>,
 }
 
 fn node(n: &pb::Node) -> Result<&NodeEnum, Unsupported> {
@@ -273,7 +370,7 @@ fn is_reserved(w: &str) -> bool {
     WORDS.contains(&w)
 }
 
-impl Emitter {
+impl Emitter<'_> {
     fn push(&mut self, s: &str) {
         self.out.push_str(s);
     }
@@ -443,6 +540,12 @@ impl Emitter {
     /// A select list or a RETURNING list. With labels, an item that names nothing is
     /// given the label Postgres gives it.
     fn targets(&mut self, items: &[pb::Node], labels: bool) -> Out {
+        // Given labels go to the result list, once: a set operation's first arm.
+        let given = if labels {
+            self.labels.take().filter(|l| l.len() == items.len())
+        } else {
+            None
+        };
         for (i, t) in items.iter().enumerate() {
             if i > 0 {
                 self.push(", ");
@@ -458,6 +561,9 @@ impl Emitter {
             if !t.name.is_empty() {
                 self.push(" AS ");
                 self.push(&quote_ident(&t.name));
+            } else if let Some(Some(l)) = given.map(|g| &g[i]) {
+                self.push(" AS ");
+                self.push(&quote_ident(l));
             } else if labels {
                 match figure_colname(val) {
                     Label::Itself => {}
@@ -827,6 +933,31 @@ impl Emitter {
             }
             NodeEnum::FuncCall(f) => self.func_call(f),
             NodeEnum::SubLink(s) => self.sub_link(s),
+            NodeEnum::MinMaxExpr(m) => {
+                // The engine's GREATEST and LEAST skip NULLs, as Postgres' do.
+                self.push(match pb::MinMaxOp::try_from(m.op) {
+                    Ok(pb::MinMaxOp::IsGreatest) => "greatest(",
+                    Ok(pb::MinMaxOp::IsLeast) => "least(",
+                    _ => return Err("GREATEST or LEAST"),
+                });
+                self.list(&m.args, Self::expr_node)?;
+                self.push(")");
+                Ok(())
+            }
+            NodeEnum::BooleanTest(t) => {
+                use pb::BoolTestType as B;
+                // SQLite has IS [NOT] TRUE and FALSE; IS UNKNOWN it has not.
+                let word = match B::try_from(t.booltesttype) {
+                    Ok(B::IsTrue) => " IS TRUE",
+                    Ok(B::IsNotTrue) => " IS NOT TRUE",
+                    Ok(B::IsFalse) => " IS FALSE",
+                    Ok(B::IsNotFalse) => " IS NOT FALSE",
+                    _ => return Err("IS UNKNOWN"),
+                };
+                self.expr(boxed(t.arg.as_deref())?, Prec::Compare)?;
+                self.push(word);
+                Ok(())
+            }
             _ => Err("expression"),
         }
     }
@@ -853,6 +984,23 @@ impl Emitter {
         let arg = boxed(t.arg.as_deref())?;
         let name = cast_type(ty)?;
         match name.as_str() {
+            // hstore is stored as its text: a literal is read by hstore_in, anything
+            // else is one already.
+            "hstore" => {
+                if is_string(arg) {
+                    self.push("hstore_in(");
+                    self.expr(arg, Prec::Or)?;
+                    self.push(")");
+                } else {
+                    self.expr(arg, Prec::Atom)?;
+                }
+            }
+            // jsonb compares and sorts as jsonb (rewrite_jsonb_collate).
+            "jsonb" => {
+                self.push("(overlite_cast(");
+                self.expr(arg, Prec::Or)?;
+                self.push(", 'jsonb') COLLATE JSONB)");
+            }
             "text" => {
                 self.push("CAST(");
                 self.expr(arg, Prec::Or)?;
@@ -934,20 +1082,33 @@ impl Emitter {
                 Ok(())
             }
             K::AexprLike | K::AexprIlike => {
-                let r = boxed(a.rexpr.as_deref())?;
-                if matches!(r, NodeEnum::FuncCall(_)) {
-                    return Err("LIKE ESCAPE");
-                }
-                let word = match op {
-                    "~~" => " LIKE ",
-                    "!~~" => " NOT LIKE ",
-                    "~~*" => " ILIKE ",
-                    "!~~*" => " NOT ILIKE ",
+                // Postgres' LIKE tells case apart and escapes with a backslash unless
+                // ESCAPE says otherwise; SQLite's folds ASCII case and has no escape of
+                // its own. LIKE is GLOB over the pattern overlite_like_glob writes, and
+                // ILIKE SQLite's LIKE over overlite_ilike_pattern's (rewrite/like.rs, which
+                // does the same for the text passes).
+                let (pattern, escape) = like_pattern(boxed(a.rexpr.as_deref())?)?;
+                let (word, func) = match op {
+                    "~~" => (" GLOB ", "overlite_like_glob("),
+                    "!~~" => (" NOT GLOB ", "overlite_like_glob("),
+                    "~~*" => (" LIKE ", "overlite_ilike_pattern("),
+                    "!~~*" => (" NOT LIKE ", "overlite_ilike_pattern("),
                     _ => return Err("LIKE operator"),
                 };
                 self.expr(boxed(a.lexpr.as_deref())?, Prec::Compare)?;
                 self.push(word);
-                self.expr(r, Prec::Compare)
+                self.push(func);
+                self.expr(pattern, Prec::Or)?;
+                self.push(", ");
+                match escape {
+                    Some(e) => self.expr(e, Prec::Or)?,
+                    None => self.push("'\\'"),
+                }
+                self.push(")");
+                if kind == K::AexprIlike {
+                    self.push(" ESCAPE '\\'");
+                }
+                Ok(())
             }
             K::AexprBetween | K::AexprNotBetween => {
                 let NodeEnum::List(b) = boxed(a.rexpr.as_deref())? else {
@@ -1113,6 +1274,9 @@ fn prec(n: &NodeEnum) -> Prec {
                     _ => Prec::Atom,
                 },
                 Ok(K::AexprNullif) => Prec::Atom,
+                // ILIKE ends in its ESCAPE clause: an operand of anything is written in
+                // parentheses, so that nothing after it is read as the escape.
+                Ok(K::AexprIlike) => Prec::Not,
                 _ => Prec::Equality,
             }
         }
@@ -1151,31 +1315,57 @@ fn cast_type(t: &pb::TypeName) -> Result<String, Unsupported> {
             _ => Err("type modifier"),
         })
         .collect::<Result<_, _>>()?;
-    let base = match names.as_slice() {
-        ["pg_catalog", b] => match *b {
-            "int2" => "smallint",
-            "int4" => "integer",
-            "int8" => "bigint",
-            "float4" => "real",
-            "float8" => "double precision",
-            "numeric" => "numeric",
-            "bool" => "boolean",
-            "varchar" => "varchar",
-            "timestamp" => "timestamp",
-            "timestamptz" => "timestamptz",
-            _ => return Err("cast type"),
-        },
-        [b] => match *b {
-            "text" | "date" | "uuid" => *b,
-            _ => return Err("cast type"),
-        },
+    // The grammar writes a type named by keywords (`integer`, `timestamp with time
+    // zone`) as pg_catalog's; one written as a plain name (`int4`, `timestamptz`) as
+    // it came. Either way, the types the engine's input functions read.
+    let b = match names.as_slice() {
+        ["pg_catalog", b] | [b] => *b,
+        _ => return Err("cast type"),
+    };
+    let base = match b {
+        "int2" | "smallint" => "smallint",
+        "int4" | "integer" | "int" => "integer",
+        "int8" | "bigint" => "bigint",
+        "float4" | "real" => "real",
+        "float8" => "double precision",
+        "numeric" | "decimal" => "numeric",
+        "bool" | "boolean" => "boolean",
+        "varchar" => "varchar",
+        "bpchar" => "char",
+        "text" | "date" | "uuid" | "json" | "jsonb" | "bytea" | "interval" | "name" | "hstore" | "inet" | "cidr"
+        | "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => b,
+        "time" | "timetz" | "timestamp" | "timestamptz" => b,
         _ => return Err("cast type"),
     };
     Ok(match (base, mods.as_slice()) {
         (_, []) => base.to_string(),
         ("numeric", [p]) => format!("numeric({p})"),
         ("numeric", [p, s]) => format!("numeric({p}, {s})"),
-        ("varchar", [n]) => format!("varchar({n})"),
+        ("varchar" | "char", [n]) => format!("{base}({n})"),
+        ("time" | "timetz" | "timestamp" | "timestamptz", [p]) => format!("{base}({p})"),
+        // An interval's modifier holds its fields (`interval '1' day`), which say
+        // what an unmarked number counts.
         _ => return Err("type modifier"),
     })
+}
+
+/// A string literal, which a cast reads with the type's input function.
+fn is_string(n: &NodeEnum) -> bool {
+    matches!(n, NodeEnum::AConst(k) if matches!(k.val, Some(Val::Sval(_))))
+}
+
+/// The pattern and the escape of a LIKE's right side: `a LIKE p ESCAPE e` is
+/// `a ~~ like_escape(p, e)` in the tree.
+fn like_pattern(r: &NodeEnum) -> Result<(&NodeEnum, Option<&NodeEnum>), Unsupported> {
+    if let NodeEnum::FuncCall(f) = r
+        && let [schema, name] = f.funcname.as_slice()
+        && string(schema)? == "pg_catalog"
+        && string(name)? == "like_escape"
+    {
+        let [p, e] = f.args.as_slice() else {
+            return Err("LIKE ESCAPE");
+        };
+        return Ok((node(p)?, Some(node(e)?)));
+    }
+    Ok((r, None))
 }

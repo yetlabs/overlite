@@ -22,6 +22,85 @@ pub(crate) fn param_columns(sql: &str) -> Option<(Vec<NamedTable>, Vec<ParamColu
     Some((w.tables, w.out))
 }
 
+/// Where a parameter of an INSERT goes: a column of its list, or a place in the row
+/// of one without a list, which the table's column order names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Slot {
+    Column(String),
+    Position(usize),
+}
+
+/// Everything the tree says of a statement's parameters, for Describe.
+#[derive(Debug, Default)]
+pub(crate) struct Facts {
+    /// The tables and the column each parameter meets, as `param_columns` gives them.
+    pub tables: Vec<NamedTable>,
+    pub refs: Vec<ParamColumn>,
+    /// An INSERT's table, as SQL text, and where each parameter that is a whole value
+    /// of a VALUES row goes.
+    pub insert: Option<(String, Vec<(usize, Slot)>)>,
+    /// Parameters that are a row count: LIMIT, OFFSET, FETCH FIRST.
+    pub row_counts: Vec<usize>,
+}
+
+/// The facts of a statement the AST path translates, None for any other: those keep
+/// the text readers until their stage (docs/adr/0001-sql-ast.md).
+pub(crate) fn facts(sql: &str) -> Option<Facts> {
+    let parsed = crate::ast::parse::parse(sql).ok()?;
+    let [raw] = parsed.stmts.as_slice() else {
+        return None;
+    };
+    let stmt = raw.stmt.as_deref()?.node.as_ref()?;
+    crate::ast::emit::statement(stmt).ok()?;
+    let mut w = Walker::default();
+    w.statement(stmt);
+    let insert = match stmt {
+        NodeEnum::InsertStmt(i) => insert_slots(i),
+        _ => None,
+    };
+    Some(Facts {
+        tables: w.tables,
+        refs: w.out,
+        insert,
+        row_counts: w.row_counts,
+    })
+}
+
+/// An INSERT's table and the slot of each parameter standing alone in a VALUES row.
+fn insert_slots(i: &pb::InsertStmt) -> Option<(String, Vec<(usize, Slot)>)> {
+    let r = i.relation.as_ref()?;
+    let mut table = String::new();
+    if !r.schemaname.is_empty() {
+        table.push_str(&crate::ast::emit::ident(&r.schemaname));
+        table.push('.');
+    }
+    table.push_str(&crate::ast::emit::ident(&r.relname));
+    let cols: Vec<&str> = i
+        .cols
+        .iter()
+        .filter_map(|c| match n(c) {
+            Some(NodeEnum::ResTarget(t)) => Some(t.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut slots = Vec::new();
+    if let Some(NodeEnum::SelectStmt(q)) = nb(i.select_stmt.as_deref()) {
+        for row in &q.values_lists {
+            let Some(NodeEnum::List(row)) = n(row) else { continue };
+            for (k, item) in row.items.iter().enumerate() {
+                let Some(NodeEnum::ParamRef(p)) = n(item) else { continue };
+                let Ok(p) = usize::try_from(p.number) else { continue };
+                if cols.is_empty() {
+                    slots.push((p, Slot::Position(k)));
+                } else if let Some(c) = cols.get(k) {
+                    slots.push((p, Slot::Column((*c).to_string())));
+                }
+            }
+        }
+    }
+    Some((table, slots))
+}
+
 #[derive(Default)]
 struct Walker {
     tables: Vec<NamedTable>,
@@ -30,6 +109,7 @@ struct Walker {
     scopes: Vec<Vec<(String, usize)>>,
     ctes: Vec<String>,
     out: Vec<ParamColumn>,
+    row_counts: Vec<usize>,
 }
 
 fn n(x: &pb::Node) -> Option<&NodeEnum> {
@@ -114,6 +194,13 @@ impl Walker {
 
     fn select(&mut self, q: &pb::SelectStmt) {
         self.with(q.with_clause.as_ref());
+        for count in [&q.limit_count, &q.limit_offset] {
+            if let Some(NodeEnum::ParamRef(p)) = nb(count.as_deref())
+                && let Ok(p) = usize::try_from(p.number)
+            {
+                self.row_counts.push(p);
+            }
+        }
         if let (Some(l), Some(r)) = (&q.larg, &q.rarg) {
             self.select(l);
             self.select(r);

@@ -40,8 +40,31 @@ type Intended = (&'static str, fn(&[String], &[String]) -> bool);
 
 const INTENDED: &[Intended] = &[
     (
-        "label: an expression whose operand is a cast is ?column? (FigureColname); the text path \
-         labeled it by the cast",
+        "jsonb compares as jsonb however its name is spelled: the text path gave `::jsonb` its \
+         COLLATE JSONB and not `::JSONB`",
+        |old, new| {
+            let mut n: Vec<&String> = Vec::new();
+            for t in without_parens(new) {
+                if t == "jsonb" && n.last().is_some_and(|l| *l == "collate") {
+                    n.pop();
+                } else {
+                    n.push(t);
+                }
+            }
+            n.len() < without_parens(new).len() && without_parens(old) == n
+        },
+    ),
+    (
+        "a cast of a cast is two casts: the text path left `::` in the SQLite SQL or cast a whole \
+         VALUES row, neither of which SQLite reads",
+        |old, new| {
+            let broken = old.iter().any(|t| t == "::") || old.windows(2).any(|w| w[0] == "values" && w[1] == "cast");
+            broken && !new.iter().any(|t| t == "::")
+        },
+    ),
+    (
+        "label: an expression whose operand is a cast or a column is ?column? (FigureColname); the \
+         text path labeled it by its operand",
         |old, new| {
             let (o, n) = (without_parens(old), without_parens(new));
             o.len() == n.len() && o.iter().zip(&n).all(|(o, n)| o == n || *n == "\"?column?\"")

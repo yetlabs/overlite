@@ -282,9 +282,7 @@ impl Session {
         let sql = if x == raw {
             rewrite(&x)
         } else {
-            // What current_user or nextval('s') became says nothing of its label.
-            let labels = crate::rewrite::labels::result_labels(raw);
-            crate::rewrite::labels::apply_labels(&rewrite(&x), &labels)
+            crate::rewrite::rewrite_expanded(raw, &x)
         };
         if skip_all {
             // SKIP LOCKED while another transaction holds the write lock: every row is
@@ -764,9 +762,7 @@ impl Session {
         if has_seq_func(&raw) || has_advisory_func(&raw) {
             // Describe must parse for column types but never advance a sequence
             // or take a lock; neutralize the calls to a constant, then rewrite.
-            desc_sql = rewrite(&neutralize_advisory_locks(&neutralize_sequences(&raw)));
-            let labels = crate::rewrite::labels::result_labels(&raw);
-            desc_sql = crate::rewrite::labels::apply_labels(&desc_sql, &labels);
+            desc_sql = crate::rewrite::rewrite_expanded(&raw, &neutralize_advisory_locks(&neutralize_sequences(&raw)));
         }
         let cols = match self.describe_sql(&desc_sql, &args) {
             Ok(c) => c,
