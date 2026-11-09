@@ -82,8 +82,25 @@ impl Session {
         if self.priv_bypass() {
             return Ok(());
         }
-        if let Some(accesses) = accesses(sql, &mut StoredRelations(self)) {
-            return self.check_accesses(&accesses);
+        // First without the tables' columns: a reference then reads as any column, and
+        // a bare name as one of every table it may belong to, which asks for more than
+        // the statement needs, never less. Table grants that cover that cover the
+        // statement, which is the common case and costs no column lookup. Else the
+        // columns decide.
+        let mut rels = StoredRelations {
+            session: self,
+            columns: false,
+        };
+        if let Some(rough) = accesses(sql, &mut rels) {
+            if self.check_accesses(&rough).is_ok() {
+                return Ok(());
+            }
+            let mut rels = StoredRelations {
+                session: self,
+                columns: true,
+            };
+            let exact = accesses(sql, &mut rels).unwrap_or(rough);
+            return self.check_accesses(&exact);
         }
         let reqs = required_privileges(sql);
         for r in &reqs {
@@ -313,7 +330,11 @@ impl Session {
 
 /// The tables of a statement as this session finds them: by the search_path, under
 /// their stored names.
-struct StoredRelations<'a>(&'a mut Session);
+struct StoredRelations<'a> {
+    session: &'a mut Session,
+    /// Whether to read the tables' columns, or to leave them unknown.
+    columns: bool,
+}
 
 impl Relations for StoredRelations<'_> {
     fn relation(&mut self, schema: &str, name: &str) -> (String, Option<Vec<String>>) {
@@ -323,12 +344,15 @@ impl Relations for StoredRelations<'_> {
         } else {
             [quote(schema), ".".to_string(), quote(name)].concat()
         };
-        let table = self.0.stored_name(&reference);
+        let table = self.session.stored_name(&reference);
+        if !self.columns {
+            return (table, None);
+        }
         let q = format!(
             "SELECT name FROM pragma_table_xinfo({}) WHERE hidden <> 1 ORDER BY cid",
             quote_literal(&table)
         );
-        let columns = match self.0.exec(&q, &[]) {
+        let columns = match self.session.exec(&q, &[]) {
             Ok(rs) if !rs.rows.is_empty() => Some(
                 rs.rows
                     .iter()

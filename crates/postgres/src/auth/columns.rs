@@ -15,7 +15,9 @@
 use overlite_core::text::eq_fold;
 use pg_query::NodeEnum;
 use pg_query::protobuf::{self as pb, OnConflictAction, SetOperation};
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 
 /// Where the tables of a statement are found.
 pub(crate) trait Relations {
@@ -49,7 +51,7 @@ pub(crate) struct Access {
 /// What sql needs on each table it touches, None when the statement is not one
 /// statement of SELECT, INSERT, UPDATE or DELETE that this reader follows whole.
 pub(crate) fn accesses(sql: &str, rels: &mut dyn Relations) -> Option<Vec<Access>> {
-    let parsed = crate::ast::parse::parse(sql).ok()?;
+    let parsed = parsed(sql)?;
     let [raw] = parsed.stmts.as_slice() else {
         return None;
     };
@@ -62,6 +64,35 @@ pub(crate) fn accesses(sql: &str, rels: &mut dyn Relations) -> Option<Vec<Access
     };
     w.statement(stmt).ok()?;
     Some(w.out)
+}
+
+/// Statements parsed, by text, on this thread: a parse is most of what reading a
+/// point lookup costs, and a tree depends on the text alone, never on the schema or
+/// the session, so a client repeating a statement parses it once. Bounded as the
+/// translation cache is, emptied when full.
+const PARSED_ENTRIES: usize = 4096;
+const PARSED_MAX_LEN: usize = 16 * 1024;
+
+std::thread_local! {
+    static PARSED: RefCell<HashMap<String, Option<Rc<pb::ParseResult>>>> = RefCell::new(HashMap::new());
+}
+
+fn parsed(sql: &str) -> Option<Rc<pb::ParseResult>> {
+    if sql.len() > PARSED_MAX_LEN {
+        return crate::ast::parse::parse(sql).ok().map(Rc::new);
+    }
+    if let Some(hit) = PARSED.with(|c| c.borrow().get(sql).cloned()) {
+        return hit;
+    }
+    let tree = crate::ast::parse::parse(sql).ok().map(Rc::new);
+    PARSED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= PARSED_ENTRIES {
+            c.clear();
+        }
+        c.insert(sql.to_string(), tree.clone());
+    });
+    tree
 }
 
 /// Not followed: the caller falls back to table-level grants.
