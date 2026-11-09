@@ -463,7 +463,7 @@ ok	SELECT schemaname, definition FROM pg_views WHERE viewname = 'v' /*overlite t
 ok	SELECT  /*overlite typed*/
 ok	CREATE TABLE orders (id int primary key)
 ok	SELECT to_regclass($1) AS "to_regclass" /*overlite typed*/
-ok	CREATE TABLE t (id INTEGER primary key AUTOINCREMENT, name text)
+ok	CREATE TABLE t (id INTEGER primary key AUTOINCREMENT /*overlite int4*/, name text)
 ok	SELECT column_name, identity_increment, identity_generation, generation_expression FROM "information_schema.columns" WHERE table_name = 't' /*overlite typed*/
 ok	CREATE TABLE t (id int primary key, label text)
 ok	SELECT current_database() AS "current_database" /*overlite typed*/
@@ -735,7 +735,7 @@ ok	SELECT name FROM pragma_table_info('q') /*overlite typed*/
 ok	SELECT count(*) AS "count" FROM "a ctid" WHERE rowid > 0 /*overlite typed int8*/
 ok	CREATE TABLE t (a int, b text)
 ok	INSERT INTO t VALUES (2, 'x'), (1, 'y') /*overlite typed*/
-ok	CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, a int)
+ok	CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, a int)
 ok	INSERT INTO s (a) VALUES (1) /*overlite typed*/
 ok	SELECT rowid AS "ctid" FROM t /*overlite typed*/
 ok	SELECT rowid AS "ctid" FROM t /*overlite typed*/
@@ -863,7 +863,7 @@ no	statement kind
 no	statement kind
 no	statement kind
 no	statement kind
-ok	CREATE TABLE eventos (id INTEGER PRIMARY KEY AUTOINCREMENT, quando TIMESTAMP, dia DATE)
+ok	CREATE TABLE eventos (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, quando TIMESTAMP, dia DATE)
 ok	INSERT INTO eventos (quando, dia) VALUES ('2024-03-15 14:30:45', '2024-03-15') /*overlite typed*/
 ok	SELECT quando, dia FROM eventos /*overlite typed*/
 ok	SELECT date_trunc('month', quando) AS "date_trunc" FROM eventos /*overlite typed*/
@@ -909,10 +909,10 @@ ok	SELECT nope FROM r9 /*overlite typed*/
 ok	SELECT zz.id FROM r9 /*overlite typed*/
 no	parse error
 no	statement kind
-ok	CREATE TABLE rt (id INTEGER PRIMARY KEY AUTOINCREMENT, "serial" integer NOT NULL, "bigserial" int, "smallserial" text)
+ok	CREATE TABLE rt (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "serial" integer NOT NULL, "bigserial" int, "smallserial" text)
 ok	INSERT INTO rt (serial, bigserial, smallserial) VALUES (7, 8, 'x') /*overlite typed*/
 ok	SELECT id, serial, bigserial, smallserial FROM rt /*overlite typed*/
-ok	CREATE TABLE rt2 (serial integer, n INTEGER PRIMARY KEY AUTOINCREMENT)
+ok	CREATE TABLE rt2 (serial integer, n INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/)
 ok	INSERT INTO rt2 (serial) VALUES (5) /*overlite typed*/
 ok	SELECT serial, n FROM rt2 /*overlite typed*/
 ok	ALTER TABLE rt RENAME COLUMN "serial" TO "sn"
@@ -922,7 +922,7 @@ ok	CREATE TABLE rt3 (date date, timestamp timestamp, interval interval, text tex
 ok	INSERT INTO rt3 VALUES ('2020-01-01', '2020-01-01 1:00', '1h', 't', 1.25, 2.5) /*overlite typed*/
 ok	SELECT date, timestamp, interval, text, numeric, decimal FROM rt3 /*overlite typed*/
 ok	DROP TABLE IF EXISTS re
-ok	CREATE TABLE re (id INTEGER PRIMARY KEY AUTOINCREMENT, a text, n DECIMALTEXT(5,2) COLLATE DECIMAL, b boolean, u uuid, d date, ts timestamptz, j jsonb, f float8)
+ok	CREATE TABLE re (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, a text, n DECIMALTEXT(5,2) COLLATE DECIMAL, b boolean, u uuid, d date, ts timestamptz, j jsonb, f float8)
 ok	INSERT INTO re (a, n, b, u, d, ts, j, f) SELECT * FROM (SELECT json_extract(value, '$[0]') AS unnest, json_extract(value, '$[1]') AS unnest, json_extract(value, '$[2]') AS unnest, json_extract(value, '$[3]') AS unnest, json_extract(value, '$[4]') AS unnest, json_extract(value, '$[5]') AS unnest, json_extract(value, '$[6]') AS unnest, json_extract(value, '$[7]') AS unnest FROM overlite_elements(overlite_zip(overlite_array_json(overlite_assign('{"a,b","c\\"d",NULL,"NULL"," x "}', 'text[]')), overlite_array_json(overlite_assign(overlite_assign('{1.005,2,NULL,-3.5,4}', 'numeric[]'), 'numeric(5,2)[]')), overlite_array_json(overlite_assign('{t,f,NULL,yes,off}', 'boolean[]')), overlite_array_json(overlite_assign('{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11,NULL,NULL,NULL,NULL}', 'uuid[]')), overlite_array_json(overlite_assign(overlite_assign('{2020-01-02,NULL,NULL,NULL,infinity}', 'date[]'), 'date[]')), overlite_array_json(overlite_assign(overlite_tz_in(overlite_assign('{"2020-01-02 03:04:05.5",NULL,NULL,NULL,NULL}', 'timestamp[]')), 'timestamptz[]')), overlite_array_json(overlite_assign(overlite_assign('{"{\\"a\\": [1, \\"x,y\\"]}",NULL,"null","[]","\\"s\\""}', 'jsonb[]'), 'jsonb[]')), overlite_array_json(overlite_assign(overlite_assign('{NULL,-1.0,3,1e3,NaN}', 'double precision[]'), 'double precision[]'))))) AS unnest RETURNING a, n, b, u, d, ts, j, f /*overlite typed*/
 ok	SELECT * FROM (SELECT value AS unnest FROM overlite_elements(overlite_array_json(overlite_assign('{1,x}', 'integer[]')))) AS unnest /*overlite typed int4*/
 ok	SELECT count(*) AS "count" FROM (SELECT value AS unnest FROM overlite_elements(overlite_array_json(overlite_assign('{"a\\\\b","q\\""}', 'text[]')))) AS unnest /*overlite typed int8*/
@@ -1631,7 +1631,7 @@ ok	INSERT INTO r7 (g, p) SELECT a.g + 5, b.p FROM r7 AS a JOIN r7 AS b ON a.p = 
 ok	INSERT INTO r7 (g, p) SELECT 9, x FROM (WITH RECURSIVE _gs(value) AS (SELECT (1) WHERE (((1) > 0 AND (1) <= (2)) OR ((1) < 0 AND (1) >= (2))) UNION ALL SELECT value + (1) FROM _gs WHERE (((1) > 0 AND value + (1) <= (2)) OR ((1) < 0 AND value + (1) >= (2)))) SELECT value AS x FROM _gs) AS x WHERE true ON CONFLICT DO NOTHING RETURNING g, p /*overlite typed*/
 ok	INSERT INTO r7 (g, p) SELECT * FROM (SELECT json_extract(value, '$[0]') AS unnest, json_extract(value, '$[1]') AS unnest FROM overlite_elements(overlite_zip(overlite_array_json(overlite_assign($1, 'integer[]')), overlite_array_json(overlite_assign($2, 'integer[]'))))) AS unnest WHERE true ON CONFLICT DO NOTHING /*overlite typed*/
 ok	SELECT * FROM r7 ORDER BY 1 NULLS LAST, 2 NULLS LAST /*overlite typed*/
-ok	CREATE TABLE docs (id INTEGER PRIMARY KEY AUTOINCREMENT, data JSONB)
+ok	CREATE TABLE docs (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, data JSONB)
 ok	INSERT INTO docs (data) VALUES ('{"nome":"ana","tags":["x","y"],"end":{"cidade":"SP"}}') /*overlite typed*/
 ok	SELECT data ->> 'nome' AS "?column?", (data -> 'nome') COLLATE JSONB AS "?column?" FROM docs /*overlite typed*/
 ok	SELECT (data -> 'tags') COLLATE JSONB ->> 0 AS "?column?", overlite_jsonb_path(data, '{end,cidade}', 1) AS "?column?" FROM docs /*overlite typed*/
@@ -2159,7 +2159,7 @@ ok	SELECT isempty(int4range(5, 5)) AS "isempty" /*overlite typed bool*/
 ok	CREATE TABLE t (r int4range)
 ok	INSERT INTO t VALUES ('[3,7)') /*overlite typed*/
 ok	SELECT r FROM t /*overlite typed*/
-ok	CREATE TABLE "sales"."orders" (id INTEGER primary key AUTOINCREMENT, total int)
+ok	CREATE TABLE "sales"."orders" (id INTEGER primary key AUTOINCREMENT /*overlite int4*/, total int)
 ok	INSERT INTO sales.orders (total) VALUES ($1) RETURNING id /*overlite typed*/
 ok	UPDATE sales.orders SET total = total + $1 WHERE id = $2 RETURNING total /*overlite typed*/
 ok	DELETE FROM sales.orders WHERE id = $1 RETURNING id /*overlite typed*/
@@ -2556,7 +2556,7 @@ ok	INSERT INTO s3.t (v) VALUES ('no id column here') /*overlite typed*/
 ok	DELETE FROM _overlite_defaults WHERE tablename = 's2.t' /*overlite typed*/
 ok	UPDATE _overlite_defaults SET tablename = 's2"."t' WHERE tablename = 's2.t' /*overlite typed*/
 ok	UPDATE _overlite_defaults SET tablename = 'public.t' WHERE tablename = 't' /*overlite typed*/
-ok	CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL)
+ok	CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, nome TEXT NOT NULL)
 ok	INSERT INTO users (nome) VALUES ('ana') /*overlite typed*/
 ok	INSERT INTO users (nome) VALUES ('bob') /*overlite typed*/
 ok	SELECT id, nome FROM users ORDER BY id NULLS LAST /*overlite typed*/
@@ -3275,7 +3275,7 @@ ok	ALTER TABLE "Sch"."add" ADD CONSTRAINT a_uq UNIQUE (a)
 ok	INSERT INTO t VALUES ('t07') /*overlite typed*/
 ok	ALTER TABLE "Sch"."add" DROP CONSTRAINT a_uq
 ok	ALTER TABLE "Sch"."add" DROP COLUMN d
-ok	CREATE TABLE at_0 (id INTEGER PRIMARY KEY AUTOINCREMENT, price DECIMALTEXT(10,2) COLLATE DECIMAL, name varchar(10))
+ok	CREATE TABLE at_0 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, price DECIMALTEXT(10,2) COLLATE DECIMAL, name varchar(10))
 ok	INSERT INTO t VALUES ('t08') /*overlite typed*/
 ok	INSERT INTO at_0 (price, name) VALUES (9.5, 'abcd'), (NULL, NULL) /*overlite typed*/
 ok	SELECT n, overlite_cast(a, 'timestamp') AS "a" FROM t WHERE n = -1 /*overlite typed*/
@@ -3305,7 +3305,7 @@ ok	ALTER TABLE "at_0" ALTER COLUMN "name" TYPE varchar(3)
 ok	SELECT format_type(atttypid, atttypmod) AS "format_type" FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'at_0' COLLATE NOCASE) AND attname = 'name' /*overlite typed*/
 ok	CREATE TABLE r3_0 ("path" varchar(255) NOT NULL UNIQUE, a text, b text, c text, d text COLLATE NOCASE)
 ok	SELECT name FROM at_0 WHERE id = 1 /*overlite typed*/
-ok	CREATE TABLE at_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, price DECIMALTEXT(10,2) COLLATE DECIMAL, name varchar(10))
+ok	CREATE TABLE at_1 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, price DECIMALTEXT(10,2) COLLATE DECIMAL, name varchar(10))
 ok	INSERT INTO t VALUES ('t09') /*overlite typed*/
 ok	INSERT INTO at_1 (price, name) VALUES (9.5, 'abcd'), (NULL, NULL) /*overlite typed*/
 ok	ALTER TABLE r3_0 ALTER COLUMN path TYPE VARCHAR(255)
@@ -3331,7 +3331,7 @@ ok	ALTER TABLE "r6_0" ALTER COLUMN "k" SET DEFAULT '08dc6092-3586-49c8-b410-8813
 ok	INSERT INTO r3_0 (path, a, b, c, d, e) VALUES ('a', 'a', 'a', 'a', 'a', 'a'), ('B', 'B', 'B', 'B', 'B', 'B') /*overlite typed*/
 ok	CREATE TABLE in0_p ("id" bigint NOT NULL PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, "code" varchar(10) NOT NULL UNIQUE)
 ok	ALTER TABLE "ck_0" DROP CONSTRAINT "ck_0_pos_check"
-ok	CREATE TABLE cd_0 (id INTEGER PRIMARY KEY AUTOINCREMENT, a int, b int)
+ok	CREATE TABLE cd_0 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, a int, b int)
 ok	INSERT INTO t VALUES ('t10') /*overlite typed*/
 ok	SELECT path FROM r3_0 ORDER BY path NULLS LAST /*overlite typed*/
 ok	SELECT a FROM r3_0 ORDER BY a NULLS LAST /*overlite typed*/
@@ -3347,14 +3347,14 @@ ok	CREATE TABLE in0_c ("id" integer NOT NULL PRIMARY KEY GENERATED BY DEFAULT AS
 ok	ALTER TABLE "r6_0" ADD COLUMN "z" uuid DEFAULT '08dc6092-3586-49c8-b410-8813ba44b39e' NOT NULL
 ok	ALTER TABLE "in0_c" ADD CONSTRAINT "in0_c_p_id_fk" FOREIGN KEY ("p_id") REFERENCES "in0_p" ("id") DEFERRABLE INITIALLY DEFERRED
 ok	ALTER TABLE "r6_0" ALTER COLUMN "n" SET DEFAULT (CAST(7 AS smallint))
-ok	CREATE TABLE r17p_0 (id INTEGER PRIMARY KEY AUTOINCREMENT, k int UNIQUE)
+ok	CREATE TABLE r17p_0 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, k int UNIQUE)
 ok	ALTER TABLE "cd_0" ADD CONSTRAINT "cd_0_a_b_uniq" UNIQUE ("a", "b")
 ok	INSERT INTO ck_0 (pos) VALUES (-1) /*overlite typed*/
 ok	ALTER TABLE r3_1 ALTER COLUMN path TYPE VARCHAR(255)
 ok	DELETE FROM ck_0 /*overlite typed*/
 ok	ALTER TABLE "ck_0" ADD CONSTRAINT "ck_0_pos_3ec685ce_check" CHECK ("pos" >= 0)
 ok	ALTER TABLE "Sch"."Mixed Case" ALTER COLUMN a SET NOT NULL
-ok	CREATE TABLE r17_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "flag" boolean NOT NULL, "q" integer NULL, "d" date NULL, "u" int UNIQUE, "f" int REFERENCES r17p_0(id), "g" int, "c" int, CONSTRAINT "r17_0_g_fk" FOREIGN KEY ("g") REFERENCES r17p_0(k), CONSTRAINT "r17_0_c_check" CHECK ("c" > 0 AND "c" < 100))
+ok	CREATE TABLE r17_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "flag" boolean NOT NULL, "q" integer NULL, "d" date NULL, "u" int UNIQUE, "f" int REFERENCES r17p_0(id), "g" int, "c" int, CONSTRAINT "r17_0_g_fk" FOREIGN KEY ("g") REFERENCES r17p_0(k), CONSTRAINT "r17_0_c_check" CHECK ("c" > 0 AND "c" < 100))
 ok	ALTER TABLE "r6_0" ALTER COLUMN "j" SET DEFAULT '[]'
 ok	CREATE TABLE id0_t1 ("id" integer NOT NULL PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, "a" text)
 ok	ALTER TABLE "r3_1" ALTER COLUMN "d" TYPE text
@@ -3384,7 +3384,7 @@ ok	CREATE TABLE r2_0 ("name" varchar(150) NOT NULL UNIQUE, "t" text, "c" char(3)
 ok	CREATE TABLE id0_t3 (id int GENERATED BY DEFAULT AS IDENTITY (START WITH 100 INCREMENT BY 5), b text)
 ok	CREATE INDEX "in0_c_name_n_idx" ON "in0_c" ("name", "n" DESC)
 ok	CREATE TABLE "ck_1" ("id" bigint NOT NULL PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, "pos" integer NOT NULL CHECK ("pos" >= 0), "a" int, "b" int, "m" ck_mood_1, CONSTRAINT "ck_1_a_b" CHECK ("a" > "b"))
-ok	CREATE TABLE in0_s ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "c_id" integer NULL CONSTRAINT "in0_s_c_id_fk" REFERENCES "in0_c"("id") DEFERRABLE INITIALLY DEFERRED)
+ok	CREATE TABLE in0_s ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "c_id" integer NULL CONSTRAINT "in0_s_c_id_fk" REFERENCES "in0_c"("id") DEFERRABLE INITIALLY DEFERRED)
 ok	ALTER TABLE "Sch"."Mixed Case" ALTER COLUMN b SET DEFAULT 'x'
 ok	SELECT conname, contype, conkey, (SELECT CASE _t WHEN 'f' THEN 'FOREIGN KEY (' || _c || ') REFERENCES ' || _r WHEN 'p' THEN 'PRIMARY KEY (' || _c || ')' WHEN 'u' THEN 'UNIQUE (' || _c || ')' WHEN 'c' THEN 'CHECK (' || _c || ')' WHEN 'x' THEN _c ELSE '' END FROM (SELECT oid AS _o, contype AS _t, ov_cols AS _c, ov_ref AS _r FROM pg_constraint) WHERE _o = oid) AS "pg_get_constraintdef" FROM pg_constraint WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'ck_1' COLLATE NOCASE) ORDER BY 1 NULLS LAST /*overlite typed*/
 ok	SELECT c.conname, overlite_array((SELECT json_group_array(_a) FROM (SELECT attname AS "_a" FROM overlite_elements(overlite_array_json(c.conkey)) AS cols JOIN pg_attribute AS ca ON cols.value = ca.attnum WHERE ca.attrelid = c.conrelid ORDER BY cols.ord NULLS LAST))) AS "array", c.contype, (SELECT fkc.relname || '.' || fka.attname FROM pg_attribute AS fka JOIN pg_class AS fkc ON fka.attrelid = fkc.oid WHERE fka.attrelid = c.confrelid AND fka.attnum = CASE WHEN json_valid(c.confkey) THEN json_extract(c.confkey, '$[' || ((1)-1) || ']') END) AS "?column?", cl.reloptions FROM pg_constraint AS c JOIN pg_class AS cl ON c.conrelid = cl.oid WHERE cl.relname = 'in0_c' AND pg_table_is_visible(cl.oid) AND c.contype <> 'n' /*overlite typed*/
@@ -3406,7 +3406,7 @@ ok	CREATE INDEX "r2_0_c_like" ON "r2_0" ("c" /*bpchar_pattern_ops*/)
 ok	ALTER TABLE r17p_0 DROP COLUMN k
 ok	INSERT INTO id0_t3 DEFAULT VALUES RETURNING id /*overlite typed*/
 ok	SELECT c FROM r3_1 ORDER BY c NULLS LAST /*overlite typed*/
-ok	CREATE TABLE cd_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, a int, b int)
+ok	CREATE TABLE cd_1 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, a int, b int)
 ok	CREATE UNIQUE INDEX "r2_0_two" ON public."r2_0" (t /*text_pattern_ops*/ DESC, n)
 ok	SELECT d FROM r3_1 ORDER BY d NULLS LAST /*overlite typed*/
 ok	SELECT c.relname, attname, attidentity, attnotnull, format_type(atttypid, atttypmod) AS "format_type" FROM pg_attribute AS a JOIN pg_class AS c ON c.oid = a.attrelid WHERE c.relname IN ('id0_t1', 'id0_t2', 'id0_t3') AND attnum > 0 ORDER BY 1 NULLS LAST, attnum NULLS LAST /*overlite typed*/
@@ -3419,10 +3419,10 @@ ok	SELECT indexname, overlite_array(nullif(json_group_array(attname ORDER BY arr
 ok	SELECT count(*) AS "count" FROM r3_1 WHERE d = 'b' /*overlite typed int8*/
 ok	ALTER TABLE "ck_1" DROP CONSTRAINT "ck_1_pos_check"
 ok	SELECT (SELECT 'CREATE ' || CASE WHEN ix._u THEN 'UNIQUE ' ELSE '' END || 'INDEX ' || (SELECT relname FROM pg_class WHERE oid = ix._i) || ' ON ' || (SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = ix._r) || ' USING btree (' || ix._c || ')' FROM (SELECT indexrelid AS _i, indrelid AS _r, indisunique AS _u, ov_cols AS _c FROM pg_index) ix WHERE ix._i = i.indexrelid) AS "pg_get_indexdef" FROM pg_index AS i JOIN pg_class AS c ON c.oid = i.indexrelid WHERE c.relname = 'r2_0_name_like' /*overlite typed*/
-ok	CREATE TABLE r14p_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, code int UNIQUE)
+ok	CREATE TABLE r14p_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, code int UNIQUE)
 ok	SELECT table_name, column_name, is_identity, coalesce(identity_generation, '') AS "coalesce", data_type FROM "information_schema.columns" WHERE table_name IN ('id0_t1', 'id0_t2', 'id0_t3') AND column_name = 'id' ORDER BY 1 NULLS LAST /*overlite typed*/
 ok	INSERT INTO r3_1 (path) VALUES ('a') /*overlite typed*/
-ok	CREATE TABLE r8_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "a" text)
+ok	CREATE TABLE r8_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "a" text)
 ok	SELECT pg_get_serial_sequence('id0_t1', 'id') AS "pg_get_serial_sequence" /*overlite typed*/
 ok	ALTER TABLE "cd_1" ADD CONSTRAINT "cd_1_a_b_uniq" UNIQUE ("a", "b")
 ok	SELECT pg_get_serial_sequence('id0_t2', 'id') AS "pg_get_serial_sequence" /*overlite typed*/
@@ -3430,7 +3430,7 @@ ok	SELECT pg_get_serial_sequence('id0_t3', 'id') AS "pg_get_serial_sequence" /*o
 ok	SELECT (SELECT 'CREATE ' || CASE WHEN ix._u THEN 'UNIQUE ' ELSE '' END || 'INDEX ' || (SELECT relname FROM pg_class WHERE oid = ix._i) || ' ON ' || (SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = ix._r) || ' USING btree (' || ix._c || ')' FROM (SELECT indexrelid AS _i, indrelid AS _r, indisunique AS _u, ov_cols AS _c FROM pg_index) ix WHERE ix._i = i.indexrelid) AS "pg_get_indexdef" FROM pg_index AS i JOIN pg_class AS c ON c.oid = i.indexrelid WHERE c.relname = 'r2_0_two' /*overlite typed*/
 ok	ALTER TABLE id0_t2 ALTER COLUMN id SET GENERATED BY DEFAULT
 ok	ALTER TABLE "r17_0" DROP COLUMN "q"
-ok	CREATE TABLE r14_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "x" integer CONSTRAINT "r14_0_x_named" REFERENCES r14p_0(id) DEFERRABLE INITIALLY DEFERRED, y int REFERENCES r14p_0(code), CONSTRAINT "r14_0_tbl_fk" FOREIGN KEY (y) REFERENCES r14p_0(code) DEFERRABLE INITIALLY DEFERRED)
+ok	CREATE TABLE r14_0 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "x" integer CONSTRAINT "r14_0_x_named" REFERENCES r14p_0(id) DEFERRABLE INITIALLY DEFERRED, y int REFERENCES r14p_0(code), CONSTRAINT "r14_0_tbl_fk" FOREIGN KEY (y) REFERENCES r14p_0(code) DEFERRABLE INITIALLY DEFERRED)
 ok	ALTER TABLE "r6_1" ADD COLUMN "z" uuid DEFAULT '08dc6092-3586-49c8-b410-8813ba44b39e' NOT NULL
 ok	INSERT INTO r2_0 (name, t, n) VALUES ('a', 'x', 1) /*overlite typed*/
 ok	CREATE TABLE na_0 (id int)
@@ -3512,19 +3512,19 @@ ok	INSERT INTO r14_0 (p_id) VALUES (99) /*overlite typed*/
 ok	ALTER TABLE "Sch"."Mixed Case" ADD CONSTRAINT a_uq UNIQUE (a)
 ok	SELECT setval(pg_get_serial_sequence('"r8n_0"', 'id'), coalesce(max(id), 1), max(id) IS NOT NULL) AS "setval" FROM r8n_0 /*overlite typed int8*/
 ok	INSERT INTO r14p_0 (id) VALUES (99) /*overlite typed*/
-ok	CREATE TABLE r21a_0 (id INTEGER PRIMARY KEY AUTOINCREMENT, v text)
+ok	CREATE TABLE r21a_0 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, v text)
 ok	INSERT INTO r8n_0 (b) VALUES (2) /*overlite typed*/
 ok	SELECT rating FROM na_0 /*overlite typed*/
 ok	SELECT id FROM r8n_0 WHERE b = 2 /*overlite typed*/
 ok	CREATE TABLE na_1 (id int)
-ok	CREATE TABLE r8_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "a" text)
+ok	CREATE TABLE r8_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "a" text)
 ok	ALTER TABLE "r14_0" DROP CONSTRAINT "r14_0_p_id_3c7e30a6_fk_r14p_id"
 ok	INSERT INTO r6_1 (n) VALUES (1) /*overlite typed*/
 ok	INSERT INTO r2_1 (name, t, n) VALUES ('a', 'x', 1) /*overlite typed*/
 ok	ALTER TABLE id0_t4 ALTER COLUMN id TYPE bigint
 ok	SELECT CAST(k AS text) AS "k" FROM r6_1 WHERE n = 1 /*overlite typed*/
 ok	INSERT INTO r2_1 (name, t, n) VALUES ('b', 'x', 1) /*overlite typed*/
-ok	CREATE TABLE r21b_0 (id INTEGER PRIMARY KEY AUTOINCREMENT, v text)
+ok	CREATE TABLE r21b_0 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, v text)
 ok	INSERT INTO na_1 VALUES (1) /*overlite typed*/
 ok	SELECT count(*) AS "count" FROM r2_1 WHERE name GLOB overlite_like_glob('a%', '\\') /*overlite typed int8*/
 ok	ALTER TABLE "na_1" ADD COLUMN "rating" DECIMALTEXT(3, 1) COLLATE DECIMAL DEFAULT 0 NOT NULL
@@ -3546,7 +3546,7 @@ ok	SELECT count(*) AS "count" FROM r21a_0 /*overlite typed int8*/
 ok	INSERT INTO id0_t4 (id, a) VALUES (8, 'x') /*overlite typed*/
 ok	CREATE INDEX "in1_c_name_n_idx" ON "in1_c" ("name", "n" DESC)
 ok	ALTER TABLE "r17_0" DROP COLUMN "g"
-ok	CREATE TABLE in1_s ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "c_id" integer NULL CONSTRAINT "in1_s_c_id_fk" REFERENCES "in1_c"("id") DEFERRABLE INITIALLY DEFERRED)
+ok	CREATE TABLE in1_s ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "c_id" integer NULL CONSTRAINT "in1_s_c_id_fk" REFERENCES "in1_c"("id") DEFERRABLE INITIALLY DEFERRED)
 ok	INSERT INTO id0_t4 (a) VALUES ('y') /*overlite typed*/
 ok	SELECT pg_get_serial_sequence('public.r8_1', 'id') AS "pg_get_serial_sequence" /*overlite typed*/
 ok	INSERT INTO na_1 VALUES (2, 2.25) /*overlite typed*/
@@ -3573,12 +3573,12 @@ no	statement kind
 ok	SELECT conname FROM pg_constraint WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'r14_0' COLLATE NOCASE) ORDER BY 1 NULLS LAST /*overlite typed*/
 ok	INSERT INTO r8e_1 DEFAULT VALUES RETURNING id /*overlite typed*/
 ok	SELECT indexname, overlite_array(nullif(json_group_array(attname ORDER BY arridx NULLS LAST), '[]')) AS "array_agg", indisunique, indisprimary, overlite_array(nullif(json_group_array(ordering ORDER BY arridx NULLS LAST), '[]')) AS "array_agg", amname, exprdef, s2.attoptions FROM (SELECT c2.relname AS "indexname", idx.*, attr.attname, am.amname, CASE WHEN idx.indexprs IS NOT NULL THEN (SELECT 'CREATE ' || CASE WHEN ix._u THEN 'UNIQUE ' ELSE '' END || 'INDEX ' || (SELECT relname FROM pg_class WHERE oid = ix._i) || ' ON ' || (SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = ix._r) || ' USING btree (' || ix._c || ')' FROM (SELECT indexrelid AS _i, indrelid AS _r, indisunique AS _u, ov_cols AS _c FROM pg_index) ix WHERE ix._i = idx.indexrelid) END AS "exprdef", CASE am.amname WHEN 'btree' THEN CASE option & 1 WHEN 1 THEN 'DESC' ELSE 'ASC' END END AS "ordering", c2.reloptions AS "attoptions" FROM (SELECT *, json_extract(koi.value, '$[0]') AS "key", json_extract(koi.value, '$[1]') AS "option", koi.ord AS "arridx" FROM pg_index AS i, overlite_elements(overlite_zip(overlite_array_json(i.indkey), overlite_array_json(i.indoption))) AS koi) AS idx LEFT JOIN pg_class AS c ON idx.indrelid = c.oid LEFT JOIN pg_class AS c2 ON idx.indexrelid = c2.oid LEFT JOIN pg_am AS am ON c2.relam = am.oid LEFT JOIN pg_attribute AS attr ON attr.attrelid = c.oid AND attr.attnum = idx."key" WHERE c.relname = 'in1_c' AND pg_table_is_visible(c.oid)) AS s2 GROUP BY indexname, indisunique, indisprimary, amname, exprdef, attoptions /*overlite typed ,,,,text[],,,*/
-ok	CREATE TABLE r21c_0 (id INTEGER PRIMARY KEY AUTOINCREMENT, a_id int REFERENCES r21a_0(id))
+ok	CREATE TABLE r21c_0 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, a_id int REFERENCES r21a_0(id))
 ok	SELECT nextval('r8_1_id_seq') AS "nextval" /*overlite typed int8*/
 ok	INSERT INTO r14_0 (p_id, x) VALUES (12345, 12345) /*overlite typed*/
 ok	SELECT currval('public.r8_1_id_seq') AS "currval" /*overlite typed int8*/
 ok	INSERT INTO r21c_0 (a_id) VALUES (1) /*overlite typed*/
-ok	CREATE TABLE r14p_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, code int UNIQUE)
+ok	CREATE TABLE r14p_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, code int UNIQUE)
 ok	SELECT setval('r8_1_id_seq', 20) AS "setval" /*overlite typed int8*/
 ok	INSERT INTO r8_1 (a) VALUES ('z') RETURNING id /*overlite typed*/
 ok	SELECT column_name FROM "information_schema.columns" WHERE table_name = 'r17_0' ORDER BY ordinal_position NULLS LAST /*overlite typed*/
@@ -3593,7 +3593,7 @@ ok	INSERT INTO r8n_1 (id, b) VALUES (9, 1) /*overlite typed*/
 ok	SELECT setval(pg_get_serial_sequence('"r8n_1"', 'id'), coalesce(max(id), 1), max(id) IS NOT NULL) AS "setval" FROM r8n_1 /*overlite typed int8*/
 no	statement kind
 ok	SELECT c.relname FROM pg_index AS i JOIN pg_class AS c ON c.oid = i.indexrelid WHERE i.indrelid = (SELECT oid FROM pg_class WHERE relname = 'r17_0' COLLATE NOCASE) ORDER BY 1 NULLS LAST /*overlite typed*/
-ok	CREATE TABLE r14_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "x" integer CONSTRAINT "r14_1_x_named" REFERENCES r14p_1(id) DEFERRABLE INITIALLY DEFERRED, y int REFERENCES r14p_1(code), CONSTRAINT "r14_1_tbl_fk" FOREIGN KEY (y) REFERENCES r14p_1(code) DEFERRABLE INITIALLY DEFERRED)
+ok	CREATE TABLE r14_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "x" integer CONSTRAINT "r14_1_x_named" REFERENCES r14p_1(id) DEFERRABLE INITIALLY DEFERRED, y int REFERENCES r14p_1(code), CONSTRAINT "r14_1_tbl_fk" FOREIGN KEY (y) REFERENCES r14p_1(code) DEFERRABLE INITIALLY DEFERRED)
 ok	SELECT count(*) AS "count" FROM r21c_0 /*overlite typed int8*/
 ok	INSERT INTO r8n_1 (b) VALUES (2) /*overlite typed*/
 ok	SELECT id FROM r8n_1 WHERE b = 2 /*overlite typed*/
@@ -3604,14 +3604,14 @@ no	statement kind
 ok	CREATE TABLE id1_t2 ("id" bigint NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY, a text)
 ok	SELECT a1.attname, c2.relname, a2.attname, con.confdeltype FROM pg_constraint AS con LEFT JOIN pg_class AS c1 ON con.conrelid = c1.oid LEFT JOIN pg_class AS c2 ON con.confrelid = c2.oid LEFT JOIN pg_attribute AS a1 ON c1.oid = a1.attrelid AND a1.attnum = CASE WHEN json_valid(con.conkey) THEN json_extract(con.conkey, '$[' || ((1)-1) || ']') END LEFT JOIN pg_attribute AS a2 ON c2.oid = a2.attrelid AND a2.attnum = CASE WHEN json_valid(con.confkey) THEN json_extract(con.confkey, '$[' || ((1)-1) || ']') END WHERE c1.relname = 'in1_s' AND con.contype = 'f' AND c1.relnamespace = c2.relnamespace AND pg_table_is_visible(c1.oid) /*overlite typed*/
 ok	SELECT CAST(d AS text) AS "d" FROM r17_0 /*overlite typed*/
-ok	CREATE TABLE r21a_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, v text)
+ok	CREATE TABLE r21a_1 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, v text)
 ok	INSERT INTO id1_t2 (a) VALUES ('x') RETURNING id /*overlite typed*/
 ok	ALTER TABLE r17_0 DROP COLUMN nope
-ok	CREATE TABLE r17p_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, k int UNIQUE)
+ok	CREATE TABLE r17p_1 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, k int UNIQUE)
 ok	SELECT s.relname AS "sequence_name", a.attname AS "colname" FROM pg_class AS s JOIN pg_depend AS d ON d.objid = s.oid AND d.classid = 1259 AND d.refclassid = 1259 JOIN pg_attribute AS a ON d.refobjid = a.attrelid AND d.refobjsubid = a.attnum JOIN pg_class AS tbl ON tbl.oid = d.refobjid AND tbl.relname = 'in1_p' AND pg_table_is_visible(tbl.oid) WHERE s.relkind = 'S' /*overlite typed*/
-ok	CREATE TABLE r17_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "flag" boolean NOT NULL, "q" integer NULL, "d" date NULL, "u" int UNIQUE, "f" int REFERENCES r17p_1(id), "g" int, "c" int, CONSTRAINT "r17_1_g_fk" FOREIGN KEY ("g") REFERENCES r17p_1(k), CONSTRAINT "r17_1_c_check" CHECK ("c" > 0 AND "c" < 100))
+ok	CREATE TABLE r17_1 ("id" INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "flag" boolean NOT NULL, "q" integer NULL, "d" date NULL, "u" int UNIQUE, "f" int REFERENCES r17p_1(id), "g" int, "c" int, CONSTRAINT "r17_1_g_fk" FOREIGN KEY ("g") REFERENCES r17p_1(k), CONSTRAINT "r17_1_c_check" CHECK ("c" > 0 AND "c" < 100))
 ok	ALTER TABLE "r14_1" ADD COLUMN "q_id" integer NULL
-ok	CREATE TABLE r21b_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, v text)
+ok	CREATE TABLE r21b_1 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, v text)
 ok	INSERT INTO id1_t2 (id, a) VALUES (10, 'y') /*overlite typed*/
 ok	INSERT INTO id1_t2 VALUES (10, 'y') /*overlite typed*/
 ok	INSERT INTO id1_t2 (id, a) VALUES (10, 'y') /*overlite typed*/
@@ -3636,7 +3636,7 @@ ok	SELECT conname, condeferrable, condeferred, (SELECT CASE _t WHEN 'f' THEN 'FO
 no	statement kind
 ok	SELECT table_name, column_name, is_identity, coalesce(identity_generation, '') AS "coalesce", data_type FROM "information_schema.columns" WHERE table_name IN ('id1_t1', 'id1_t2', 'id1_t3') AND column_name = 'id' ORDER BY 1 NULLS LAST /*overlite typed*/
 ok	INSERT INTO r17p_1 (k) VALUES (7) /*overlite typed*/
-ok	CREATE TABLE r21c_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, a_id int REFERENCES r21a_1(id))
+ok	CREATE TABLE r21c_1 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, a_id int REFERENCES r21a_1(id))
 ok	INSERT INTO r17_1 (flag, q, d, u, f, g, c) VALUES (true, 1, '2024-01-02', 5, 1, 7, 3) /*overlite typed*/
 ok	SELECT pg_get_serial_sequence('id1_t1', 'id') AS "pg_get_serial_sequence" /*overlite typed*/
 ok	INSERT INTO r21c_1 (a_id) VALUES (1) /*overlite typed*/
@@ -3669,7 +3669,7 @@ ok	ALTER TABLE id1_t1 ALTER COLUMN a DROP IDENTITY IF EXISTS
 ok	ALTER TABLE id1_t1 ALTER COLUMN id DROP IDENTITY
 ok	CREATE TABLE rk_0 (a int, b text, PRIMARY KEY (a, b))
 ok	ALTER TABLE "r14_1" DROP CONSTRAINT "r14_1_x_named"
-ok	CREATE TABLE rs_0 (id INTEGER PRIMARY KEY AUTOINCREMENT, n text)
+ok	CREATE TABLE rs_0 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, n text)
 ok	ALTER TABLE "r17_1" DROP COLUMN "u"
 ok	INSERT INTO id1_t1 (a) VALUES ('n') /*overlite typed*/
 ok	SELECT id FROM id1_t1 /*overlite typed*/
@@ -3711,7 +3711,7 @@ ok	SELECT overlite_cast(greatest(s, overlite_cast('2000-01-01', 'timestamp')), '
 ok	SELECT date_trunc('month', s) AS "date_trunc", date_trunc('year', dt) AS "date_trunc", date_trunc('day', tz) AS "date_trunc", date_trunc('hour', d) AS "date_trunc" FROM rg_0 WHERE id = 1 /*overlite typed*/
 ok	CREATE TABLE rg_1 (id int, s timestamp, e timestamp, d interval, tm time, dt date, tz timestamptz)
 ok	INSERT INTO id1_t4 (a) VALUES ('y') /*overlite typed*/
-ok	CREATE TABLE rs_1 (id INTEGER PRIMARY KEY AUTOINCREMENT, n text)
+ok	CREATE TABLE rs_1 (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, n text)
 ok	SELECT count(*) AS "count" FROM id1_t4 WHERE id IS NOT NULL /*overlite typed int8*/
 ok	ALTER TABLE id1_t3 ALTER COLUMN id DROP IDENTITY
 ok	CREATE TABLE ri_1 (id integer NOT NULL PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, n text)
@@ -10558,7 +10558,7 @@ ok	INSERT INTO t VALUES ('3033', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('3034', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('3035', 'x') /*overlite typed*/
 ok	CREATE TABLE dt (id int, d date, ts timestamp, tz timestamptz, du interval, s text, x text)
-ok	CREATE TABLE w (k INTEGER PRIMARY KEY AUTOINCREMENT, i int, s smallint, b bigint, t text)
+ok	CREATE TABLE w (k INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, i int, s smallint, b bigint, t text)
 ok	INSERT INTO dt VALUES (1, '2024-01-02', '2024-01-02 00:00:00', '2024-01-02 00:00:00+00', '1 day', 'word', 'wodr') /*overlite typed*/
 no	statement kind
 ok	SELECT count(*) AS "count" FROM dt WHERE tz < overlite_cast('2024-01-01 20:00', 'timestamp') /*overlite typed int8*/
@@ -10935,7 +10935,7 @@ ok	SELECT conname, (SELECT relname FROM pg_class WHERE oid = conrelid) AS "ontab
 ok	SELECT oid, (SELECT relname FROM pg_class WHERE oid = stxrelid) AS "stxrelid", CAST((SELECT nspname FROM pg_namespace WHERE oid = stxnamespace) AS text) AS "nsp", stxname, pg_get_statisticsobjdef_columns(oid) AS "columns", 'd' IN (SELECT value FROM json_each(overlite_array_json(stxkind))) AS "ndist_enabled", 'f' IN (SELECT value FROM json_each(overlite_array_json(stxkind))) AS "deps_enabled", 'm' IN (SELECT value FROM json_each(overlite_array_json(stxkind))) AS "mcv_enabled", stxstattarget FROM pg_statistic_ext WHERE stxrelid = '31' ORDER BY nsp NULLS LAST, stxname NULLS LAST /*overlite typed ,,,,,bool,bool,bool,*/
 ok	SELECT conname, (SELECT relname FROM pg_class WHERE oid = conrelid) AS "ontable", (SELECT CASE _t WHEN 'f' THEN 'FOREIGN KEY (' || _c || ') REFERENCES ' || _r WHEN 'p' THEN 'PRIMARY KEY (' || _c || ')' WHEN 'u' THEN 'UNIQUE (' || _c || ')' WHEN 'c' THEN 'CHECK (' || _c || ')' WHEN 'x' THEN _c ELSE '' END FROM (SELECT oid AS _o, contype AS _t, ov_cols AS _c, ov_ref AS _r FROM pg_constraint) WHERE _o = oid) AS "condef" FROM pg_constraint AS c WHERE confrelid IN (SELECT (SELECT NULL AS pg_partition_ancestors WHERE 0) UNION ALL VALUES (31)) AND contype = 'f' AND conparentid = 0 /*overlite typed*/
 ok	CREATE TABLE ag (g int, i int, b bigint, v text)
-ok	CREATE TABLE fp (k INTEGER PRIMARY KEY AUTOINCREMENT, i int, s smallint, d date, tz timestamptz, v text)
+ok	CREATE TABLE fp (k INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, i int, s smallint, d date, tz timestamptz, v text)
 ok	CREATE TABLE ag (g int, i int, b bigint, r real)
 ok	CREATE TABLE ar (id int PRIMARY KEY, a int[], t text[])
 ok	INSERT INTO ag VALUES (1, 1, 10, 'a b'), (1, 2, 20, 'c'), (2, 3, 30, NULL) /*overlite typed*/
@@ -11213,7 +11213,7 @@ ok	SELECT t.tgname, pg_get_triggerdef(t.oid, true) AS "pg_get_triggerdef", t.tge
 ok	CREATE TABLE n1 (id int PRIMARY KEY)
 ok	INSERT INTO n1 VALUES (1), (2) /*overlite typed*/
 ok	ALTER TABLE n1 ADD COLUMN n DECIMALTEXT(10,2) COLLATE DECIMAL UNIQUE
-ok	CREATE TABLE s1 (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, v text)
+ok	CREATE TABLE s1 (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, v text)
 ok	INSERT INTO s1 (v) VALUES ('a'), ('b'), ('c') /*overlite typed*/
 ok	CREATE TABLE d1 (a int DEFAULT (1 + 2), b text DEFAULT ('x' || 'y'))
 ok	DELETE FROM s1 WHERE id = 3 /*overlite typed*/
@@ -11225,11 +11225,11 @@ ok	INSERT INTO ts1 VALUES ('a', 1) /*overlite typed*/
 ok	SELECT a, b FROM d1 /*overlite typed*/
 ok	SELECT * FROM ts1 /*overlite typed*/
 ok	ALTER TABLE n1 ADD COLUMN m DECIMALTEXT(10,2) COLLATE DECIMAL DEFAULT ((CAST(overlite_numeric(round(1.234, 2)) AS DECIMALTEXT) COLLATE DECIMAL))
-ok	CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY AUTOINCREMENT, n DECIMALTEXT(10,2) COLLATE DECIMAL, c citext COLLATE NOCASE)
+ok	CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, n DECIMALTEXT(10,2) COLLATE DECIMAL, c citext COLLATE NOCASE)
 ok	INSERT INTO tt (n, c) VALUES (1.10, 'Abc') /*overlite typed*/
 ok	SELECT n FROM tt /*overlite typed*/
 ok	SELECT count(*) AS "count" FROM tt WHERE c = 'abc' /*overlite typed int8*/
-ok	CREATE TABLE ut (id INTEGER PRIMARY KEY AUTOINCREMENT, n DECIMALTEXT(10,2) COLLATE DECIMAL)
+ok	CREATE TABLE ut (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, n DECIMALTEXT(10,2) COLLATE DECIMAL)
 ok	INSERT INTO ut (n) VALUES (1.10) /*overlite typed*/
 ok	SELECT id, n FROM ut /*overlite typed*/
 ok	UPDATE n1 SET n = 1.10 WHERE id = 1 /*overlite typed*/
@@ -14573,17 +14573,17 @@ ok	INSERT INTO django_content_type (app_label, model) SELECT * FROM (SELECT json
 ok	SELECT 1 AS "a" FROM wagtailcore_site WHERE wagtailcore_site.hostname = 'localhost' LIMIT 1 /*overlite typed int4*/
 ok	SELECT wagtailcore_site.id, wagtailcore_site.hostname, wagtailcore_site.port, wagtailcore_site.site_name, wagtailcore_site.root_page_id, wagtailcore_site.is_default_site FROM wagtailcore_site WHERE wagtailcore_site.hostname = 'localhost' LIMIT 21 /*overlite typed*/
 ok	DELETE FROM base_sitesettings WHERE base_sitesettings.site_id IN (1) /*overlite typed*/
-ok	CREATE TABLE "django_migrations" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "app" varchar(255) NOT NULL, "name" varchar(255) NOT NULL, "applied" timestamp with time zone NOT NULL)
-ok	CREATE TABLE "django_content_type" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(100) NOT NULL, "app_label" varchar(100) NOT NULL, "model" varchar(100) NOT NULL)
+ok	CREATE TABLE "django_migrations" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "app" varchar(255) NOT NULL, "name" varchar(255) NOT NULL, "applied" timestamp with time zone NOT NULL)
+ok	CREATE TABLE "django_content_type" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(100) NOT NULL, "app_label" varchar(100) NOT NULL, "model" varchar(100) NOT NULL)
 ok	ALTER TABLE "django_content_type" ADD CONSTRAINT "django_content_type_app_label_model_76bd3d3b_uniq" UNIQUE ("app_label", "model")
 ok	INSERT INTO django_migrations (app, name, applied) VALUES ('contenttypes', '0001_initial', overlite_cast(overlite_tz_in('2026-11-07 16:03:20.147749+00:00'), 'timestamptz')) RETURNING django_migrations.id /*overlite typed*/
-ok	CREATE TABLE "auth_permission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(50) NOT NULL, "content_type_id" integer NOT NULL, "codename" varchar(100) NOT NULL)
-ok	CREATE TABLE "auth_group" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(80) NOT NULL UNIQUE)
-ok	CREATE TABLE "auth_group_permissions" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "group_id" integer NOT NULL, "permission_id" integer NOT NULL)
-ok	CREATE TABLE "auth_user" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "password" varchar(128) NOT NULL, "last_login" timestamp with time zone NOT NULL, "is_superuser" boolean NOT NULL, "username" varchar(30) NOT NULL UNIQUE, "first_name" varchar(30) NOT NULL, "last_name" varchar(30) NOT NULL, "email" varchar(75) NOT NULL, "is_staff" boolean NOT NULL, "is_active" boolean NOT NULL, "date_joined" timestamp with time zone NOT NULL)
+ok	CREATE TABLE "auth_permission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(50) NOT NULL, "content_type_id" integer NOT NULL, "codename" varchar(100) NOT NULL)
+ok	CREATE TABLE "auth_group" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(80) NOT NULL UNIQUE)
+ok	CREATE TABLE "auth_group_permissions" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "group_id" integer NOT NULL, "permission_id" integer NOT NULL)
+ok	CREATE TABLE "auth_user" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "password" varchar(128) NOT NULL, "last_login" timestamp with time zone NOT NULL, "is_superuser" boolean NOT NULL, "username" varchar(30) NOT NULL UNIQUE, "first_name" varchar(30) NOT NULL, "last_name" varchar(30) NOT NULL, "email" varchar(75) NOT NULL, "is_staff" boolean NOT NULL, "is_active" boolean NOT NULL, "date_joined" timestamp with time zone NOT NULL)
 ok	ALTER TABLE "auth_permission" ADD CONSTRAINT "auth_permission_content_type_id_2f476e4b_fk_django_co" FOREIGN KEY ("content_type_id") REFERENCES "django_content_type" ("id") DEFERRABLE INITIALLY DEFERRED
 ok	CREATE INDEX "auth_permission_content_type_id_2f476e4b" ON "auth_permission" ("content_type_id")
-ok	CREATE TABLE "django_admin_log" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "action_time" timestamp with time zone NOT NULL, "object_id" text NULL, "object_repr" varchar(200) NOT NULL, "action_flag" smallint NOT NULL CHECK ("action_flag" >= 0), "change_message" text NOT NULL, "content_type_id" integer NULL, "user_id" integer NOT NULL)
+ok	CREATE TABLE "django_admin_log" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "action_time" timestamp with time zone NOT NULL, "object_id" text NULL, "object_repr" varchar(200) NOT NULL, "action_flag" smallint NOT NULL CHECK ("action_flag" >= 0), "change_message" text NOT NULL, "content_type_id" integer NULL, "user_id" integer NOT NULL)
 ok	ALTER TABLE "django_content_type" ALTER COLUMN "name" DROP NOT NULL
 ok	SELECT oid FROM pg_class WHERE relname = 'django_content_type' AND relkind IN ('r', 'p', 'v', 'm', 'f') /*overlite typed*/
 ok	SELECT attnum, attname FROM pg_attribute WHERE attrelid = 69 /*overlite typed*/
@@ -14591,12 +14591,12 @@ ok	SELECT conname, contype, conkey, confkey, confrelid FROM pg_constraint WHERE 
 ok	SELECT c2.relname, i.indkey, i.indisunique, i.indisprimary, am.amname FROM pg_index AS i JOIN pg_class AS c2 ON c2.oid = i.indexrelid LEFT JOIN pg_am AS am ON am.oid = c2.relam WHERE i.indrelid = 69 /*overlite typed*/
 ok	ALTER TABLE "django_content_type" DROP COLUMN "name"
 ok	ALTER TABLE "auth_permission" ALTER COLUMN "name" TYPE varchar(255)
-ok	CREATE TABLE "wagtailcore_page" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "path" varchar(255) NOT NULL UNIQUE, "depth" integer NOT NULL CHECK ("depth" >= 0), "numchild" integer NOT NULL CHECK ("numchild" >= 0), "title" varchar(255) NOT NULL, "slug" varchar(255) NOT NULL, "live" boolean NOT NULL, "has_unpublished_changes" boolean NOT NULL, "url_path" text NOT NULL, "seo_title" varchar(255) NOT NULL, "show_in_menus" boolean NOT NULL, "search_description" text NOT NULL, "go_live_at" timestamp with time zone NULL, "expire_at" timestamp with time zone NULL, "expired" boolean NOT NULL, "content_type_id" integer NOT NULL, "owner_id" integer NULL, "locked" boolean NOT NULL, "latest_revision_created_at" timestamp with time zone NULL, "first_published_at" timestamp with time zone NULL)
+ok	CREATE TABLE "wagtailcore_page" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "path" varchar(255) NOT NULL UNIQUE, "depth" integer NOT NULL CHECK ("depth" >= 0), "numchild" integer NOT NULL CHECK ("numchild" >= 0), "title" varchar(255) NOT NULL, "slug" varchar(255) NOT NULL, "live" boolean NOT NULL, "has_unpublished_changes" boolean NOT NULL, "url_path" text NOT NULL, "seo_title" varchar(255) NOT NULL, "show_in_menus" boolean NOT NULL, "search_description" text NOT NULL, "go_live_at" timestamp with time zone NULL, "expire_at" timestamp with time zone NULL, "expired" boolean NOT NULL, "content_type_id" integer NOT NULL, "owner_id" integer NULL, "locked" boolean NOT NULL, "latest_revision_created_at" timestamp with time zone NULL, "first_published_at" timestamp with time zone NULL)
 ok	ALTER TABLE wagtailcore_page ALTER COLUMN path TYPE VARCHAR(255)
-ok	CREATE TABLE "wagtailcore_grouppagepermission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "permission_type" varchar(20) NOT NULL, "group_id" integer NOT NULL, "page_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailcore_pagerevision" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "submitted_for_moderation" boolean NOT NULL, "created_at" timestamp with time zone NOT NULL, "content_json" text NOT NULL, "approved_go_live_at" timestamp with time zone NULL, "page_id" integer NOT NULL, "user_id" integer NULL)
-ok	CREATE TABLE "wagtailcore_pageviewrestriction" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "password" varchar(255) NOT NULL, "page_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailcore_site" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "hostname" varchar(255) NOT NULL, "port" integer NOT NULL, "is_default_site" boolean NOT NULL, "root_page_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_grouppagepermission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "permission_type" varchar(20) NOT NULL, "group_id" integer NOT NULL, "page_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_pagerevision" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "submitted_for_moderation" boolean NOT NULL, "created_at" timestamp with time zone NOT NULL, "content_json" text NOT NULL, "approved_go_live_at" timestamp with time zone NULL, "page_id" integer NOT NULL, "user_id" integer NULL)
+ok	CREATE TABLE "wagtailcore_pageviewrestriction" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "password" varchar(255) NOT NULL, "page_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_site" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "hostname" varchar(255) NOT NULL, "port" integer NOT NULL, "is_default_site" boolean NOT NULL, "root_page_id" integer NOT NULL)
 ok	SELECT django_content_type.id, django_content_type.app_label, django_content_type.model FROM django_content_type WHERE django_content_type.app_label = 'wagtailcore' AND django_content_type.model = 'page' LIMIT 21 /*overlite typed*/
 no	statement kind
 ok	INSERT INTO django_content_type (app_label, model) VALUES ('wagtailcore', 'page') RETURNING django_content_type.id /*overlite typed*/
@@ -14604,29 +14604,29 @@ no	statement kind
 ok	SELECT wagtailcore_site.id, wagtailcore_site.hostname, wagtailcore_site.port, wagtailcore_site.is_default_site, wagtailcore_site.root_page_id FROM wagtailcore_site WHERE wagtailcore_site.hostname = 'localhost' AND wagtailcore_site.is_default_site AND wagtailcore_site.root_page_id = 2 LIMIT 21 /*overlite typed*/
 ok	INSERT INTO auth_group (name) VALUES ('Moderators') RETURNING auth_group.id /*overlite typed*/
 ok	ALTER TABLE "wagtailcore_site" ADD COLUMN "site_name" varchar(255) NULL
-ok	CREATE TABLE "wagtailcore_collection" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "path" varchar(255) NOT NULL UNIQUE, "depth" integer NOT NULL CHECK ("depth" >= 0), "numchild" integer NOT NULL CHECK ("numchild" >= 0), "name" varchar(255) NOT NULL)
-ok	CREATE TABLE "wagtailcore_groupcollectionpermission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "collection_id" integer NOT NULL, "group_id" integer NOT NULL, "permission_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_collection" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "path" varchar(255) NOT NULL UNIQUE, "depth" integer NOT NULL CHECK ("depth" >= 0), "numchild" integer NOT NULL CHECK ("numchild" >= 0), "name" varchar(255) NOT NULL)
+ok	CREATE TABLE "wagtailcore_groupcollectionpermission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "collection_id" integer NOT NULL, "group_id" integer NOT NULL, "permission_id" integer NOT NULL)
 ok	ALTER TABLE wagtailcore_collection ALTER COLUMN path TYPE VARCHAR(255)
 ok	ALTER TABLE "wagtailcore_pageviewrestriction" ADD COLUMN "restriction_type" varchar(20) DEFAULT 'password' NOT NULL
 ok	ALTER TABLE "wagtailcore_pageviewrestriction" ALTER COLUMN "restriction_type" DROP DEFAULT
 ok	ALTER TABLE "wagtailcore_page" ADD COLUMN "live_revision_id" integer NULL
 ok	ALTER TABLE "wagtailcore_page" ADD COLUMN "last_published_at" timestamp with time zone NULL
 ok	UPDATE wagtailcore_page SET last_published_at = wagtailcore_page.latest_revision_created_at WHERE NOT wagtailcore_page.has_unpublished_changes /*overlite typed*/
-ok	CREATE TABLE "wagtailcore_collectionviewrestriction" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "restriction_type" varchar(20) NOT NULL, "password" varchar(255) NOT NULL, "collection_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_collectionviewrestriction" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "restriction_type" varchar(20) NOT NULL, "password" varchar(255) NOT NULL, "collection_id" integer NOT NULL)
 ok	UPDATE wagtailcore_page SET draft_title = wagtailcore_page.title /*overlite typed*/
 ok	SELECT wagtailcore_grouppagepermission.id, wagtailcore_grouppagepermission.permission_type, wagtailcore_grouppagepermission.group_id, wagtailcore_grouppagepermission.page_id FROM wagtailcore_grouppagepermission WHERE wagtailcore_grouppagepermission.permission_type = 'lock' /*overlite typed*/
 ok	SELECT auth_group.id, auth_group.name FROM auth_group WHERE auth_group.id = 1 LIMIT 21 /*overlite typed*/
 ok	ALTER TABLE "wagtailcore_site" ALTER COLUMN "site_name" SET DEFAULT ''
 ok	UPDATE wagtailcore_site SET site_name = '' WHERE site_name IS NULL /*overlite typed*/
 ok	ALTER TABLE "wagtailcore_site" ALTER COLUMN "site_name" SET NOT NULL
-ok	CREATE TABLE "wagtailcore_task" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(255) NOT NULL, "active" boolean NOT NULL, "content_type_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailcore_taskstate" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "status" varchar(50) NOT NULL, "started_at" timestamp with time zone NOT NULL, "finished_at" timestamp with time zone NULL, "content_type_id" integer NOT NULL, "page_revision_id" integer NOT NULL, "task_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailcore_workflow" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(255) NOT NULL, "active" boolean NOT NULL)
+ok	CREATE TABLE "wagtailcore_task" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(255) NOT NULL, "active" boolean NOT NULL, "content_type_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_taskstate" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "status" varchar(50) NOT NULL, "started_at" timestamp with time zone NOT NULL, "finished_at" timestamp with time zone NULL, "content_type_id" integer NOT NULL, "page_revision_id" integer NOT NULL, "task_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_workflow" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(255) NOT NULL, "active" boolean NOT NULL)
 ok	CREATE TABLE "wagtailcore_groupapprovaltask" ("task_ptr_id" integer NOT NULL PRIMARY KEY)
-ok	CREATE TABLE "wagtailcore_workflowstate" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "status" varchar(50) NOT NULL, "created_at" timestamp with time zone NOT NULL, "current_task_state_id" integer NULL UNIQUE, "page_id" integer NOT NULL, "requested_by_id" integer NULL, "workflow_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_workflowstate" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "status" varchar(50) NOT NULL, "created_at" timestamp with time zone NOT NULL, "current_task_state_id" integer NULL UNIQUE, "page_id" integer NOT NULL, "requested_by_id" integer NULL, "workflow_id" integer NOT NULL)
 ok	CREATE TABLE "wagtailcore_workflowpage" ("page_id" integer NOT NULL PRIMARY KEY, "workflow_id" integer NOT NULL)
 ok	ALTER TABLE "wagtailcore_taskstate" ADD COLUMN "workflow_state_id" integer NOT NULL
-ok	CREATE TABLE "wagtailcore_workflowtask" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "sort_order" integer NULL, "task_id" integer NOT NULL, "workflow_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_workflowtask" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "sort_order" integer NULL, "task_id" integer NOT NULL, "workflow_id" integer NOT NULL)
 ok	CREATE UNIQUE INDEX "unique_in_progress_workflow" ON "wagtailcore_workflowstate" ("page_id") WHERE "status" = 'in_progress'
 ok	SELECT count(*) AS "count" FROM (SELECT DISTINCT auth_group.id AS "col1", auth_group.name AS "col2" FROM auth_group JOIN wagtailcore_grouppagepermission ON auth_group.id = overlite_cast(wagtailcore_grouppagepermission.group_id, 'integer') WHERE wagtailcore_grouppagepermission.id IN (SELECT v0.id FROM wagtailcore_grouppagepermission AS v0 WHERE v0.permission_type = 'publish' AND v0.page_id IN (SELECT u0.id FROM wagtailcore_page AS u0 WHERE u0.path IN ('0001'))) OR wagtailcore_grouppagepermission.id = 3) AS subquery /*overlite typed int8*/
 ok	SELECT wagtailcore_task.id, wagtailcore_task.name, wagtailcore_task.active, wagtailcore_task.content_type_id, wagtailcore_groupapprovaltask.task_ptr_id, count(wagtailcore_groupapprovaltask_groups.group_id) AS "count" FROM wagtailcore_groupapprovaltask JOIN wagtailcore_groupapprovaltask_groups ON wagtailcore_groupapprovaltask.task_ptr_id = wagtailcore_groupapprovaltask_groups.groupapprovaltask_id JOIN wagtailcore_task ON wagtailcore_groupapprovaltask.task_ptr_id = overlite_cast(wagtailcore_task.id, 'integer') WHERE wagtailcore_groupapprovaltask_groups.group_id IN (SELECT DISTINCT w0.id FROM auth_group AS w0 JOIN wagtailcore_grouppagepermission AS w1 ON w0.id = overlite_cast(w1.group_id, 'integer') WHERE w1.id IN (SELECT v0.id FROM wagtailcore_grouppagepermission AS v0 WHERE v0.permission_type = 'publish' AND v0.page_id IN (SELECT u0.id FROM wagtailcore_page AS u0 WHERE u0.path IN ('0001'))) OR w1.id = 3) AND wagtailcore_task.active GROUP BY wagtailcore_task.id, wagtailcore_groupapprovaltask.task_ptr_id HAVING count(wagtailcore_groupapprovaltask_groups.group_id) = 1 ORDER BY wagtailcore_groupapprovaltask.task_ptr_id ASC NULLS LAST LIMIT 1 /*overlite typed ,,,,,int8*/
@@ -14640,7 +14640,7 @@ ok	INSERT INTO wagtailcore_workflowpage (page_id, workflow_id) VALUES (1, 1) /*o
 ok	DROP INDEX IF EXISTS unique_in_progress_workflow
 ok	CREATE UNIQUE INDEX "unique_in_progress_workflow" ON "wagtailcore_workflowstate" ("page_id") WHERE "status" IN ('in_progress', 'needs_changes')
 ok	ALTER TABLE "wagtailcore_taskstate" ADD COLUMN "comment" text DEFAULT '' NOT NULL
-ok	CREATE TABLE "wagtailcore_pagelogentry" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "label" text NOT NULL, "action" varchar(255) NOT NULL, "data_json" text NOT NULL, "timestamp" timestamp with time zone NOT NULL, "content_changed" boolean NOT NULL, "deleted" boolean NOT NULL, "content_type_id" integer NULL, "page_id" integer NOT NULL, "revision_id" integer NULL, "user_id" integer NULL)
+ok	CREATE TABLE "wagtailcore_pagelogentry" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "label" text NOT NULL, "action" varchar(255) NOT NULL, "data_json" text NOT NULL, "timestamp" timestamp with time zone NOT NULL, "content_changed" boolean NOT NULL, "deleted" boolean NOT NULL, "content_type_id" integer NULL, "page_id" integer NOT NULL, "revision_id" integer NULL, "user_id" integer NULL)
 ok	ALTER TABLE "wagtailcore_page" ADD COLUMN "translation_key" uuid NULL
 ok	SELECT wagtailcore_page.id, wagtailcore_page.path, wagtailcore_page.depth, wagtailcore_page.numchild, wagtailcore_page.title, wagtailcore_page.slug, wagtailcore_page.live, wagtailcore_page.has_unpublished_changes, wagtailcore_page.url_path, wagtailcore_page.seo_title, wagtailcore_page.show_in_menus, wagtailcore_page.search_description, wagtailcore_page.go_live_at, wagtailcore_page.expire_at, wagtailcore_page.expired, wagtailcore_page.content_type_id, wagtailcore_page.owner_id, wagtailcore_page.locked, wagtailcore_page.latest_revision_created_at, wagtailcore_page.first_published_at, wagtailcore_page.live_revision_id, wagtailcore_page.last_published_at, wagtailcore_page.draft_title, wagtailcore_page.locked_at, wagtailcore_page.locked_by_id, wagtailcore_page.translation_key, wagtailcore_page.locale_id FROM wagtailcore_page WHERE wagtailcore_page.translation_key IS NULL /*overlite typed*/
 ok	UPDATE wagtailcore_page SET translation_key = overlite_cast('37fa07c7cf0c41ebb52f5f884334b9fd', 'uuid'), locale_id = 1 WHERE wagtailcore_page.id = 1 /*overlite typed*/
@@ -14793,10 +14793,10 @@ ok	UPDATE wagtailcore_page SET translation_key = overlite_cast('6656dc4ca54645cf
 ok	UPDATE wagtailcore_collection SET depth = length(wagtailcore_collection.path) / 4 WHERE NOT wagtailcore_collection.depth = length(wagtailcore_collection.path) / 4 /*overlite typed*/
 ok	UPDATE wagtailcore_collection SET numchild = (SELECT count(u0.id) AS "count" FROM wagtailcore_collection AS u0 WHERE CAST(u0.path AS text) GLOB overlite_like_glob(replace(replace(replace(wagtailcore_collection.path, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%', '\\') AND length(u0.path) = length(wagtailcore_collection.path) + 4) WHERE NOT wagtailcore_collection.numchild = (SELECT count(u0.id) AS "count" FROM wagtailcore_collection AS u0 WHERE CAST(u0.path AS text) GLOB overlite_like_glob(replace(replace(replace(wagtailcore_collection.path, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%', '\\') AND length(u0.path) = length(wagtailcore_collection.path) + 4) /*overlite typed*/
 ok	SELECT wagtailcore_collection.id AS "pk", wagtailcore_collection.path AS "path", wagtailcore_collection.depth AS "depth", wagtailcore_collection.numchild AS "numchild" FROM wagtailcore_collection WHERE wagtailcore_collection.depth = 1 AND CAST(wagtailcore_collection.path AS text) GLOB overlite_like_glob('%', '\\') ORDER BY wagtailcore_collection.name ASC NULLS LAST /*overlite typed*/
-ok	CREATE TABLE "wagtailcore_comment" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "text" text NOT NULL, "contentpath" text NOT NULL, "position" text NOT NULL, "created_at" timestamp with time zone NOT NULL, "updated_at" timestamp with time zone NOT NULL, "resolved_at" timestamp with time zone NULL, "page_id" integer NOT NULL, "resolved_by_id" integer NULL, "revision_created_id" integer NULL, "user_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailcore_commentreply" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "text" text NOT NULL, "created_at" timestamp with time zone NOT NULL, "updated_at" timestamp with time zone NOT NULL, "comment_id" integer NOT NULL, "user_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailcore_pagesubscription" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "comment_notifications" boolean NOT NULL, "page_id" integer NOT NULL, "user_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailcore_modellogentry" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "label" text NOT NULL, "action" varchar(255) NOT NULL, "data_json" text NOT NULL, "timestamp" timestamp with time zone NOT NULL, "content_changed" boolean NOT NULL, "deleted" boolean NOT NULL, "object_id" varchar(255) NOT NULL, "content_type_id" integer NULL, "user_id" integer NULL)
+ok	CREATE TABLE "wagtailcore_comment" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "text" text NOT NULL, "contentpath" text NOT NULL, "position" text NOT NULL, "created_at" timestamp with time zone NOT NULL, "updated_at" timestamp with time zone NOT NULL, "resolved_at" timestamp with time zone NULL, "page_id" integer NOT NULL, "resolved_by_id" integer NULL, "revision_created_id" integer NULL, "user_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_commentreply" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "text" text NOT NULL, "created_at" timestamp with time zone NOT NULL, "updated_at" timestamp with time zone NOT NULL, "comment_id" integer NOT NULL, "user_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_pagesubscription" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "comment_notifications" boolean NOT NULL, "page_id" integer NOT NULL, "user_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_modellogentry" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "label" text NOT NULL, "action" varchar(255) NOT NULL, "data_json" text NOT NULL, "timestamp" timestamp with time zone NOT NULL, "content_changed" boolean NOT NULL, "deleted" boolean NOT NULL, "object_id" varchar(255) NOT NULL, "content_type_id" integer NULL, "user_id" integer NULL)
 ok	SELECT auth_group.id AS "id", auth_group.name AS "name", auth_group_permissions.permission_id AS "permissions__id", auth_permission.codename AS "permissions__codename" FROM auth_group JOIN auth_group_permissions ON auth_group.id = overlite_cast(auth_group_permissions.group_id, 'integer') JOIN auth_permission ON auth_group_permissions.permission_id = overlite_cast(auth_permission.id, 'integer') JOIN django_content_type ON auth_permission.content_type_id = overlite_cast(django_content_type.id, 'integer') WHERE auth_permission.codename IN ('add_collection', 'change_collection', 'delete_collection') AND django_content_type.app_label = 'wagtailcore' AND django_content_type.model = 'collection' /*overlite typed*/
 ok	SELECT auth_permission.id, auth_permission.name, auth_permission.content_type_id, auth_permission.codename FROM auth_permission JOIN django_content_type ON auth_permission.content_type_id = overlite_cast(django_content_type.id, 'integer') WHERE auth_permission.codename IN ('add_collection', 'change_collection', 'delete_collection') AND django_content_type.app_label = 'wagtailcore' AND django_content_type.model = 'collection' ORDER BY django_content_type.app_label ASC NULLS LAST, django_content_type.model ASC NULLS LAST, auth_permission.codename ASC NULLS LAST /*overlite typed*/
 ok	ALTER TABLE "wagtailcore_pagerevision" ALTER COLUMN "content_json" TYPE jsonb USING CAST(content_json AS jsonb)
@@ -14808,42 +14808,42 @@ ok	CREATE INDEX "content_object_idx" ON "wagtailcore_revision" ("content_type_id
 ok	UPDATE wagtailcore_revision SET base_content_type_id = 1, content_type_id = overlite_cast(wagtailcore_revision.content ->> 'content_type', 'integer') /*overlite typed*/
 ok	UPDATE wagtailcore_page SET latest_revision_id = (SELECT u0.id AS "pk" FROM wagtailcore_revision AS u0 WHERE u0.content_type_id = wagtailcore_page.content_type_id AND u0.object_id = overlite_cast(wagtailcore_page.id, 'varchar') ORDER BY u0.created_at DESC NULLS FIRST, u0.id DESC NULLS FIRST LIMIT 1) /*overlite typed*/
 ok	UPDATE wagtailcore_revision SET object_str = (wagtailcore_revision.content -> 'title') COLLATE JSONB /*overlite typed*/
-ok	CREATE TABLE "wagtailcore_referenceindex" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "object_id" varchar(255) NOT NULL, "to_object_id" varchar(255) NOT NULL, "model_path" text NOT NULL, "content_path" text NOT NULL, "content_path_hash" uuid NOT NULL, "base_content_type_id" integer NOT NULL, "content_type_id" integer NOT NULL, "to_content_type_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_referenceindex" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "object_id" varchar(255) NOT NULL, "to_object_id" varchar(255) NOT NULL, "model_path" text NOT NULL, "content_path" text NOT NULL, "content_path_hash" uuid NOT NULL, "base_content_type_id" integer NOT NULL, "content_type_id" integer NOT NULL, "to_content_type_id" integer NOT NULL)
 ok	CREATE UNIQUE INDEX "unique_in_progress_workflow" ON "wagtailcore_workflowstate" ("base_content_type_id", "object_id") WHERE "status" IN ('in_progress', 'needs_changes')
 ok	UPDATE wagtailcore_workflowstate SET base_content_type_id = 1, content_type_id = (SELECT u0.content_type_id AS "content_type_id" FROM wagtailcore_page AS u0 WHERE u0.id = overlite_cast(wagtailcore_workflowstate.object_id, 'integer')) /*overlite typed*/
 ok	UPDATE wagtailcore_grouppagepermission SET permission_id = (SELECT u0.id AS "pk" FROM auth_permission AS u0 JOIN django_content_type AS u1 ON u0.content_type_id = overlite_cast(u1.id, 'integer') WHERE u0.codename = coalesce(CASE WHEN wagtailcore_grouppagepermission.permission_type = 'edit' THEN 'change' ELSE wagtailcore_grouppagepermission.permission_type END, '') || coalesce('_page', '') AND u0.content_type_id = 1 ORDER BY u1.app_label ASC NULLS LAST, u1.model ASC NULLS LAST, u0.codename ASC NULLS LAST LIMIT 1), permission_type = CASE WHEN wagtailcore_grouppagepermission.permission_type = 'edit' THEN 'change' ELSE wagtailcore_grouppagepermission.permission_type END WHERE wagtailcore_grouppagepermission.permission_id IS NULL OR wagtailcore_grouppagepermission.permission_type = 'edit' /*overlite typed*/
 ok	ALTER TABLE "wagtailcore_grouppagepermission" ADD CONSTRAINT "permission_or_permission_type_not_null" CHECK (permission_id IS NOT NULL OR permission_type IS NOT NULL)
 ok	SELECT wagtailcore_modellogentry.id, wagtailcore_modellogentry.data FROM wagtailcore_modellogentry WHERE wagtailcore_modellogentry."action" IN ('wagtail.revert', 'wagtail.rename', 'wagtail.publish') ORDER BY wagtailcore_modellogentry.timestamp DESC NULLS FIRST, wagtailcore_modellogentry.id DESC NULLS FIRST /*overlite typed*/
 ok	UPDATE wagtailcore_modellogentry SET data = (overlite_cast('{}', 'jsonb') COLLATE JSONB) WHERE wagtailcore_modellogentry.data = (overlite_cast('null', 'jsonb') COLLATE JSONB) /*overlite typed*/
-ok	CREATE TABLE "wagtailcore_uploadedfile" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "file" varchar(200) NOT NULL, "for_content_type_id" integer NULL, "uploaded_by_user_id" integer NULL)
-ok	CREATE TABLE "taggit_tag" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(100) NOT NULL UNIQUE, "slug" varchar(100) NOT NULL UNIQUE)
-ok	CREATE TABLE "wagtailimages_image" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "title" varchar(255) NOT NULL, "file" varchar(100) NOT NULL, "width" integer NOT NULL, "height" integer NOT NULL, "created_at" timestamp with time zone NOT NULL, "focal_point_x" integer NULL CHECK ("focal_point_x" >= 0), "focal_point_y" integer NULL CHECK ("focal_point_y" >= 0), "focal_point_width" integer NULL CHECK ("focal_point_width" >= 0), "focal_point_height" integer NULL CHECK ("focal_point_height" >= 0), "uploaded_by_user_id" integer NULL, "file_size" integer NULL CHECK ("file_size" >= 0), "collection_id" integer NOT NULL, "file_hash" varchar(40) NOT NULL)
-ok	CREATE TABLE "wagtailimages_rendition" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "file" varchar(100) NOT NULL, "width" integer NOT NULL, "height" integer NOT NULL, "focal_point_key" varchar(16) NOT NULL, "filter_spec" varchar(255) NOT NULL, "image_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailcore_uploadedfile" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "file" varchar(200) NOT NULL, "for_content_type_id" integer NULL, "uploaded_by_user_id" integer NULL)
+ok	CREATE TABLE "taggit_tag" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(100) NOT NULL UNIQUE, "slug" varchar(100) NOT NULL UNIQUE)
+ok	CREATE TABLE "wagtailimages_image" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "title" varchar(255) NOT NULL, "file" varchar(100) NOT NULL, "width" integer NOT NULL, "height" integer NOT NULL, "created_at" timestamp with time zone NOT NULL, "focal_point_x" integer NULL CHECK ("focal_point_x" >= 0), "focal_point_y" integer NULL CHECK ("focal_point_y" >= 0), "focal_point_width" integer NULL CHECK ("focal_point_width" >= 0), "focal_point_height" integer NULL CHECK ("focal_point_height" >= 0), "uploaded_by_user_id" integer NULL, "file_size" integer NULL CHECK ("file_size" >= 0), "collection_id" integer NOT NULL, "file_hash" varchar(40) NOT NULL)
+ok	CREATE TABLE "wagtailimages_rendition" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "file" varchar(100) NOT NULL, "width" integer NOT NULL, "height" integer NOT NULL, "focal_point_key" varchar(16) NOT NULL, "filter_spec" varchar(255) NOT NULL, "image_id" integer NOT NULL)
 ok	SELECT auth_permission.id, auth_permission.name, auth_permission.content_type_id, auth_permission.codename FROM auth_permission JOIN django_content_type ON auth_permission.content_type_id = overlite_cast(django_content_type.id, 'integer') WHERE auth_permission.codename IN ('add_image', 'change_image') AND auth_permission.content_type_id = 27 ORDER BY django_content_type.app_label ASC NULLS LAST, django_content_type.model ASC NULLS LAST, auth_permission.codename ASC NULLS LAST /*overlite typed*/
 ok	SELECT auth_group.id, auth_group.name FROM auth_group JOIN auth_group_permissions ON auth_group.id = overlite_cast(auth_group_permissions.group_id, 'integer') WHERE auth_group_permissions.permission_id = 109 /*overlite typed*/
-ok	CREATE TABLE "wagtailimages_uploadedimage" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "file" varchar(200) NOT NULL, "uploaded_by_user_id" integer NULL)
+ok	CREATE TABLE "wagtailimages_uploadedimage" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "file" varchar(200) NOT NULL, "uploaded_by_user_id" integer NULL)
 ok	SELECT auth_permission.id, auth_permission.name, auth_permission.content_type_id, auth_permission.codename FROM auth_permission WHERE auth_permission.codename = 'access_admin' AND auth_permission.content_type_id = 28 AND auth_permission.name = 'Can access Wagtail admin' LIMIT 21 /*overlite typed*/
 ok	SELECT auth_group.id, auth_group.name FROM auth_group JOIN auth_group_permissions ON auth_group.id = overlite_cast(auth_group_permissions.group_id, 'integer') JOIN auth_permission ON auth_group_permissions.permission_id = overlite_cast(auth_permission.id, 'integer') WHERE auth_permission.codename = 'access_admin' /*overlite typed*/
 ok	SELECT auth_permission.id, auth_permission.name, auth_permission.content_type_id, auth_permission.codename FROM auth_permission JOIN django_content_type ON auth_permission.content_type_id = overlite_cast(django_content_type.id, 'integer') WHERE auth_permission.codename IN ('choose_image') AND auth_permission.content_type_id = 27 ORDER BY django_content_type.app_label ASC NULLS LAST, django_content_type.model ASC NULLS LAST, auth_permission.codename ASC NULLS LAST LIMIT 1 /*overlite typed*/
-ok	CREATE TABLE "base_footertext" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "body" text NOT NULL)
-ok	CREATE TABLE "base_formfield" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "sort_order" integer NULL, "label" varchar(255) NOT NULL, "field_type" varchar(16) NOT NULL, "required" boolean NOT NULL, "choices" text NOT NULL, "default_value" varchar(255) NOT NULL, "help_text" varchar(255) NOT NULL)
+ok	CREATE TABLE "base_footertext" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "body" text NOT NULL)
+ok	CREATE TABLE "base_formfield" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "sort_order" integer NULL, "label" varchar(255) NOT NULL, "field_type" varchar(16) NOT NULL, "required" boolean NOT NULL, "choices" text NOT NULL, "default_value" varchar(255) NOT NULL, "help_text" varchar(255) NOT NULL)
 ok	CREATE TABLE "base_formpage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "to_address" varchar(255) NOT NULL, "from_address" varchar(255) NOT NULL, "subject" varchar(255) NOT NULL, "body" jsonb NOT NULL, "thank_you_text" text NOT NULL, "image_id" integer NULL)
 ok	CREATE TABLE "base_gallerypage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "introduction" text NOT NULL, "body" jsonb NOT NULL, "collection_id" integer NULL, "image_id" integer NULL)
 ok	CREATE TABLE "base_homepage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "hero_text" varchar(255) NOT NULL, "hero_cta" varchar(255) NOT NULL, "body" jsonb NOT NULL, "promo_title" varchar(255) NULL, "promo_text" text NULL, "featured_section_1_title" varchar(255) NULL, "featured_section_2_title" varchar(255) NULL, "featured_section_3_title" varchar(255) NULL)
-ok	CREATE TABLE "base_people" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "first_name" varchar(254) NOT NULL, "last_name" varchar(254) NOT NULL, "job_title" varchar(254) NOT NULL, "image_id" integer NULL)
+ok	CREATE TABLE "base_people" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "first_name" varchar(254) NOT NULL, "last_name" varchar(254) NOT NULL, "job_title" varchar(254) NOT NULL, "image_id" integer NULL)
 ok	CREATE TABLE "base_standardpage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "introduction" text NOT NULL, "body" jsonb NOT NULL, "image_id" integer NULL)
 ok	CREATE TABLE "blog_blogpage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "introduction" text NOT NULL, "body" jsonb NOT NULL, "subtitle" varchar(255) NOT NULL, "date_published" date NULL, "image_id" integer NULL)
 ok	ALTER TABLE "base_formfield" ALTER COLUMN "default_value" TYPE text USING CAST(default_value AS text)
 ok	ALTER TABLE "base_footertext" ADD COLUMN "expired" boolean DEFAULT false NOT NULL
 ok	ALTER TABLE "base_footertext" ADD COLUMN "live" boolean DEFAULT true NOT NULL
-ok	CREATE TABLE "base_sitesettings" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "title_suffix" varchar(255) NOT NULL, "site_id" integer NOT NULL UNIQUE)
+ok	CREATE TABLE "base_sitesettings" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "title_suffix" varchar(255) NOT NULL, "site_id" integer NOT NULL UNIQUE)
 ok	CREATE TABLE "base_userapprovaltask" ("task_ptr_id" integer NOT NULL PRIMARY KEY, "user_id" integer NULL)
-ok	CREATE TABLE "breads_breadingredient" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(255) NOT NULL)
+ok	CREATE TABLE "breads_breadingredient" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(255) NOT NULL)
 ok	CREATE TABLE "breads_breadpage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "introduction" text NOT NULL, "body" jsonb NOT NULL)
-ok	CREATE TABLE "locations_locationoperatinghours" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "sort_order" integer NULL, "day" varchar(4) NOT NULL, "opening_time" time NULL, "closing_time" time NULL, "closed" boolean NOT NULL)
+ok	CREATE TABLE "locations_locationoperatinghours" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "sort_order" integer NULL, "day" varchar(4) NOT NULL, "opening_time" time NULL, "closing_time" time NULL, "closed" boolean NOT NULL)
 ok	CREATE TABLE "locations_locationpage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "introduction" text NOT NULL, "body" jsonb NOT NULL, "address" text NOT NULL, "lat_long" varchar(36) NOT NULL, "image_id" integer NULL)
-ok	CREATE TABLE "locations_locationoperatingday" ("custom_id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "sort_order" integer NULL, "day" varchar(3) NOT NULL, "closed" boolean NOT NULL, "location_id" integer NOT NULL)
-ok	CREATE TABLE "locations_locationoperatingtimeslot" ("sort_order" integer NULL, "custom_id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "opening_time" time NOT NULL, "closing_time" time NOT NULL, "day_id" integer NOT NULL)
+ok	CREATE TABLE "locations_locationoperatingday" ("custom_id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "sort_order" integer NULL, "day" varchar(3) NOT NULL, "closed" boolean NOT NULL, "location_id" integer NOT NULL)
+ok	CREATE TABLE "locations_locationoperatingtimeslot" ("sort_order" integer NULL, "custom_id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "opening_time" time NOT NULL, "closing_time" time NOT NULL, "day_id" integer NOT NULL)
 ok	SELECT wagtailcore_revision.id, wagtailcore_revision.created_at, wagtailcore_revision.approved_go_live_at, wagtailcore_revision.user_id, wagtailcore_revision.content, wagtailcore_revision.object_id, wagtailcore_revision.content_type_id, wagtailcore_revision.base_content_type_id, wagtailcore_revision.object_str FROM wagtailcore_revision WHERE wagtailcore_revision.content_type_id IN (SELECT u0.id FROM django_content_type AS u0 WHERE u0.app_label = 'locations' AND u0.model = 'locationpage') /*overlite typed*/
 ok	DROP TABLE locations_locationoperatinghours
 ok	CREATE TABLE "people_peopleindexpage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "introduction" text NOT NULL, "image_id" integer NULL)
@@ -14851,28 +14851,28 @@ ok	ALTER TABLE "people_personpage" ADD COLUMN "social_links" jsonb DEFAULT '""' 
 ok	CREATE TABLE "recipes_recipeindexpage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "introduction" text NOT NULL)
 ok	CREATE TABLE "recipes_recipepage" ("page_ptr_id" integer NOT NULL PRIMARY KEY, "date_published" date NULL, "subtitle" varchar(255) NOT NULL, "introduction" text NOT NULL, "backstory" jsonb NOT NULL, "recipe_headline" text NOT NULL, "body" jsonb NOT NULL)
 ok	CREATE TABLE "django_session" ("session_key" varchar(40) NOT NULL PRIMARY KEY, "session_data" text NOT NULL, "expire_date" timestamp with time zone NOT NULL)
-ok	CREATE TABLE "simple_translation_simpletranslation" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT)
-ok	CREATE TABLE "wagtailadmin_editingsession" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "object_id" varchar(255) NOT NULL, "last_seen_at" timestamp with time zone NOT NULL, "content_type_id" integer NOT NULL, "user_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailadmin_formstate" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "data" text NOT NULL, "object_id" varchar(255) NOT NULL, "parent_object_id" varchar(255) NOT NULL, "last_updated_at" timestamp with time zone NOT NULL, "content_type_id" integer NOT NULL, "user_id" integer NOT NULL)
+ok	CREATE TABLE "simple_translation_simpletranslation" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/)
+ok	CREATE TABLE "wagtailadmin_editingsession" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "object_id" varchar(255) NOT NULL, "last_seen_at" timestamp with time zone NOT NULL, "content_type_id" integer NOT NULL, "user_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailadmin_formstate" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "data" text NOT NULL, "object_id" varchar(255) NOT NULL, "parent_object_id" varchar(255) NOT NULL, "last_updated_at" timestamp with time zone NOT NULL, "content_type_id" integer NOT NULL, "user_id" integer NOT NULL)
 ok	CREATE INDEX "wagtailcore_uuid_d6363b_idx" ON "wagtailcore_modellogentry" ("uuid", "action", "timestamp" DESC)
-ok	CREATE TABLE "wagtailcore_apitoken" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "name" varchar(255) NOT NULL, "key_hash" varchar(64) NOT NULL UNIQUE, "prefix" varchar(16) NOT NULL, "created" timestamp with time zone NOT NULL, "revoked_at" timestamp with time zone NULL, "last_used_at" timestamp with time zone NULL, "user_id" integer NOT NULL)
-ok	CREATE TABLE "wagtaildocs_document" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "title" varchar(255) NOT NULL, "file" varchar(100) NOT NULL, "created_at" timestamp with time zone NOT NULL, "uploaded_by_user_id" integer NULL)
+ok	CREATE TABLE "wagtailcore_apitoken" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "name" varchar(255) NOT NULL, "key_hash" varchar(64) NOT NULL UNIQUE, "prefix" varchar(16) NOT NULL, "created" timestamp with time zone NOT NULL, "revoked_at" timestamp with time zone NULL, "last_used_at" timestamp with time zone NULL, "user_id" integer NOT NULL)
+ok	CREATE TABLE "wagtaildocs_document" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "title" varchar(255) NOT NULL, "file" varchar(100) NOT NULL, "created_at" timestamp with time zone NOT NULL, "uploaded_by_user_id" integer NULL)
 ok	ALTER TABLE "wagtaildocs_document" ADD COLUMN "collection_id" integer DEFAULT 1 NOT NULL CONSTRAINT "wagtaildocs_document_collection_id_23881625_fk_wagtailco" REFERENCES "wagtailcore_collection"("id") DEFERRABLE INITIALLY DEFERRED
 ok	ALTER TABLE "wagtaildocs_document" ADD COLUMN "file_size" integer NULL CHECK ("file_size" >= 0)
 ok	ALTER TABLE "wagtaildocs_document" ALTER COLUMN "file_size" TYPE bigint USING CAST(file_size AS bigint)
-ok	CREATE TABLE "wagtailembeds_embed" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "url" varchar(200) NOT NULL, "max_width" smallint NULL, "type" varchar(10) NOT NULL, "html" text NOT NULL, "title" text NOT NULL, "author_name" text NOT NULL, "provider_name" text NOT NULL, "thumbnail_url" varchar(200) NULL, "width" integer NULL, "height" integer NULL, "last_updated" timestamp with time zone NOT NULL)
+ok	CREATE TABLE "wagtailembeds_embed" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "url" varchar(200) NOT NULL, "max_width" smallint NULL, "type" varchar(10) NOT NULL, "html" text NOT NULL, "title" text NOT NULL, "author_name" text NOT NULL, "provider_name" text NOT NULL, "thumbnail_url" varchar(200) NULL, "width" integer NULL, "height" integer NULL, "last_updated" timestamp with time zone NOT NULL)
 ok	SELECT wagtailembeds_embed.hash AS "hash", count(wagtailembeds_embed.id) AS "hash_count", min(wagtailembeds_embed.id) AS "min_id" FROM wagtailembeds_embed GROUP BY 1 HAVING count(wagtailembeds_embed.id) > 1 /*overlite typed ,int8,*/
 ok	ALTER TABLE "wagtailembeds_embed" ADD CONSTRAINT "wagtailembeds_embed_hash_c9bd8c9a_uniq" UNIQUE ("hash")
-ok	CREATE TABLE "wagtailforms_formsubmission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "form_data" text NOT NULL, "submit_time" timestamp with time zone NOT NULL, "page_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailredirects_redirect" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "old_path" varchar(255) NOT NULL UNIQUE, "is_permanent" boolean NOT NULL, "redirect_link" varchar(200) NOT NULL, "redirect_page_id" integer NULL, "site_id" integer NULL)
+ok	CREATE TABLE "wagtailforms_formsubmission" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "form_data" text NOT NULL, "submit_time" timestamp with time zone NOT NULL, "page_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailredirects_redirect" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "old_path" varchar(255) NOT NULL UNIQUE, "is_permanent" boolean NOT NULL, "redirect_link" varchar(200) NOT NULL, "redirect_page_id" integer NULL, "site_id" integer NULL)
 ok	ALTER TABLE "wagtailredirects_redirect" ADD COLUMN "created_at" timestamp with time zone DEFAULT '2026-11-07 15:53:43.508642' NULL
-ok	CREATE TABLE "wagtailsearch_editorspick" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "sort_order" integer NULL, "description" text NOT NULL, "page_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailsearch_querydailyhits" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "date" date NOT NULL, "hits" integer NOT NULL, "query_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailsearch_indexentry" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "object_id" varchar(50) NOT NULL, "title_norm" double precision NOT NULL, "content_type_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailsearch_editorspick" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "sort_order" integer NULL, "description" text NOT NULL, "page_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailsearch_querydailyhits" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "date" date NOT NULL, "hits" integer NOT NULL, "query_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailsearch_indexentry" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "object_id" varchar(50) NOT NULL, "title_norm" double precision NOT NULL, "content_type_id" integer NOT NULL)
 ok	ALTER TABLE "wagtailsearch_indexentry" ADD COLUMN "autocomplete" tsvector NOT NULL
 ok	CREATE INDEX "wagtailsear_autocom_476c89_gin" ON "wagtailsearch_indexentry" ("autocomplete") /*overlite using gin*/
-ok	CREATE TABLE "wagtailsearchpromotions_searchpromotion" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "sort_order" integer NULL, "description" text NOT NULL, "page_id" integer NOT NULL, "query_id" integer NOT NULL)
-ok	CREATE TABLE "wagtailusers_userprofile" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "submitted_notifications" boolean NOT NULL, "approved_notifications" boolean NOT NULL, "rejected_notifications" boolean NOT NULL, "user_id" integer NOT NULL UNIQUE)
+ok	CREATE TABLE "wagtailsearchpromotions_searchpromotion" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "sort_order" integer NULL, "description" text NOT NULL, "page_id" integer NOT NULL, "query_id" integer NOT NULL)
+ok	CREATE TABLE "wagtailusers_userprofile" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, "submitted_notifications" boolean NOT NULL, "approved_notifications" boolean NOT NULL, "rejected_notifications" boolean NOT NULL, "user_id" integer NOT NULL UNIQUE)
 ok	SELECT wagtailcore_site.id, wagtailcore_site.hostname, wagtailcore_site.port, wagtailcore_site.site_name, wagtailcore_site.root_page_id, wagtailcore_site.is_default_site, CASE WHEN wagtailcore_site.hostname = '127.0.0.1' AND wagtailcore_site.port = 8000 THEN 0 WHEN wagtailcore_site.hostname = '127.0.0.1' AND wagtailcore_site.is_default_site THEN 1 WHEN wagtailcore_site.is_default_site THEN 2 ELSE 3 END AS "match", wagtailcore_page.id, wagtailcore_page.path, wagtailcore_page.depth, wagtailcore_page.numchild, wagtailcore_page.translation_key, wagtailcore_page.locale_id, wagtailcore_page.latest_revision_id, wagtailcore_page.live, wagtailcore_page.has_unpublished_changes, wagtailcore_page.first_published_at, wagtailcore_page.last_published_at, wagtailcore_page.live_revision_id, wagtailcore_page.go_live_at, wagtailcore_page.expire_at, wagtailcore_page.expired, wagtailcore_page.locked, wagtailcore_page.locked_at, wagtailcore_page.locked_by_id, wagtailcore_page.title, wagtailcore_page.draft_title, wagtailcore_page.slug, wagtailcore_page.content_type_id, wagtailcore_page.url_path, wagtailcore_page.owner_id, wagtailcore_page.latest_revision_created_at, wagtailcore_page.alias_of_id, wagtailcore_page.show_in_menus, wagtailcore_page.seo_title, wagtailcore_page.search_description FROM wagtailcore_site JOIN wagtailcore_page ON wagtailcore_site.root_page_id = overlite_cast(wagtailcore_page.id, 'integer') WHERE wagtailcore_site.hostname = '127.0.0.1' OR wagtailcore_site.is_default_site ORDER BY 7 ASC NULLS LAST /*overlite typed ,,,,,,int4,,,,,,,,,,,,,,,,,,,,,,,,,,,,,*/
 ok	SELECT wagtailcore_page.id, wagtailcore_page.path, wagtailcore_page.depth, wagtailcore_page.numchild, wagtailcore_page.translation_key, wagtailcore_page.locale_id, wagtailcore_page.latest_revision_id, wagtailcore_page.live, wagtailcore_page.has_unpublished_changes, wagtailcore_page.first_published_at, wagtailcore_page.last_published_at, wagtailcore_page.live_revision_id, wagtailcore_page.go_live_at, wagtailcore_page.expire_at, wagtailcore_page.expired, wagtailcore_page.locked, wagtailcore_page.locked_at, wagtailcore_page.locked_by_id, wagtailcore_page.title, wagtailcore_page.draft_title, wagtailcore_page.slug, wagtailcore_page.content_type_id, wagtailcore_page.url_path, wagtailcore_page.owner_id, wagtailcore_page.latest_revision_created_at, wagtailcore_page.alias_of_id, wagtailcore_page.show_in_menus, wagtailcore_page.seo_title, wagtailcore_page.search_description, base_homepage.page_ptr_id, base_homepage.image_id, base_homepage.hero_text, base_homepage.hero_cta, base_homepage.hero_cta_link_id, base_homepage.body, base_homepage.lead_image_id, base_homepage.lead_title, base_homepage.lead_text, base_homepage.featured_section_1_title, base_homepage.featured_section_1_id, base_homepage.featured_section_2_title, base_homepage.featured_section_2_id, base_homepage.featured_section_3_title, base_homepage.featured_section_3_id FROM base_homepage JOIN wagtailcore_page ON base_homepage.page_ptr_id = overlite_cast(wagtailcore_page.id, 'integer') WHERE base_homepage.page_ptr_id = 60 LIMIT 21 /*overlite typed*/
 ok	SELECT wagtailcore_page.id, wagtailcore_page.alias_of_id FROM wagtailcore_page WHERE wagtailcore_page.path IN ('0001', '00010002') AND NOT wagtailcore_page.id = 60 ORDER BY wagtailcore_page.path ASC NULLS LAST /*overlite typed*/

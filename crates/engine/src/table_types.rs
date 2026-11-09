@@ -11,6 +11,7 @@
 //! rollback; a file changed by another process is not seen until then, as for the
 //! probes' cache (`resolve/time_zone.rs`).
 
+use crate::catalog::constraints::int4_key;
 use crate::db_state::DbState;
 use overlite_core::sync::RwLockExt;
 use rusqlite::Connection;
@@ -29,8 +30,9 @@ pub struct ColumnType {
     /// boolean of a file not in the storage format, or of a view while some column of
     /// the file is mixed): the readings of resolve/booleans.rs for text apply to it.
     pub mixed_bool: bool,
-    /// The table's rowid under its own name (`INTEGER PRIMARY KEY`): a serial and a
-    /// bigserial key are both declared INTEGER there, so its width is not known.
+    /// The table's rowid under its own name (`INTEGER PRIMARY KEY`), whose width is not
+    /// known: SQLite declares a serial and a bigserial key both INTEGER. A key whose
+    /// DDL says it is an int4 (`int4_key`) is not counted: it is a narrow integer.
     pub rowid: bool,
 }
 
@@ -260,13 +262,32 @@ impl TableTypes {
                 *keys.entry(table.to_lowercase()).or_default() += 1;
             }
         }
+        // The keys a serial's or an integer identity's comment says are int4s, read
+        // from the DDL of the tables that have one.
+        let mut int4_keys: HashSet<(String, String)> = HashSet::new();
+        if let Ok(mut st) = q.prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' \
+             AND (sql LIKE '%/*overlite int4*/%' OR sql LIKE '%/*overlite identity % integer*/%')",
+        ) && let Ok(it) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for (table, sql) in it.filter_map(std::result::Result::ok) {
+                for (t, col, decl, pk, _) in &rows {
+                    if *pk == 1 && t == &table && decl.eq_ignore_ascii_case("integer") && int4_key(&sql, col) {
+                        int4_keys.insert((table.to_lowercase(), col.to_lowercase()));
+                    }
+                }
+            }
+        }
         let mut all: HashMap<String, Vec<ColumnType>> = HashMap::new();
         for (table, col, decl, pk, view) in rows {
             let lower = table.to_lowercase();
             let is_bool = matches!(decl.trim().to_ascii_lowercase().as_str(), "boolean" | "bool");
             let listed = mixed.contains(&(lower.clone(), col.to_lowercase()));
             let mixed_bool = is_bool && (!formatted || listed || (view && !mixed.is_empty()));
-            let rowid = pk == 1 && keys.get(&lower) == Some(&1) && decl.eq_ignore_ascii_case("integer");
+            let rowid = pk == 1
+                && keys.get(&lower) == Some(&1)
+                && decl.eq_ignore_ascii_case("integer")
+                && !int4_keys.contains(&(lower.clone(), col.to_lowercase()));
             all.entry(lower).or_default().push(ColumnType {
                 name: col,
                 decl,

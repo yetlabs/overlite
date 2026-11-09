@@ -492,6 +492,21 @@ pub fn identity_columns(ddl: &str) -> Vec<Identity> {
     out
 }
 
+/// Whether col of a CREATE TABLE is a key that is the rowid declared an int4: a serial's
+/// (`/*overlite int4*/`, which ast::ddl writes after its AUTOINCREMENT) or an integer
+/// identity's. SQLite declares any rowid INTEGER, which says nothing of its width.
+pub(crate) fn int4_key(ddl: &str, col: &str) -> bool {
+    if !ddl.contains("/*overlite int4*/") && !ddl.contains("integer*/") {
+        return false;
+    }
+    if identity_of(ddl, col).is_some_and(|i| i.type_name == "integer") {
+        return true;
+    }
+    column_items(ddl)
+        .into_iter()
+        .any(|(column, text)| eq_fold(&column, col) && text.contains("/*overlite int4*/"))
+}
+
 fn identity_of(ddl: &str, col: &str) -> Option<Identity> {
     identity_columns(ddl).into_iter().find(|i| eq_fold(&i.column, col))
 }

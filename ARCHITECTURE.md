@@ -327,7 +327,10 @@ and CHECK constraints by their names (`catalog/constraints.rs`), and two comment
 server leaves there itself. An index column's operator class that is not its type's
 default follows the column, `name /*varchar_pattern_ops*/`, and an identity column's
 definition ends in `/*overlite identity by default bigint*/`, its kind and the type it
-was declared with, since a key that is SQLite's rowid is INTEGER whatever it was.
+was declared with, since a key that is SQLite's rowid is INTEGER whatever it was. A
+serial key's ends in `/*overlite int4*/` after its AUTOINCREMENT for the same reason:
+`TableTypes` reads it (and an integer identity's mark) so that the key goes out as an
+int4, where a bigserial's, and a serial's from before the comment, goes out as an int8.
 Whatever rewrites a column's definition keeps the comment, or rewrites it.
 
 The same holds for what SQLite takes no clause for. A UNIQUE or PRIMARY KEY's deferral

@@ -58,8 +58,8 @@ fn a_plain_lookup_over_typed_columns_reads_them_by_type() {
         assert_eq!(rows(&conn, sql), want, "{sql}");
     }
     for (sql, want) in [
-        ("SELECT k, i, s FROM fp WHERE k = 1", vec![20, 23, 21]),
-        ("SELECT * FROM fp", vec![20, 23, 21, 1082, 1184, 25]),
+        ("SELECT k, i, s FROM fp WHERE k = 1", vec![23, 23, 21]),
+        ("SELECT * FROM fp", vec![23, 23, 21, 1082, 1184, 25]),
     ] {
         let (simple, described) = oids(&server, sql);
         assert_eq!(simple, want, "{sql}");

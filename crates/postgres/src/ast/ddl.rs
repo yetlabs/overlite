@@ -361,6 +361,12 @@ fn column_def(
         _ => None,
     });
     let serial = column_type(src, ts, te, tn, creating, edits)?;
+    let int4_serial = serial
+        && tn
+            .names
+            .last()
+            .and_then(|n| string(n).ok())
+            .is_some_and(|n| n.eq_ignore_ascii_case("serial") || n.eq_ignore_ascii_case("serial4"));
     let col_type = src.span(ts, te);
     let mut owner = ConstrType::Undefined;
     let mut i = 0;
@@ -413,7 +419,17 @@ fn column_def(
                         } else {
                             k
                         };
-                        edits.after(src, at, " AUTOINCREMENT");
+                        // A serial's key is an int4, which the rowid's INTEGER does not
+                        // say: the comment does (`int4_key`).
+                        edits.after(
+                            src,
+                            at,
+                            if int4_serial {
+                                " AUTOINCREMENT /*overlite int4*/"
+                            } else {
+                                " AUTOINCREMENT"
+                            },
+                        );
                     }
                 }
             },
@@ -1023,11 +1039,11 @@ mod tests {
         for (sql, want) in [
             (
                 "CREATE TABLE t (id serial PRIMARY KEY, n numeric(10,2), c citext NOT NULL)",
-                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, n DECIMALTEXT(10,2) COLLATE DECIMAL, c citext COLLATE NOCASE NOT NULL)",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT /*overlite int4*/, n DECIMALTEXT(10,2) COLLATE DECIMAL, c citext COLLATE NOCASE NOT NULL)",
             ),
             (
                 "CREATE TABLE t (id serial NOT NULL PRIMARY KEY, a int[3][3], v varchar(20)[])",
-                "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, a int[][], v \"varchar(20)[]\")",
+                "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT /*overlite int4*/, a int[][], v \"varchar(20)[]\")",
             ),
             (
                 "CREATE TABLE t (a int UNIQUE DEFERRABLE INITIALLY DEFERRED, b text COLLATE \"C\" DEFAULT 'x', CONSTRAINT u UNIQUE (a) DEFERRABLE) TABLESPACE pg_default",

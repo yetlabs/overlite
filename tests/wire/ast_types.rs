@@ -162,8 +162,8 @@ fn oids(server: &Server, sql: &str) -> (Vec<u32>, Vec<u32>) {
 
 // An integer goes out at its width, as Postgres sends it: int2, int4 or int8 by its
 // column's type or its expression's, where every integer was int8 by its sampled value.
-// A key that is the table's rowid keeps int8, as a serial and a bigserial key are both
-// INTEGER there.
+// A serial key, the table's rowid, is an int4 too: its DDL says so where SQLite
+// declares a serial and a bigserial key both INTEGER.
 #[test]
 fn an_integer_goes_out_at_its_width() {
     let server = start_server();
@@ -178,7 +178,7 @@ fn an_integer_goes_out_at_its_width() {
             "SELECT i, s, b, i + 1, length(t), count(*) FROM w GROUP BY i, s, b, t",
             vec![23, 21, 20, 23, 23, 20],
         ),
-        ("SELECT k, i, lower(t) FROM w ORDER BY k", vec![20, 23, 25]),
+        ("SELECT k, i, lower(t) FROM w ORDER BY k", vec![23, 23, 25]),
         ("SELECT i FROM w UNION SELECT b FROM w", vec![20]),
         ("UPDATE w SET i = 2 RETURNING s, i", vec![21, 23]),
     ] {

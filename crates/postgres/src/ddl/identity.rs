@@ -180,7 +180,10 @@ impl Session {
             let def = if integer_type(&typ).is_some() && is_key(&rest) && clause.options.is_empty() {
                 // The rowid, as a serial key is: a statement Postgres' grammar reads, which
                 // the translation writes as INTEGER ... AUTOINCREMENT.
-                join_def(&name, "serial", &(rest + " " + &mark(clause.always, &type_name)))
+                // An int4 a serial, another a bigserial, so that the translation marks
+                // only the int4 (ast::ddl): the identity's mark says which besides.
+                let serial = if type_name == "integer" { "serial" } else { "bigserial" };
+                join_def(&name, serial, &(rest + " " + &mark(clause.always, &type_name)))
             } else {
                 if self.identity_sequence(&stored, &column, &clause.options, None).is_err() {
                     failed = true;
