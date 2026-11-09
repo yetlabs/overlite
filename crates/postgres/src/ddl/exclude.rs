@@ -232,6 +232,14 @@ type NamedClause = (Option<String>, String);
 /// The items of a CREATE TABLE's column list that are EXCLUDE constraints, taken out:
 /// the statement without them and each one with its name. None when there are none.
 pub(crate) fn split_create_exclusions(sql: &str) -> Option<(String, Vec<NamedClause>)> {
+    // Only a CREATE TABLE has one: the rest go by without a scan.
+    if !sql
+        .trim_start()
+        .get(..6)
+        .is_some_and(|w| w.eq_ignore_ascii_case("create"))
+    {
+        return None;
+    }
     let toks = code_tokens(sql);
     let is = |k: usize, w: &str| toks.get(k).is_some_and(|t| t.is_word(sql, w));
     if !is(0, "create") {

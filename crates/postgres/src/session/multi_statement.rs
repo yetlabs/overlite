@@ -87,6 +87,12 @@ fn split_statements(sql: &str) -> Vec<String> {
             out.push(st.trim().to_string());
         }
     };
+    // Most messages hold one statement and no semicolon but at their end: no scan.
+    let body = sql.trim_end_matches(|c: char| c == ';' || c.is_ascii_whitespace());
+    if !body.contains(';') {
+        add(&mut out, body);
+        return out;
+    }
     let Ok(scanned) = pg_query::scan(sql) else {
         add(&mut out, sql);
         return out;

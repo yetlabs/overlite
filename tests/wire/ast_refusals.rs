@@ -336,3 +336,17 @@ fn notify_and_prepare_by_their_trees() {
     assert_sqlstate(&conn.exec("DEALLOCATE q", &[]).unwrap_err(), "26000");
     must_exec(&conn, "DEALLOCATE ALL");
 }
+
+// The fast path sends a statement as written, and no type pass reads it after: a
+// statement over a column whose type the translation reads (a boolean met by a string,
+// a numeric met by a literal of another scale) is the translation's.
+#[test]
+fn the_fast_path_leaves_typed_columns_to_the_translation() {
+    let conn = connect(&start_server());
+    must_exec(&conn, "CREATE TABLE f (id bigint, b boolean, n numeric(6,2))");
+    must_exec(&conn, "INSERT INTO f VALUES (1, true, 1.5), (2, false, 2)");
+    assert_eq!(texts(&conn, "SELECT id FROM f WHERE b = 'f'"), ["2"]);
+    assert_eq!(texts(&conn, "SELECT id FROM f WHERE b = 'yes'"), ["1"]);
+    assert_eq!(texts(&conn, "SELECT id FROM f WHERE n = 1.5"), ["1"]);
+    assert_eq!(texts(&conn, "SELECT id FROM f WHERE n = '2.0'"), ["2"]);
+}

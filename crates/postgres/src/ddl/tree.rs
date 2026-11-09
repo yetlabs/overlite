@@ -41,6 +41,15 @@ pub(crate) fn parse_failure(sql: &str) -> Error {
 /// What f reads of sql's one statement, None for anything Postgres' grammar does not
 /// read as one statement.
 pub(crate) fn read<T>(sql: &str, f: impl FnOnce(&NodeEnum) -> Option<T>) -> Option<T> {
+    // What reads or writes rows is no handler's, and not parsed for them: the hot path.
+    if crate::rewrite::cache::reads_or_writes_rows(sql) {
+        return None;
+    }
+    read_any(sql, f)
+}
+
+/// `read`, of a statement that reads or writes rows too.
+pub(crate) fn read_any<T>(sql: &str, f: impl FnOnce(&NodeEnum) -> Option<T>) -> Option<T> {
     let parsed = crate::ast::parse::shared(sql).ok()?;
     let [raw] = parsed.stmts.as_slice() else {
         return None;

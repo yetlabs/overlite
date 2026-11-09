@@ -1004,7 +1004,7 @@ fn combine_rls(perm: &[String], restr: &[String]) -> String {
 /// Whether the statement is an upsert with a DO UPDATE action (as opposed to DO
 /// NOTHING).
 fn has_do_update(sql: &str) -> bool {
-    tree::read(sql, |n| match n {
+    tree::read_any(sql, |n| match n {
         NodeEnum::InsertStmt(i) => {
             Some(i.on_conflict_clause.as_ref()?.action == pg_query::protobuf::OnConflictAction::OnconflictUpdate as i32)
         }

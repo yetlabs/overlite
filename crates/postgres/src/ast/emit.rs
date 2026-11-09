@@ -2460,6 +2460,7 @@ impl<'a> Emitter<'a> {
                     return Ok(());
                 }
                 if let Some(t) = &mut self.typer
+                    && t.any_mixed()
                     && !matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(NodeEnum::AStar(_)))
                     && t.column(&c.fields).is_some_and(|c| c.mixed)
                     && !std::mem::take(&mut self.whole_item)
@@ -3785,7 +3786,7 @@ impl<'a> Emitter<'a> {
     /// (other: true, false, or a string Postgres' boolin reads), and that value.
     fn mixed_test<'n>(&mut self, col: &'n NodeEnum, other: &NodeEnum) -> Option<(&'n NodeEnum, bool)> {
         let NodeEnum::ColumnRef(c) = col else { return None };
-        if !self.typer.as_mut()?.column(&c.fields)?.mixed {
+        if !self.typer.as_ref()?.any_mixed() || !self.typer.as_mut()?.column(&c.fields)?.mixed {
             return None;
         }
         let k = match other {

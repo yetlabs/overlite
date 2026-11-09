@@ -44,6 +44,8 @@ pub struct TableTypes {
     /// The names of the columns whose type makes the AST path's typed translation of a
     /// statement differ from the statement as written (`typed_differs`).
     typed_columns: HashSet<String>,
+    /// Whether some column is a boolean that may hold text (`ColumnType::mixed_bool`).
+    pub any_mixed_bool: bool,
     /// The tables with an integer column narrower than a bigint, which a star reads.
     narrow_tables: HashSet<String>,
     /// The lengths and first bytes of those names, which most words of a statement are
@@ -54,6 +56,10 @@ pub struct TableTypes {
 
 /// How a column's type bears on the fast path: whether a statement naming it reads
 /// differently typed, and whether it is an integer the protocol sends at its width.
+/// Only text, a bigint (or the rowid) and a float read as SQLite reads them; any other
+/// type (a date or time, an array, a range, a numeric, a boolean, which a string
+/// compared with it is read as, a uuid, json...) has the typed translation write
+/// something of its own, which the fast path, with no type pass after it, would not.
 fn typed_kind(c: &ColumnType) -> (bool, bool) {
     let d = c.decl.trim().trim_matches('"').to_ascii_lowercase();
     if d.contains('[') {
@@ -65,9 +71,23 @@ fn typed_kind(c: &ColumnType) -> (bool, bool) {
             base,
             "smallint" | "int2" | "smallserial" | "serial2" | "integer" | "int" | "int4" | "serial" | "serial4"
         );
-    let temporal =
-        base.starts_with("time") || base.starts_with("date") || base == "interval" || base.ends_with("range");
-    (narrow || temporal, narrow)
+    let plain = c.rowid
+        || matches!(
+            base,
+            "text"
+                | "varchar"
+                | "character varying"
+                | "bigint"
+                | "int8"
+                | "bigserial"
+                | "serial8"
+                | "real"
+                | "float4"
+                | "double precision"
+                | "float8"
+                | "float"
+        );
+    (narrow || !plain, narrow)
 }
 
 impl TableTypes {
@@ -93,21 +113,22 @@ impl TableTypes {
                 firsts[usize::from(c >= 64) & 1] |= 1 << (c % 64);
             }
         }
+        let any_mixed_bool = tables.values().any(|cols| cols.iter().any(|c| c.mixed_bool));
         TableTypes {
             generation,
             tables,
             typed_columns,
+            any_mixed_bool,
             narrow_tables,
             lengths,
             firsts,
         }
     }
 
-    /// Whether the AST path's typed translation of sql, a statement the text passes
-    /// would leave as it is (the fast path), may say something else: sql names a
-    /// column of a date, time or interval type, an array or a range, which the typed
-    /// translation compares by its type, or an integer narrower than a bigint, which it
-    /// sends at its width, or a star over a table with one. A word that is no column
+    /// Whether the typed translation of sql, a statement the fast path would send as
+    /// it is, may say something else: sql names a column of a type the translation
+    /// reads (`typed_kind`), or a star over a table with an integer narrower than a
+    /// bigint, which it sends at its width. A word that is no column
     /// but has such a name answers true too, which costs a translation, not an answer.
     #[must_use]
     pub fn typed_differs(&self, sql: &str) -> bool {
@@ -333,11 +354,13 @@ mod tests {
             ),
             ("w", &[("i", "INTEGER"), ("b", "BIGINT")]),
         ]);
-        assert!(!t.typed_differs("SELECT v, n FROM kv WHERE v = 'ts'"));
+        assert!(!t.typed_differs("SELECT v FROM kv WHERE v = 'ts'"));
         assert!(t.typed_differs("SELECT v FROM kv WHERE ts > '2024-01-02'"));
         assert!(t.typed_differs("SELECT b FROM w WHERE i = 1"));
         assert!(t.typed_differs("SELECT * FROM w"));
         assert!(!t.typed_differs("SELECT b FROM w WHERE b = 6"));
+        // A numeric reads as one, not as its text.
+        assert!(t.typed_differs("SELECT v FROM kv WHERE n = 1.5"));
         assert!(!TableTypes::of(&[("t", &[("a", "TEXT")])]).typed_differs("SELECT * FROM t"));
     }
 }

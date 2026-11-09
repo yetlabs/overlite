@@ -500,6 +500,11 @@ pub(crate) fn of_type_name(t: &pb::TypeName) -> Ty {
 }
 
 impl Typer {
+    /// Whether the catalog has a boolean column that may hold text anywhere.
+    pub(crate) fn any_mixed(&self) -> bool {
+        self.ctx.types.any_mixed_bool
+    }
+
     pub(crate) fn new(ctx: Rc<Context>) -> Typer {
         Typer {
             ctx,

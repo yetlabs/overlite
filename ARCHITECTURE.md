@@ -39,8 +39,8 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
 
 - `sqlite`: `Sqlite`, one per database, and `DbSession`, one per client, each owning a
   SQLite connection. Statement execution, binding, and the decoding of values.
-- `blank`: `blank_literals`, `code_only` and `blank_comments`, the literal-blanking
-  rule (below).
+- `blank`: `blank_literals`, `code_only` and `blank_comments`, which the session's
+  door and what reads the text after it use (What still reads the text, below).
 - `column_types`: the type of a computed result column, read from the select list.
 - `table_types`: `TableTypes`, the columns of every table and view of a database with
   their declared types, which booleans may hold text and which column is the rowid:
@@ -134,37 +134,48 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   is SQLite's sqlite_sequence), identity columns, TRUNCATE, enums, COMMENT,
   CREATE/DROP/ALTER DATABASE, nextval defaults, column IF [NOT] EXISTS
   (`column_if_exists`, with `alter_actions` splitting an ALTER TABLE's actions), and
-  `assign`, which fits written values to a column's modifier. `words` reads the names
-  of the role, database, RLS and COMMENT statements: whole when quoted, folded when
-  not. Other readers of names remain (`session::utility::unquote_ident` the most used);
-  they are to be folded into it, and then into the tree (stage 5c). Which handler takes
-  a statement is `ast::classify`'s; how each reads its statement is still its text.
-- `rewrite`: `rewrite_full`, 66 passes in a fixed order, each its own function,
-  grouped by theme: `casts`, `datetime`, `json`, `arrays`, `operators`, `catalog`...
-  The order matters, and comments in `rewrite_full` say why where it does. `tokens`
-  is the crate's shared tokenizer (`code_tokens`): words, literals and quoted names,
-  punctuation, each with its depth, comments left out.
-- `ast` (docs/adr/0001-sql-ast.md, stage 5b): a statement parsed by Postgres' grammar
-  (libpg_query, called directly by `parse`, without the pg_query crate's summary walk;
-  `parse::shared` keeps a thread's parses by text, so that the classifiers, the
-  privilege check and the translation read one parse of a statement) and printed as
-  SQLite SQL (`emit`), for SELECT, INSERT, UPDATE and DELETE, several of them in one
-  Parse included, and DDL (`ddl`, below). `classify` reads the session's routes from
-  the node: transaction control, savepoints, cursors, the DDL of schemas, roles,
-  sequences, types and databases, GRANT, RLS, COMMENT, SET ROLE, PREPARE, COPY,
-  TimeZone, search_path, EXPLAIN; each classifier of the session asks it, and reads the
-  words only where the grammar does not read the statement; a statement that reads or
-  writes rows is none of these and is not parsed for them. `ddl` translates CREATE
-  TABLE, CREATE INDEX, ALTER TABLE, DROP, RENAME, CREATE VIEW and CREATE TABLE AS:
-  the tree says what each part of the statement is and Postgres' scanner where it
-  ends, and only what SQLite does not take is written anew (a column's type: serial,
-  numeric, citext, arrays; COLLATE; a DEFAULT, a CHECK, a generated column's, an
-  index's keys and WHERE through the printer, as the text passes wrote them in DDL:
-  SQLite's CAST and clock, a cast of a literal folded; a key's deferral and an index's
-  method, INCLUDE and NULLS NOT DISTINCT in the comments the catalog reads; what
-  SQLite has no use for dropped), so that a table's stored DDL stays as the client
-  wrote it wherever SQLite takes it (What a table's DDL keeps, below). A function's
-  DDL, SET CONSTRAINTS and VACUUM are the engine's or SQLite's as written.
+  `assign`, which fits written values to a column's modifier. Which handler takes a
+  statement is `ast::classify`'s, and each reads its statement from its node
+  (`ddl::tree` holds the helpers: the node, names as the grammar folds them, options),
+  or where it re-emits a piece of the client's SQL (an EXCLUDE's elements, a column's
+  definition, a default) by Postgres' scanner (`pg_query::scan`). What a handler reads
+  of a table's stored DDL (sqlite_master: a rebuild's columns, a constraint, a view's or
+  a trigger's text) is SQLite's text, read as such.
+- `rewrite`: the door to SQLite for a client's statement. `translate` sends a
+  statement on the fast path (`fastpath`) as written, or answers its translation (the
+  tree's, `ast::translate`) from the translation cache (`cache`), or Postgres' refusal
+  of it; `rewrite` is the same for SQL the server writes itself. `blank` and `strings`
+  are the session's door for the text it still reads (below).
+- `ast` (docs/adr/0001-sql-ast.md, done in stage 5c): a statement parsed by Postgres'
+  grammar (libpg_query, called directly by `parse`, without the pg_query crate's summary
+  walk; `parse::shared` keeps a thread's parses by text, so that the classifiers, the
+  privilege check and the translation read one parse of a statement; a tree nested
+  past `MAX_NESTING` protobuf messages is refused before it is decoded, 54001, since
+  prost decodes without its own recursion limit) and printed as SQLite SQL (`emit`),
+  for SELECT, INSERT, UPDATE and DELETE, several of them in one Parse included, and DDL
+  (`ddl`, below). What it does not translate is refused (`rewrite::refused`): a parse
+  error with Postgres' message, position and code (`parse::error_of`, answered before
+  any classifier or grant reads the statement, `grammar_refusal`), a refusal Postgres
+  gives too with its SQLSTATE and message (`emit::refuse`: an operator no type has,
+  42883; a derived column list too long, 42P10), anything else 0A000. SQLite's
+  `CREATE TRIGGER ... BEGIN ... END` (`sqlite_trigger`) is the one statement run as
+  written: its head is read by the grammar with `EXECUTE FUNCTION
+  overlite_sqlite_trigger_body()` in place of its body, so both trigger forms are a
+  CreateTrigStmt, told apart by the function. `classify` reads the session's routes
+  from the node: transaction control, savepoints, cursors, the DDL of schemas, roles,
+  sequences, types and databases, GRANT, RLS, COMMENT, SET ROLE, COPY, TimeZone,
+  search_path, EXPLAIN; a statement that reads or writes rows is none of these and is
+  not parsed for them. `ddl` translates CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP,
+  RENAME, CREATE VIEW and CREATE TABLE AS: the tree says what each part of the
+  statement is and Postgres' scanner where it ends, and only what SQLite does not take
+  is written anew (a column's type: serial, numeric, citext, arrays; COLLATE; a
+  DEFAULT, a CHECK, a generated column's, an index's keys and WHERE through the
+  printer, untyped: SQLite's CAST and clock, a cast of a literal folded; a key's
+  deferral and an index's method, INCLUDE and NULLS NOT DISTINCT in the comments the
+  catalog reads; what SQLite has no use for dropped), so that a table's stored DDL
+  stays as the client wrote it wherever SQLite takes it (What a table's DDL keeps,
+  below). A function's DDL, SET CONSTRAINTS and VACUUM are the engine's or SQLite's as
+  written.
   For the rows: the catalog's relations are the engine's views under
   the names it gives them (pg_catalog's bare, information_schema's as the dotted name
   of a temp view, `catalog_relation`), their oid, tableoid and xmin columns as written,
@@ -182,50 +193,36 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   subquery over the join), `SET (a, b) =`, a write's WITH and its target's alias, row locks
   (dropped: the session takes them), ctid as rowid, arrays (literals, `= ANY` and `<>
   ALL`, subscripts and slices of anything, ARRAY(subquery), array_agg as a JSON array,
-  `@>`, `<@`, `&&`, `||`, casts, a cast to text in Postgres' form), the bitwise and math
-  operators, pg_trgm's and tsquery's, and any function a text pass does not rewrite by
-  name, written as it came (`REWRITTEN` lists those it does, which a test holds to the
-  passes);
-  `rewrite` takes it when it covers the statement and runs `rewrite_full` otherwise,
-  which in a running server is what Postgres' grammar does not read and the
-  statements whose typing depends on the catalog (`TYPE_REFUSAL_*`), counted by
-  `make text-passes` (OVERLITE_RECORD_TEXT_PASSES).
-  For a statement it covers, its output is final: it writes the labels, every cast,
-  each sort key's NULLS and every LIKE itself, and Describe types the parameters from
-  its tree (`params::facts`) alone. The text readers of each (`rewrite::labels`,
-  `rewrite_like`, `rewrite_null_order`, the regexes of `types::param_types`) run only
-  for the statements left to the text passes and on the fast path.
+  `@>`, `<@`, `&&`, `||`, casts, a cast to text in Postgres' form), hstore's operators,
+  the bitwise and math operators, pg_trgm's and tsquery's, and any function not in
+  `REWRITTEN` written as it came.
+  Its output is final: it writes the labels, every cast, each sort key's NULLS and
+  every LIKE itself, and Describe types the parameters from its tree (`params::facts`)
+  alone.
   `types` is the type environment: the type of each expression, a column's by the
   table of its own scope (through aliases, joins, subqueries in FROM, derived column
   lists, set-returning functions and CTEs, from the catalog the session's context
   gives, `env`), an expression's by Postgres' result types for the operators and the
   signatures of the functions overlite provides; what the catalog does not know is
-  read as the text passes read it (a json, array or range operator over such a
-  column). With a context the
-  printer writes from it what depends on a type (numeric exactness and the numeric
-  form, date and time arithmetic and comparison, the session's TimeZone read when the
-  statement runs, AT TIME ZONE, booleans met by a string, tsvector, `%`, json and range
-  operators, array comparison, the select-list casts, avg of integers at Postgres'
-  scale) and ends the statement in the engine's mark, which carries the result
-  columns' integer widths, booleans and arrays' element types: its output is final,
-  and the engine's type passes do not read it. Without one (the session's own probes) it prints the untyped
-  translation, which those passes finish. `env` holds the context of the translation
-  running on the thread, set by the session (`type_context`): the connection's
-  `TableTypes` and the search_path, and the stamp the cache keeps the translation under.
-  `shape` remembers, by the statement with its literals' values left out, what the
-  slice does not cover, so that such a statement is not parsed again only to be
-  refused; a refusal that depends on the catalog is not remembered. `labels` gives unnamed result columns Postgres' names, also those of a
-  statement the session expands (`rewrite::rewrite_expanded`), `params` the column
-  each `$n` meets by scope, `compare` holds the two routes' outputs side by side, which
-  the differential test (`diff`, over tests/fixtures/ast-corpus, in `make check`: the
-  typed translation against the text passes' output finished by the engine's type
-  passes, both under an empty catalog) and OVERLITE_AST_SHADOW (`shadow`: one
-  translation in n compared on a live server, untyped against the text passes', a
-  difference logged) use; `list_what_the_text_passes_translate` (ignored) writes the
-  corpus' statements the printer refuses, each with its reason. `record` keeps every
-  statement clients send when
-  OVERLITE_RECORD_STATEMENTS names a file, which `make ast-corpus` uses to grow the
-  corpus from the wire suite. `OVERLITE_AST=0` turns the AST path off.
+  `Any`, read as a json, array or range operator's other side says. The printer
+  writes from it what depends on a type (numeric exactness and the numeric form, date
+  and time arithmetic and comparison, the session's TimeZone read when the statement
+  runs, AT TIME ZONE, booleans met by a string, and a boolean column that holds text
+  read in both forms, tsvector, `%`, json, hstore and range operators, array
+  comparison, the select-list casts, avg of integers at Postgres' scale) and ends the
+  statement in the engine's mark, which carries the result columns' integer widths,
+  booleans and arrays' element types. `env` holds the context of the translation
+  running on the thread, set by the session (`type_context`, `rewrite_typed` for its
+  own SQL): the connection's `TableTypes` and the search_path, and the stamp the cache
+  keeps the translation under; without one the catalog is an empty one. `shape` is a
+  statement with its literals' values left out, by which the fast path remembers what
+  the grammar read. `labels` gives unnamed result columns Postgres' names, also those
+  of a statement the session expands (`rewrite::rewrite_expanded`), `params` the
+  column each `$n` meets by scope. `snapshot` (a test) holds the printer to its output
+  over the corpus (tests/fixtures/ast-corpus, written to printed.txt, rewritten with
+  OVERLITE_SNAPSHOT=update after review). `record` keeps every statement clients send
+  when OVERLITE_RECORD_STATEMENTS names a file, which `make ast-corpus` uses to grow
+  the corpus from the wire suite.
 - `rewrite::cache`: the translation cache, one per process: what `rewrite` made of a
   statement's text, in 256 shards each behind its own lock, bounded by statements
   (16384) and bytes (64 MiB), least recently used out first, a text kept the second
@@ -236,11 +233,11 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   A translation the AST path typed depends on the catalog's columns and the
   search_path: it is kept under its context's stamp, in its hash and generation, so
   another database, snapshot or search_path is another entry. Everything else that
-  depends on the session or the schema (search_path's table names, TimeZone, and for
-  the text passes' translations the catalog's types) is applied after `rewrite` on every
+  depends on the session or the schema (search_path's table names, TimeZone) is
+  applied after `rewrite` on every
   execution; the module lists it and tests/wire/translation_cache.rs holds it. `OVERLITE_REWRITE_CACHE=0` turns it off.
-- `types`: OIDs, and per type the rewrites and the text and binary encodings:
-  arrays, numeric, hstore, timestamps, booleans, parameter types.
+- `types`: OIDs, and per type the text and binary encodings: arrays, numeric, hstore,
+  timestamps, booleans, parameter types (from the tree, `param_types`).
 
 ## Errors
 
@@ -280,10 +277,13 @@ one run inside an implicit transaction. Each statement takes this route through
 1. A blank statement answers EmptyQueryResponse and never reaches the engine.
    `statement_text`, the door Parse goes through too, drops the comments in front, turns
    every other comment to spaces, and `normalize_literals` turns E'', U&'' and a string
-   continued on another line into plain literals, so that nothing after it knows
-   comments or more than one kind of literal.
+   continued on another line into plain literals, for what still reads the text (the
+   session's expansions, below, and the parameter count). Then a statement Postgres'
+   grammar refuses is answered with Postgres' error (`ast::grammar_refusal`; one that
+   reads or writes rows by its translation, which parses it anyway), but SQLite's
+   trigger.
 2. The session's own statements are tried in turn, each recognized by its node
-   (`ast::classify`, its words where Postgres' grammar does not read it): transaction control, savepoints,
+   (`ast::classify`): transaction control, savepoints,
    then, unless the transaction is aborted, schema DDL, role DDL, GRANT, ALTER TABLE,
    RLS DDL, LISTEN/NOTIFY, sequences, types, COMMENT, SET ROLE, PREPARE/EXECUTE, COPY,
    search_path and the utility statements clients expect to succeed.
@@ -302,10 +302,9 @@ one run inside an implicit transaction. Each statement takes this route through
    sequence calls, advisory locks and enum columns into literals, and calls `rewrite`
    (`rewrite_expanded` when it expanded something, so that the result columns keep
    the labels of the statement as sent), which answers from the translation cache or
-   translates (the AST path, else the text passes).
+   translates from the tree, or refuses.
 6. `Session::exec` arms the canceler and hands the text to `DbSession`. `execute` runs
-   function DDL, then the `resolve` passes (the type passes only for a statement
-   without the AST path's mark), and prepares, binds
+   function DDL, then the `resolve` passes, and prepares, binds
    and steps the statement. Nothing is cached: a statement is prepared and finalized
    on every execution. A computed column has no decltype, so `computed_types`
    (`column_types.rs`) reads the select list: a cast decides the column's type, and the rest speak for it only when
@@ -344,8 +343,9 @@ method pg_class.relam reports). index_where stops at the first of them.
 client wrote it: a column's type, a constraint's name, a name's quotes and a key
 written the client's way are what the catalog reads back, and what existing databases
 hold. An expression it prints (a DEFAULT, a CHECK, an index's key or WHERE) is kept as
-written where it is the same SQL token for token. The differential test compares this
-text, which is what SQLite stores, with the text passes' (`ddl::takes`).
+written where it is the same SQL token for token (`same_tokens`, by Postgres'
+scanner). The corpus' snapshot (`ast::snapshot`) holds this text, which is what SQLite
+stores.
 
 A materialized view `v` is a table `v` and a view `_overlite_mv_v` holding its query;
 the prefix keeps the view out of every catalog. `_overlite_extensions` and
@@ -367,35 +367,30 @@ long as a transaction that only reads stays open.
 
 ### The fast path contract
 
-`needs_no_rewrite` answers true only if `rewrite_full` would return the statement
-unchanged. It recognizes a narrow shape in one allocation-free pass; anything else
-answers false, so it can only be wrong by being slow. `rewrite` trusts it, so a false
-true silently skips a translation.
+`rewrite::fast_path` sends a statement to SQLite as written, without a parse, when
+three things hold, each of which can only be wrong by being slow:
 
-A statement on the fast path reaches the engine untyped, and its type passes run on
-it as they do for the text passes' output; it must also be one the AST path's typed
-translation would leave as it is. `rewrite::fast_path` asks the type environment
-that too: `TableTypes::typed_differs` scans the statement's words against the names
-of the database's columns whose type the typed translation reads (a date, time,
-timestamp, interval, array or range, an integer narrower than a bigint, which goes out
-at its width) and, for a star, the tables with a narrow integer. A hit, even a word
-that only shares the name, sends the statement to the AST path, which costs a
-translation, never an answer; a lookup over other columns stays on the fast path at
-the cost of a hash per word, and nothing when the database has no such column.
+- `needs_no_rewrite`: the statement is a narrow shape the printer writes as it reads
+  it, recognized in one allocation-free pass of its words; anything else (a word the
+  printer writes otherwise, a call it rewrites, ORDER BY, whose NULLS it writes, LIKE,
+  which it makes a GLOB, a name before a literal or a parameter, which is a typed
+  literal, a row in parentheses...) answers false. The tests in `rewrite/fastpath.rs`
+  hold it to the printer: every word of this crate's source in statement templates,
+  every statement of the wire suite (`tests/fixtures/rewrite-corpus.hex`) and random
+  statements, each it takes compared with what the printer writes of it, through
+  Postgres' deparse of both.
+- `TableTypes::typed_differs`: no word names a column whose type the typed
+  translation reads (anything but text, a bigint or the rowid, and a float: a date or
+  time, an array, a range, a numeric, a boolean, a narrow integer, which goes out at
+  its width...), nor, for a star, a table with a narrow integer. No type pass reads a
+  statement after it, so a statement over such a column is the translation's. A word
+  that only shares the name costs a translation, never an answer.
+- `parses`: Postgres' grammar reads it, which a statement of the same shape (`ast::
+  shape`, the text with its literals' values left out) answers without a parse once
+  one did: SQLite's dialect the words would take (`INSERT OR IGNORE`) is not run.
 
-Two passes run after the text passes and on the fast path, so a plain lookup gets
-them too, and are not in `rewrite_full`: `rewrite_null_order` gives each sort key
-without NULLS FIRST or LAST the one Postgres uses, and `rewrite_like` makes LIKE a GLOB
-and ILIKE a LIKE over the patterns the engine writes. Each scans for its word first
-and costs nothing without it. The AST path writes both itself. The fast path takes a
-LIKE only over a literal or a parameter: `rewrite_like` reads a pattern up to a word
-that may end one, which a CASE holds.
-
-A pass reacting to a new word must therefore be seen by it. The tests in
-`rewrite/fastpath.rs` put every word of this crate's source, walked recursively, into
-statement templates, and also run every statement of the wire suite
-(`tests/fixtures/rewrite-corpus.hex`) and random statements, asserting that nothing
-skipped changes under `rewrite_full`.
+`postgres_syntax_error` answers Postgres' error where SQLite reports a syntax error in
+a statement the grammar refuses.
 
 ### What a function's body reads
 
@@ -444,31 +439,19 @@ NOTES.md, Limits.
 this server makes invalidates it, and a TTL bounds how long a change from outside can
 go unnoticed.
 
-### The literal-blanking rule
+### What still reads the text
 
-What decides a statement's route reads code, not literals. `code_only` (engine
-`blank.rs`) turns the text
-of string literals, comments and quoted names to spaces, and `blank_literals` the same
-but keeping quoted names. Both keep quotes and every byte's position, so an offset found
-in the blanked text is an offset in the statement. A classifier reads `code_only`; what
-needs a name reads `blank_literals`.
-
-A comment is whitespace, and is gone before anything reads the statement:
-`statement_text` (rewrite/blank.rs) turns each to spaces with `blank_comments`, so that a
-quote, a `$n` or a keyword inside one counts to no scanner after it: the parameter count,
-the classifiers, the fast path, the rewrite and the engine. What also reads raw text
-(`code_only`, `blank_literals`, `count_params`, the splitter of a batch, a `LANGUAGE sql`
-body as it is inlined) skips comments itself. `comments_are_whitespace_to_every_scanner`
-in `session/mod.rs` runs statements whose comments hold quotes, `$n` and keywords through
-each of them, beside the same statements without.
-
-A rewrite pass works on text, and a literal is text to it. Most skip literals by
-themselves. One that scans raw text and has no use for what a literal says goes through
-`holding_literals` in `rewrite_full`, which runs it with each literal's text out of
-sight. `literals_survive_the_whole_rewrite` in `rewrite/mod.rs` holds them all to it: it
-reads the passes from `rewrite_full`, so a new one has to name the words that set it
-off, and puts those words in literals in every clause. The one exception is the point of
-its pass: NOTES.md, Limits.
+Nothing translates a statement from its text: the translation, the classifiers, the
+handlers and the privilege check read its tree, or Postgres' scanner where a piece of
+the client's SQL is written back. What still reads the text is the session's door and
+what follows it: `statement_text` (rewrite/blank.rs, with `normalize_literals`) turns
+comments to spaces and every kind of literal into a plain one, so that the session's
+expansions (`apply_rls`, the function inlining, session identity, sequence calls,
+advisory locks, enum columns), the parameter count and the fast path's scan meet
+neither; they skip literals by `code_only` and `blank_literals` (engine `blank.rs`),
+which keep every byte's position. `comments_are_whitespace_to_every_scanner` in
+`session/mod.rs` holds them to it. The engine reads the SQL the printer wrote (its
+name resolution, `column_types`), not the client's.
 
 ### Bytes outside UTF-8
 
@@ -518,9 +501,8 @@ object; what the type's input function does not read is refused with its code (2
 22007, 22008, 22009, 22023, 42601). `assign` in `builtins/casts.rs` and
 `builtins/canonical.rs` hold the forms.
 
-The readings of `resolve/booleans.rs` follow from it (for a statement the AST path
-types, its printer writes the same for a column in the format, and leaves a statement
-reading a mixed column to the text passes). A boolean column in the format
+The printer's readings of a boolean column follow from it (they were
+`resolve/booleans.rs`'s until stage 5c). A boolean column in the format
 holds 1 and 0, which SQLite compares as they are: `col = $1` and `col = true` stay as
 written and search an index on col, and only a string compared with one (`col = 'f'`,
 `col IN ('t', $1)`) becomes the 1 or 0 it reads as, or `pg_bool('...')`, 22P02. A mixed
@@ -529,8 +511,7 @@ a mixed column keep the readings for text: `col = value` becomes `col IN (1, 't'
 'true', ...)` over every form of that truth value, and any other reading reads
 `overlite_bool(col)`. A column that is a whole item of a select list is left alone: its
 declared type makes it a boolean on the way out. Which columns are which comes from the
-schema and the mixed list, kept per database until schema_version moves. bool_and,
-bool_or and every are min and max over overlite_bool either way.
+schema and the mixed list (`TableTypes`, `ColumnType::mixed_bool`).
 
 ## Storage format
 
