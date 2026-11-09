@@ -960,6 +960,10 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     // ARRAY(subquery), whose value is the JSON array the rewrite builds: the call
     // marks the result column an array.
     scalar(conn, "overlite_array", 1, |a| Ok(a[0].clone()))?;
+    // `a || b` of arrays, or of an array and an element, by which side is which.
+    scalar(conn, "overlite_array_cat", 3, |a| {
+        Ok(crate::builtins::arrays::array_cat(&a[0], &a[1], &a[2].to_string()))
+    })?;
     // A covering index's INCLUDE columns: 0 the list as pg_get_indexdef writes it, 1 a
     // JSON array of the names.
     scalar(conn, "overlite_index_include", 2, |a| {

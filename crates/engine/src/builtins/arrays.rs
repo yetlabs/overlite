@@ -32,6 +32,46 @@ pub(crate) fn json_arrays_overlap(a: &str, b: &str) -> (bool, bool) {
     (false, true)
 }
 
+/// `a || b` of Postgres' arrays, kinds saying which side is an array (`a`) and which
+/// an element (`e`): "aa" two arrays end to end, "ae" an element appended, "ea" one
+/// prepended. A NULL array is no elements, a NULL element is appended as one; two
+/// NULL arrays are NULL, as Postgres' array_cat gives.
+pub(crate) fn array_cat(l: &Value, r: &Value, kinds: &str) -> Value {
+    let items = |v: &Value, array: bool| -> Option<Option<String>> {
+        if array {
+            if v.is_null() {
+                return Some(None);
+            }
+            let Value::Text(j) = array_as_json(v) else { return None };
+            let inner = j.trim().strip_prefix('[')?.strip_suffix(']')?.trim().to_string();
+            Some(Some(inner))
+        } else {
+            Some(Some(match v {
+                Value::Null => "null".to_string(),
+                Value::Int(n) => n.to_string(),
+                Value::Float(f) if f.is_finite() => overlite_core::format_float(*f),
+                Value::Bool(b) => b.to_string(),
+                other => json_quote(&arg_str(other)),
+            }))
+        }
+    };
+    let (la, ra) = match kinds {
+        "ae" => (true, false),
+        "ea" => (false, true),
+        _ => (true, true),
+    };
+    let (Some(a), Some(b)) = (items(l, la), items(r, ra)) else {
+        return Value::Null;
+    };
+    match (a, b) {
+        (None, None) => Value::Null,
+        (Some(x), None) | (None, Some(x)) => Value::Text(["[", &x, "]"].concat()),
+        (Some(x), Some(y)) if x.is_empty() => Value::Text(["[", &y, "]"].concat()),
+        (Some(x), Some(y)) if y.is_empty() => Value::Text(["[", &x, "]"].concat()),
+        (Some(x), Some(y)) => Value::Text(["[", &x, ",", &y, "]"].concat()),
+    }
+}
+
 /// Parses a stored JSON array value and returns its length.
 pub(crate) fn json_array_len(v: &Value) -> Option<i64> {
     let s = match v {
