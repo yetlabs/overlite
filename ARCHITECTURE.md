@@ -2,10 +2,11 @@
 
 overlite speaks the PostgreSQL wire protocol on the front and stores everything in
 SQLite files on the back. There is no planner. A statement is classified by looking at its
-text and run by SQLite; it is translated from Postgres' parse tree where the AST path
-covers it (`ast`, a slice of DML that grows by stages: docs/adr/0001-sql-ast.md), with
-its labels, parameter types and the types of its expressions read from that tree and
-the catalog, and by text rewrites elsewhere.
+text and run by SQLite; a statement that reads or writes rows, the catalog's included,
+is translated from Postgres' parse tree (`ast`, docs/adr/0001-sql-ast.md), with its
+labels, parameter types and the types of its expressions read from that tree and the
+catalog, and DDL and the utility statements by text rewrites, until stage 5b moves
+them too.
 
 ## Crates
 
@@ -138,20 +139,32 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   The order matters, and comments in `rewrite_full` say why where it does. `tokens`
   is the crate's shared tokenizer (`code_tokens`): words, literals and quoted names,
   punctuation, each with its depth, comments left out.
-- `ast` (docs/adr/0001-sql-ast.md, stage 4): a statement parsed by Postgres' grammar
+- `ast` (docs/adr/0001-sql-ast.md, stage 5a): a statement parsed by Postgres' grammar
   (libpg_query, called directly by `parse`, without the pg_query crate's summary walk)
-  and printed as SQLite SQL (`emit`), for SELECT, INSERT, UPDATE and DELETE but the
-  catalog's relations and functions (stage 5): set operations whatever their members,
+  and printed as SQLite SQL (`emit`), for SELECT, INSERT, UPDATE and DELETE, several
+  of them in one Parse included. The catalog's relations are the engine's views under
+  the names it gives them (pg_catalog's bare, information_schema's as the dotted name
+  of a temp view, `catalog_relation`), their oid, tableoid and xmin columns as written,
+  a reg* cast a lookup in the view its type names (`reg_cast`), the functions the text
+  passes rewrote by name (`CATALOG_CALLS`: obj_description, pg_get_indexdef, the
+  partition and option sets...) as they wrote them, a catalog boolean met by a string
+  its 1 or 0. Beside them: set operations whatever their members,
   DISTINCT ON (ROW_NUMBER() over the ON keys), window functions and frames, FILTER and
   an aggregate's ORDER BY, set-returning functions in FROM (the engine's walkers of a
   JSON array, `srf_from`, in a subquery or in place, their columns renamed where they
-  read a table on their left), derived column lists, ON CONFLICT, UPDATE ... FROM,
-  DELETE ... USING (by rowid), a write's WITH and its target's alias, row locks
+  read a table on their left, a star over them carrying their columns by name), and
+  in a select list (the set joined after FROM, calls side by side zipped), derived
+  column lists (a star's through the catalog), ON CONFLICT, UPDATE ... FROM, DELETE ...
+  USING (by rowid), RETURNING beside either (an item reading a joined relation a
+  subquery over the join), `SET (a, b) =`, a write's WITH and its target's alias, row locks
   (dropped: the session takes them), ctid as rowid, arrays (literals, `= ANY` and `<>
-  ALL`, subscripts and slices, ARRAY(subquery), array_agg as a JSON array, `@>`, `<@`,
-  `&&`, `||`, casts), and any function a text pass does not rewrite by name, written as
-  it came (`REWRITTEN` lists those it does, which a test holds to the passes);
-  `rewrite` takes it when it covers the statement and runs `rewrite_full` otherwise.
+  ALL`, subscripts and slices of anything, ARRAY(subquery), array_agg as a JSON array,
+  `@>`, `<@`, `&&`, `||`, casts, a cast to text in Postgres' form), the bitwise and math
+  operators, pg_trgm's and tsquery's, and any function a text pass does not rewrite by
+  name, written as it came (`REWRITTEN` lists those it does, which a test holds to the
+  passes);
+  `rewrite` takes it when it covers the statement and runs `rewrite_full` otherwise,
+  which over the corpus is DDL, the utility statements and what Postgres refuses.
   For a statement it covers, its output is final: it writes the labels, every cast,
   each sort key's NULLS and every LIKE itself, and Describe types the parameters from
   its tree (`params::facts`) alone. The text readers of each (`rewrite::labels`,
@@ -183,7 +196,9 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   typed translation against the text passes' output finished by the engine's type
   passes, both under an empty catalog) and OVERLITE_AST_SHADOW (`shadow`: one
   translation in n compared on a live server, untyped against the text passes', a
-  difference logged) use. `record` keeps every statement clients send when
+  difference logged) use; `list_what_the_text_passes_translate` (ignored) writes the
+  corpus' statements the printer refuses, each with its reason. `record` keeps every
+  statement clients send when
   OVERLITE_RECORD_STATEMENTS names a file, which `make ast-corpus` uses to grow the
   corpus from the wire suite. `OVERLITE_AST=0` turns the AST path off.
 - `rewrite::cache`: the translation cache, one per process: what `rewrite` made of a

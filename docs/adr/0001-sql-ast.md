@@ -1,6 +1,6 @@
 # 0001: Translate SQL from a parse tree, not from text
 
-Status: accepted; stages 0 to 4 landed on main (below), stage 1's week of the owner's apps pending
+Status: accepted; stages 0 to 4 and 5a landed on main (below), stage 1's week of the owner's apps pending
 Date: 2026-11-08
 
 ## Context
@@ -770,6 +770,198 @@ has. Then the utility statements on the tree (`route_of` and the session's
 classifiers), CREATE TABLE/INDEX/ALTER with `ddl_syntax` and `default_expr`, and
 `rewrite_full` deleted with the scanners. The leftover row shapes above (select-list
 set-returning functions, the math operators) are small and could go first.
+
+## Stage 5a result
+
+Every statement of the corpus that reads or writes rows is the AST path's now, the
+catalog's included, but for what Postgres itself refuses and three named below; the
+text passes keep DDL and the utility statements (stage 5b).
+
+- **The catalog.** pg_catalog's relations are the engine's views under their bare
+  names, information_schema's under the dotted name of their temp view (the names
+  rewrite_information_schema knew; any other is written as it came), a column
+  qualified by either the same (`catalog_relation`). oid, tableoid and xmin are
+  written as they came: the views have them, and a user table's `oid` is a column.
+  A reg* cast (regclass, regtype, regproc, regprocedure, regnamespace, regrole) is a
+  lookup in the view its type names (`reg_cast`): a number is the oid, a system
+  catalog's name its fixed oid, a quoted name the object of that name, anything else
+  an oid written as its object's name; regoperator, oid and the rest are casts the
+  engine reads. The functions the text passes rewrote by name (`CATALOG_CALLS`:
+  obj_description, shobj_description, col_description, pg_get_indexdef,
+  pg_get_constraintdef, the partition sets, pg_options_to_table) are written as they
+  wrote them, in FROM too, WITH ORDINALITY included; array_to_string of
+  ARRAY(subquery) is its rows joined; `OPERATOR(pg_catalog.op)` is op; a catalog
+  boolean met by a string is its 1 or 0 where the environment does not type the
+  column. Everything else (pg_get_expr, format_type, pg_table_is_visible, the
+  has_*_privilege family...) was already written as it came. Describe types a
+  parameter meeting a catalog column (relname name, oid oid, `= ANY` their arrays)
+  from the tree's references.
+- **The leftover shapes.** Set-returning functions in a select list (the set joined
+  after FROM, lateral; several zipped, as rewrite_set_returning wrote them); `&`, `|`,
+  `<<`, `>>` as SQLite's (a new precedence level between comparison and `+`), `#` and
+  `^` as overlite_xor and power, `|/`, `||/`, `@`, `~` as calls or SQLite's, typed at
+  Postgres' widths; pg_trgm's `<%`, `%>`, `<<%`, `%>>` and its distances; tsquery's
+  `&&`, `||`, `!!` (overlite_tsquery_op, new); containment by what the catalog does not
+  know decided by the other side, as Postgres' resolution would: a range or a range's
+  literal containing a known scalar is json_contains (which reads range @> element at
+  run time), `-|-`, `&<`, `&>` are ranges' alone, `<<`/`>>` beside a range's literal a
+  range's; a slice of any expression (overlite_array_slice, new); an array cast to text
+  in Postgres' form (overlite_array_text, new); several statements in one Parse, each
+  translated; a quoted name with a dot written whole; OVERRIDING SYSTEM VALUE dropped
+  (the session's identity_insert takes it out before translating); RETURNING beside
+  FROM or USING (an item reading a joined relation a subquery over the join for the
+  row, as rewrite_update_from wrote it); `SET (a, b) = (...)` and `= (SELECT ...)`; a
+  join alias; a star under a derived column list, through the catalog; jsonb_typeof and
+  json_typeof by Postgres' names; ctid through a CTE.
+- **Found on the way**: a star over a FROM whose set-returning function is written in
+  place (stage 4) lost the function's named columns, which Django's get_constraints
+  reads through `SELECT * FROM pg_index i, unnest(...) koi(key, ...)`: the star now
+  carries them (`star_renames`), as rewrite_lateral did.
+
+**The corpus** (`make ast-corpus` added 65 statements: 16306), main 9142966 against
+stage 5a, both on it:
+
+| | fast path | text passes | AST path |
+|---|---|---|---|
+| before stage 5a | 4164 | 3988 | 8154 |
+| stage 5a | 4164 | 3427 | 8715 |
+
+The 561 statements moved are 600 that read or write rows, less the 39 named below.
+Per source (text passes / AST path): django 430/2619 to 382/2667, wagtail 181/536 to
+172/545, gitea 511/486 to 508/489, owner 27/37 to 24/40, rewrite 88/133 to 20/201,
+wire 2751/4343 to 2321/4773.
+
+Of the 8715: identical 6072, identical but parentheses 1972, intended 671 (556
+before), unexplained 0. The new intended differences, by reason (compare.rs): 55 a
+reg* literal's name read as Postgres reads a name (an unquoted one folded and compared
+without case, the catalog keeping names as created; `schema."Name"`, which the text
+pass cut at its last quote); 9 tsquery's operators; 8 labels of a CASE named by its
+ELSE through casts and calls (psql reads by position); 8 labels of each statement of a
+string holding several; 6 range operators over what the text pass took for json; 5
+set-returning functions in place where the text pass wrote a subquery; 4 Postgres'
+syntax the text pass left (a slice of an expression); 4 array_agg; 3 casts to an array
+type; 3 quoted names with a dot (`"information_schema.tables"`, whose quotes the text
+pass doubled); 2 OVERRIDING SYSTEM VALUE; 2 jsonb_typeof; 1 each: an array cast to
+text, array_to_string of ARRAY(subquery) beyond the first, a partition set WITH
+ORDINALITY, ctid through a CTE, a label `?column?`, the session's zone.
+
+**What the text passes still translate**, 3427 statements: 3307 utility statements
+(ALTER TABLE 873, CREATE TABLE 824, CREATE [UNIQUE] INDEX 571, DROP 185, GRANT and
+REVOKE 152, SET 95, other ALTERs 82, COMMENT 65, CREATE SCHEMA 52, DATABASE 50, ROLE 33,
+POLICY 30, FUNCTION 30, SEQUENCE 20, the cursors' FETCH, MOVE and CLOSE 57, COPY 30,
+TRUNCATE 25, PREPARE and EXECUTE 24, the rest under 20 each), 81
+utility texts Postgres cannot parse, and 39 that read or write rows:
+
+- 35 Postgres refuses too: 31 parse errors (a `%s` or `?` placeholder never
+  substituted, a truncated statement, `current_user()`), `json_object('a', 1)` (42883),
+  `0=%s` (`=%` is no operator), `?1` (no prefix `?`), and two derived column lists
+  longer than their columns (42P10).
+- 2 `SELECT * FROM (SELECT * FROM t) AS v(a)` over a table the empty catalog of the
+  test does not know: a refusal by the catalog (`TYPE_REFUSAL_STAR`, not remembered by
+  shape), translated in a server that has t.
+- 1 Django `(SELECT ...) UNION (SELECT ...)` of 101 members: prost's decode stops at
+  its recursion limit of 100 levels (`SelectStmt.larg` nests once per member; 99
+  members fail, 60 pass), a "decode error".
+
+**Bugs fixed**, each a test in tests/wire/ast_catalog.rs that fails on 9142966 and is
+held to Postgres 17: psql's `\d` of any table with a foreign key failed on its trigger
+listing (`pg_partition_ancestors(...) WITH ORDINALITY`, a syntax error in SQLite); an
+array cast to text gave the stored JSON (`[1,2]`, now `{1,2}`); a slice of anything but
+a column was a syntax error; jsonb_typeof said `integer`, `text`, `true`; tsquery's
+`&&` was an overlap, `||` a concatenation of texts, `!!` a syntax error;
+`'MyTab'::regclass` missed `mytab` and `'public."My T"'::regclass` missed `My T`;
+`5 & 3` went out as int8. tests/wire/srf.rs held a star under a shorter derived column
+list to 0A000; it now answers as Postgres, over a table the catalog knows.
+
+**Client-visible changes** (NOTES.md, Behavior): the fixes above; the bitwise
+operators at their operands' width; a CASE labelled by its ELSE.
+
+**Performance.** pgbench as before (4 clients, 4 threads, 8 s, each binary on its own
+copy of the 100,000-row `kv`, the order swapped in round 2), main 9142966 against
+7d134dc (937816d after it touches only a FROM's partition sets), tps per round:
+
+| script, mode | main | stage 5a | means |
+|---|---|---|---|
+| lookup (fast path), simple | 114927 / 114172 / 112399 | 114353 / 114764 / 114631 | +0.7% |
+| lookup (fast path), prepared | 96763 / 96825 / 97340 | 97525 / 97494 / 95849 | −0.0% |
+| lookup2 (AST slice), simple | 81058 / 80894 / 79953 | 80558 / 80550 / 80309 | −0.2% |
+| lookup2 (AST slice), prepared | 87691 / 87668 / 86841 | 87385 / 87861 / 86750 | −0.1% |
+| mix, simple | 14148 / 14058 / 13953 | 14056 / 14088 / 14101 | +0.2% |
+| mix, prepared | 14614 / 14426 / 14396 | 14514 / 14530 / 14535 | +0.3% |
+| lookup3, simple | 79983 / 79763 / 79992 | 79351 / 79570 / 79756 | −0.4% |
+| lookup3, prepared | 86188 / 84079 / 84700 | 85996 / 83164 / 85540 | −0.1% |
+
+All within a binary's own spread: none of these statements changed route. The
+catalog's: psql 18 over one connection, 100 times `\d a` and `\d c` (a table with a
+key, a unique and a check, and a plain one) and 200 times `\dt`, each binary on its
+own copy of the database, in turn, three rounds, seconds (the outputs of the two
+binaries identical):
+
+| loop | main | stage 5a |
+|---|---|---|
+| `\d a`, `\d c` ×100 | 1.139 / 1.097 / 1.086 | 0.983 / 0.988 / 0.994 (−10%) |
+| `\dt` ×200 | 0.094 / 0.095 / 0.096 | 0.092 / 0.090 / 0.086 (−5%) |
+
+`\d b` (a foreign key) failed on main; it answers now.
+
+**Exit criteria.** `make check` green, the differential at zero unexplained, every
+statement that reads or writes rows translated but those Postgres refuses, one the
+test's empty catalog cannot type, and one too deep to decode: met. `rewrite_full` is
+not deleted: it serves the utility statements (5b).
+
+**Stage 5b, the utility statements on the tree.**
+
+1. Measure first what reaches `rewrite_full` in a server, not in the corpus: most
+   utility statements are the session's before `rewrite` (transaction control,
+   savepoints, schema, role, GRANT, RLS, LISTEN/NOTIFY, sequences, types, COMMENT, SET,
+   PREPARE/EXECUTE, COPY, cursors). Count, in a test build over the wire suite, the
+   statements `rewrite` hands to `rewrite_full` by node kind (record them beside
+   OVERLITE_RECORD_STATEMENTS), and give the differential test a mode over them.
+2. Classify on the tree: `route_of`, `handle_simple_query`'s chain and the
+   `ddl::words` readers (`unquote_ident` and its kin) read the parsed node kind and its
+   names, from one parse per statement shared with the translation (the cache keyed by
+   text holds the parse result too, or the route). The literal-blanking classifiers
+   (`code_only` callers) go with it.
+3. CREATE TABLE as a printer node: column types as `ddl_syntax` writes them (serial,
+   citext, numeric as DECIMALTEXT with its collation, arrays, identity's comment),
+   DEFAULT through `default_expr`'s rules (a printed expression, folded constants),
+   CHECK, UNIQUE and PRIMARY KEY with their deferral comment, FOREIGN KEY, EXCLUDE
+   through ddl/exclude, TABLESPACE dropped; the comments `catalog/constraints.rs`
+   reads back are the contract, so the differential compares the stored DDL.
+4. CREATE [UNIQUE] INDEX (USING's comment, INCLUDE, NULLS NOT DISTINCT, operator
+   classes, WHERE, IF NOT EXISTS), then ALTER TABLE: `alter_actions` splitting by the
+   tree's cmds, the rebuild path given nodes instead of text, column IF [NOT] EXISTS.
+5. The rest by count: DROP, TRUNCATE, COMMENT, GRANT/REVOKE, CREATE/ALTER/DROP of
+   schema, database, role, policy, sequence, type, extension, collation, view and
+   materialized view (whose query is a SELECT the printer has), CREATE FUNCTION (its
+   SQL body through the printer when it is inlined). Exit: over the recorded server
+   statements, `rewrite_full` receives none but those Postgres refuses.
+
+**Stage 5c, deleting the text route.**
+
+1. Answer what Postgres refuses from the tree: a parse error with Postgres' message
+   and position (42601) without SQLite; an `Unsupported` that is Postgres' own
+   refusal (no such operator 42883, a derived column list too long 42P10) a typed
+   refusal carrying its SQLSTATE, sent as the error. The catalog-dependent refusals
+   (`TYPE_REFUSAL_*`: `%` and json, range or a star over what the catalog does not
+   know, a boolean column holding text) need an answer each: a run-time dispatch as
+   json_contains does, or the readings of resolve/booleans.rs written by the printer.
+2. Deep trees: prost's recursion limit stops a 99-member UNION. Decode with prost's
+   `no-recursion-limit` and bound the depth ourselves (libpg_query's stack check, the
+   printer's recursion on a thread with a known stack), with a wire test of a
+   200-member UNION and the panics test's nesting.
+3. The untyped translation (the session's probes, with no context) has to cover what
+   the typed one does: give the probes a context, or run the differential untyped too.
+4. Then delete `rewrite_full` and its passes, `holding_literals`,
+   `literals_survive_the_whole_rewrite`, `rewrite::labels` (result_labels,
+   apply_labels), `param_types`' regexes and `type_by_text`, `text_tail` once the fast
+   path's statements are printed (or the fast path itself, if the cache makes it moot:
+   measure lookup simple and prepared), the engine's type passes
+   (`resolve_types`: temporal, numeric, booleans, tsvector, time_zone) once nothing
+   reaches the engine untyped, `rewrite/tokens.rs` and the blanking scanners
+   (`blank.rs`, `resolve/names.rs`) where nothing reads raw text, and OVERLITE_AST,
+   OVERLITE_AST_SHADOW and the differential test with them: the corpus stays, as a
+   snapshot of the printer's output reviewed on change.
 
 ## Risks
 

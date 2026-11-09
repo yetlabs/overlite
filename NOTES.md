@@ -444,6 +444,26 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   array (`tags[2]` is `tags`, as Postgres names it), a DISTINCT ON item without a name
   by Postgres' label. A cast of a JSON array's text to an array type
   (`CAST('["a"]' AS TEXT[])`) reads the array, which the text passes left as text.
+- Since stage 5a (docs/adr/0001-sql-ast.md), the catalog's reads (psql's `\d` family,
+  pg_dump, the ORMs' introspection) are translated from the tree into the same SQL
+  over the same views, and so are the row shapes stage 4 left. Answers that were wrong
+  or refused and are Postgres' now (tests/wire/ast_catalog.rs): psql's `\d` of a table
+  with a foreign key (its trigger listing reads `pg_partition_ancestors(...) WITH
+  ORDINALITY`, which reached SQLite as a syntax error); an array cast to text
+  is Postgres' text form (`ARRAY['a b','c']::text` is `{"a b",c}`, where it was the
+  JSON array it is stored as); a slice of any expression (`(string_to_array(s,
+  ';'))[2:3]`, `(array_agg(x))[2:2]`); jsonb_typeof and json_typeof say `number`,
+  `string` and `boolean` (they said SQLite's `integer`, `real`, `text`, `true`);
+  tsquery's `&&`, `||` and `!!` join and negate queries (they were an overlap, a
+  concatenation of texts and a syntax error); a reg* literal folds an unquoted name
+  and reads past a schema (`'MyTab'::regclass` finds `mytab`, `'public."My T"'`
+  finds `My T`); a star over a table the catalog knows takes a shorter derived column
+  list, its first columns renamed (it was 0A000).
+- Client-visible since stage 5a: the bitwise operators of integers go out at their
+  operands' width (`5 & 3` int4, a shift of a bigint int8; they were int8); a CASE
+  whose ELSE is a cast or a call is labelled by it, as Postgres' FigureColname does
+  (psql's `\d` reads its columns by position). A Parse holding several statements is
+  translated statement by statement, as before.
 
 ## Limits
 
@@ -455,8 +475,8 @@ Since stage 3 of the AST migration (docs/adr/0001-sql-ast.md), a statement the A
 path translates is typed from its tree and the catalog, and the limits below that
 come from a type the translation cannot see hold for the others only: a statement the
 fast path runs as written (since stage 4 only one over columns whose types it reads
-the same), one left to the text passes (DDL and the catalog's statements, and the
-shapes listed in the ADR's stage 4 result), and the server's own probes. In a typed
+the same), one left to the text passes (since stage 5a, DDL and the utility
+statements, and statements Postgres itself refuses), and the server's own probes. In a typed
 statement what is still not known is a column of a table the catalog does not have,
 a function the environment does not type; a json, range, array or `%` operator over
 such a value is read as the text passes read it.
@@ -629,7 +649,7 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 
 - A table's column list, `FROM t AS x(a, b)`, is a syntax error: only a derived table
   and a function take one. A derived table's list shorter than its columns is 0A000
-  when a star hides how many there are.
+  when a star over a relation the catalog does not know hides how many there are.
 - A schema name holds letters, digits and underscores: a table of schema `s` is stored
   as `s.t`, so the name has to be one word. Any other name is 0A000, where Postgres
   takes it.
