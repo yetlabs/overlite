@@ -34,6 +34,7 @@ mod resolve;
 mod sql_funcs;
 mod sqlite;
 mod storage;
+mod table_types;
 
 pub use blank::{blank_comments, blank_literals, code_only};
 pub use builtins::casts::{CastType, assign as assign_value, assignment_type, cast, interval_parts};
@@ -52,7 +53,9 @@ pub use cluster::{Cluster, DEFAULT_MAX_OPEN_DATABASES, open_cluster, single};
 pub use error::{Error, ErrorKind, Result};
 pub use resolve::names::{Meets, NamedTable, ParamColumn, param_columns};
 pub use resolve::schema_qualify::split_stored_name;
+pub use resolve::{TYPED_MARK, type_passes_without_tables};
 pub use sql_funcs::function_ddl_target;
 pub use sql_funcs::rewrite::{FunctionCall, inline_function_body};
 pub use sqlite::{DbSession, InterruptHandle, Sqlite, ViewsAndTriggers};
 pub use storage::{FORMAT_VERSION, backup_path};
+pub use table_types::{ColumnType, TableTypes};

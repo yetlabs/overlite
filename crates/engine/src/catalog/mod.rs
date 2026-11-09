@@ -1390,6 +1390,16 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             v => crate::builtins::dates::session_tz_text(&v.to_string()).map_or_else(|| v.clone(), Value::Text),
         })
     })?;
+    // A timestamptz's wall clock in the session's zone, which the AST path writes where
+    // Postgres reads one there (a cast to a date or a time, EXTRACT, DATE_TRUNC): the
+    // value itself in UTC.
+    scalar(conn, "overlite_tz_wall", 1, |a| {
+        if a[0].is_null() || crate::builtins::dates::session_is_utc() {
+            return Ok(a[0].clone());
+        }
+        let zone = crate::builtins::dates::session_zone();
+        Ok(at_time_zone(&a[0].to_string(), &zone).map_or_else(|| a[0].clone(), Value::Text))
+    })?;
     // A timestamptz a client gives as text, read in the session's zone: resolve/temporal.rs
     // writes it around what a cast or a write to timestamptz takes, but a timestamptz.
     scalar(conn, "overlite_tz_in", 1, |a| {

@@ -8,15 +8,13 @@ use crate::catalog::schema::{rebuild_catalog, setup_connection};
 use crate::column_types::{TypeHint, apply_strong_types, computed_types};
 use crate::db_state::{DbState, state_for};
 use crate::error::{Error, ErrorKind, Result, errf};
-use crate::resolve::booleans::resolve_booleans;
 use crate::resolve::current_database::resolve_current_database;
 use crate::resolve::current_schema::resolve_current_schema;
 use crate::resolve::public_qualifier::strip_public_qualifier;
 use crate::resolve::regclass::resolve_to_regclass;
 use crate::resolve::schema_qualify::qualify_schema_names;
 use crate::resolve::search_path::resolve_search_path;
-use crate::resolve::time_zone::{resolve_time_zones, resolve_zone_values};
-use crate::resolve::tsvector::resolve_tsvectors;
+use crate::resolve::{apply_result_types, resolve_types, split_typed};
 use crate::sql_funcs::try_function_ddl;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use overlite_core::sync::MutexExt;
@@ -530,6 +528,13 @@ impl DbSession {
     /// was read at may come back with another schema.
     fn forget_schema_objects(&self) {
         self.views_and_triggers.borrow_mut().take();
+        self.state.forget_table_types();
+    }
+
+    /// The columns of the database's tables and views with their declared types, as
+    /// this connection read them last (table_types.rs).
+    pub fn table_types(&self) -> std::sync::Arc<crate::TableTypes> {
+        self.state.table_types(&self.conn)
     }
 
     pub fn interrupt_handle(&self) -> InterruptHandle {
@@ -620,24 +625,22 @@ fn execute(sp: Option<&[String]>, st: &DbState, q: &Connection, query: &str, arg
     if let Some(rs) = try_function_ddl(st, q, query)? {
         return Ok(rs);
     }
-    let query = qualify_schema_names(st, query);
-    let query = resolve_search_path(sp, st, q, &query);
-    let query = strip_public_qualifier(&query);
-    let query = resolve_current_schema(sp, st, &query);
-    let query = resolve_current_database(st, &query);
-    let query = resolve_to_regclass(&query);
-    let query = resolve_time_zones(q, &query);
-    let query = resolve_zone_values(q, &query, args);
-    let query = resolve_tsvectors(q, &query);
-    let query = crate::resolve::temporal::resolve_temporal(q, &query);
-    let query = resolve_booleans(st, q, &query);
+    let (query, typed) = split_typed(query);
+    let query = resolve_names(sp, st, q, query);
+    let query = match typed {
+        Some(_) => query,
+        None => Cow::Owned(resolve_types(st, q, &query, args).into_owned()),
+    };
     let cmd = leading_command(&query);
     if is_query(&query) {
-        return do_query(q, &query, args, &cmd).map_err(|e| missing_from_entry(e, &query));
+        let mut rs = do_query(q, &query, args, &cmd).map_err(|e| missing_from_entry(e, &query))?;
+        apply_result_types(&mut rs.columns, typed.as_deref());
+        return Ok(rs);
     }
     let rs = do_exec(q, &query, args, &cmd).map_err(|e| missing_from_entry(e, &query));
     if ["CREATE", "ALTER", "DROP"].iter().any(|c| cmd.starts_with(c)) {
         st.forget_bool_columns();
+        st.forget_table_types();
         crate::resolve::time_zone::DDL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
     rs
@@ -1162,17 +1165,12 @@ fn describe(
     query: &str,
     args: &[Value],
 ) -> Result<Option<Vec<Column>>> {
-    let query = qualify_schema_names(st, query);
-    let query = resolve_search_path(sp, st, q, &query);
-    let query = strip_public_qualifier(&query);
-    let query = resolve_current_schema(sp, st, &query);
-    let query = resolve_current_database(st, &query);
-    let query = resolve_to_regclass(&query);
-    let query = resolve_time_zones(q, &query);
-    let query = resolve_zone_values(q, &query, args);
-    let query = resolve_tsvectors(q, &query);
-    let query = crate::resolve::temporal::resolve_temporal(q, &query);
-    let query = resolve_booleans(st, q, &query);
+    let (query, typed) = split_typed(query);
+    let query = resolve_names(sp, st, q, query);
+    let query = match typed {
+        Some(_) => query,
+        None => Cow::Owned(resolve_types(st, q, &query, args).into_owned()),
+    };
     let Some(intro) = introspection_sql(&query) else {
         return Ok(None); // statement produces no rows
     };
@@ -1196,7 +1194,25 @@ fn describe(
     // parameter holds what the probe made of it, which says nothing of the real one.
     let sampled = args.is_empty() || !intro.contains("overlite_elements");
     let row = sampled && stmt.step().unwrap_or(false);
-    Ok(Some(make_columns(names, &decls, &hints, row.then_some(&stmt))))
+    let mut columns = make_columns(names, &decls, &hints, row.then_some(&stmt));
+    apply_result_types(&mut columns, typed.as_deref());
+    Ok(Some(columns))
+}
+
+/// The passes that qualify and resolve names by the session: schemas, search_path,
+/// current_schema(), current_database(), to_regclass().
+pub(crate) fn resolve_names<'a>(sp: Option<&[String]>, st: &DbState, q: &Connection, query: &'a str) -> Cow<'a, str> {
+    let a = qualify_schema_names(st, query);
+    let b = resolve_search_path(sp, st, q, &a);
+    let c = strip_public_qualifier(&b);
+    let d = resolve_current_schema(sp, st, &c);
+    let e = resolve_current_database(st, &d);
+    let f = resolve_to_regclass(&e);
+    if f == query {
+        Cow::Borrowed(query)
+    } else {
+        Cow::Owned(f)
+    }
 }
 
 /// Whether a statement is expected to return rows.

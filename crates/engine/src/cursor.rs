@@ -5,14 +5,6 @@
 
 use crate::column_types::{apply_strong_types, computed_types};
 use crate::error::Result;
-use crate::resolve::booleans::resolve_booleans;
-use crate::resolve::current_database::resolve_current_database;
-use crate::resolve::current_schema::resolve_current_schema;
-use crate::resolve::public_qualifier::strip_public_qualifier;
-use crate::resolve::regclass::resolve_to_regclass;
-use crate::resolve::schema_qualify::qualify_schema_names;
-use crate::resolve::search_path::resolve_search_path;
-use crate::resolve::time_zone::{resolve_time_zones, resolve_zone_values};
 use crate::sqlite::{DbSession, Script, Stmt, cell, do_exec, make_columns};
 use overlite_core::{Column, SqlState, Value};
 use rusqlite::{Connection, ffi};
@@ -84,17 +76,12 @@ impl DbSession {
         // not move past: a cursor's transaction takes the write lock up front.
         self.begin_writing(false)?;
         let (st, q) = (&self.state, &self.conn);
-        let query = qualify_schema_names(st, sql);
-        let query = resolve_search_path(sp, st, q, &query);
-        let query = strip_public_qualifier(&query);
-        let query = resolve_current_schema(sp, st, &query);
-        let query = resolve_current_database(st, &query);
-        let query = resolve_to_regclass(&query);
-        let query = resolve_time_zones(q, &query);
-        let query = resolve_zone_values(q, &query, args);
-        let query = crate::resolve::tsvector::resolve_tsvectors(q, &query);
-        let query = crate::resolve::temporal::resolve_temporal(q, &query);
-        let query = resolve_booleans(st, q, &query);
+        let (query, typed) = crate::resolve::split_typed(sql);
+        let query = crate::sqlite::resolve_names(sp, st, q, query);
+        let query = match typed {
+            Some(_) => query,
+            None => std::borrow::Cow::Owned(crate::resolve::resolve_types(st, q, &query, args).into_owned()),
+        };
         let mut script = Script::new(q, &query);
         let Some(stmt) = script.next()? else {
             return Err(crate::error::errf!(SqlState::SYNTAX_ERROR, "a cursor needs a query"));
@@ -110,7 +97,8 @@ impl DbSession {
         let hints = computed_types(&query, &decls);
         apply_strong_types(&mut decls, &hints);
         let row = stmt.step()?;
-        let columns = make_columns(names, &decls, &hints, row.then_some(&stmt));
+        let mut columns = make_columns(names, &decls, &hints, row.then_some(&stmt));
+        crate::resolve::apply_result_types(&mut columns, typed.as_deref());
         let pending = row.then(|| (0..decls.len()).map(|i| cell(stmt.value(i), &decls[i])).collect());
         let open = Open {
             p: stmt.into_raw(),
