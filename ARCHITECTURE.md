@@ -187,7 +187,10 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   an aggregate's ORDER BY, set-returning functions in FROM (the engine's walkers of a
   JSON array, `srf_from`, in a subquery or in place, their columns renamed where they
   read a table on their left, a star over them carrying their columns by name), and
-  in a select list (the set joined after FROM, calls side by side zipped), derived
+  in a select list (the set joined after FROM, calls side by side zipped), row
+  comparisons (`(a, b) < (1, 2)`, member by member through the typed comparison, an IN
+  list of rows joined two by two so that its depth stays within SQLite's, a row against
+  a subquery SQLite's row value), derived
   column lists (a star's through the catalog), ON CONFLICT, UPDATE ... FROM, DELETE ...
   USING (by rowid), RETURNING beside either (an item reading a joined relation a
   subquery over the join), `SET (a, b) =`, a write's WITH and its target's alias, row locks
@@ -207,7 +210,7 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   `Any`, read as a json, array or range operator's other side says. The printer
   writes from it what depends on a type (numeric exactness and the numeric form, date
   and time arithmetic and comparison, the session's TimeZone read when the statement
-  runs, AT TIME ZONE, booleans met by a string, and a boolean column that holds text
+  runs, through one conversion of what meets a timestamptz (`value`, `as_timestamptz`), AT TIME ZONE, booleans met by a string, and a boolean column that holds text
   read in both forms, tsvector, `%`, json, hstore and range operators, array
   comparison, the select-list casts, avg of integers at Postgres' scale) and ends the
   statement in the engine's mark, which carries the result columns' integer widths,
@@ -237,7 +240,9 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   applied after `rewrite` on every
   execution; the module lists it and tests/wire/translation_cache.rs holds it. `OVERLITE_REWRITE_CACHE=0` turns it off.
 - `types`: OIDs, and per type the text and binary encodings: arrays, numeric, hstore,
-  timestamps, booleans, parameter types (from the tree, `param_types`).
+  timestamps, booleans, ranges (`range`: each range type and its array under its OID,
+  range_out's text with a tstzrange's bounds in the session's zone, range_send's
+  layout), parameter types (from the tree, `param_types`).
 
 ## Errors
 
@@ -570,7 +575,15 @@ without an offset (overlite_tz_in) in the zone, and a timestamptz read from a co
 going on to a cast or a write with its offset (overlite_tz_text), so no zone misreads
 it. The AST path writes the same from its types whatever the zone, and a wall clock
 there as overlite_tz_wall, so that one translation, cached, serves every session:
-each of these functions reads the zone when the statement runs. The session restores the zone a rolled-back SET or a SET LOCAL changed, and
+each of these functions reads the zone when the statement runs. Whatever meets a
+timestamptz without being one (a timestamp, a date, a literal or a parameter, in a
+comparison, IN, BETWEEN, COALESCE, a cast, a write) goes through one conversion in
+the printer (`Emitter::value`, `as_timestamptz`), overlite_tz_in, which reads an
+array's elements so too (a timestamp[] cast to timestamptz[]); the engine's range input
+reads a tstzrange's bound without an offset the same way (`timestamptz_in_session`),
+a timestamptz DEFAULT of such a literal is folded to its instant when the table is
+created or altered, and a timestamptz plus an interval adds its days and months on the
+zone's wall clock (`temporal::shift_zoned`). The session restores the zone a rolled-back SET or a SET LOCAL changed, and
 reports each change with ParameterStatus. now() holds the transaction's start the same
 way, in a thread local the session marks at BEGIN and clears at its end.
 

@@ -420,7 +420,9 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   goes out at its width, int2, int4 or int8, by its column's type or its expression's
   (`i + 1`, `length(t)` int4, `count(*)` int8), as Postgres sends it, where every
   integer was int8; a table's rowid key keeps int8 (a serial and a bigserial key are
-  both INTEGER PRIMARY KEY in SQLite). pgx scans an int4 into int64, int32 and int as
+  both INTEGER PRIMARY KEY in SQLite) unless its DDL says it is narrower (a serial's
+  or a smallserial's key since the `/*overlite int4*/` and `int2` comments, an
+  identity's by its mark; see below). pgx scans an int4 into int64, int32 and int as
   from Postgres, and into an interface{} as int32; psycopg reads any width as int.
   AT TIME ZONE is labelled `timezone`, as Postgres labels it (it was its operand's
   name). COALESCE of a double and a numeric is a double, ROUND with digits a numeric
@@ -432,9 +434,11 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   bigint (or a star over a table with one), leaves the fast path for the typed
   translation: `SELECT id FROM t WHERE tz > '2024-01-02'` reads the literal as a
   timestamptz where it compared texts, and `SELECT * FROM t` sends an int column as
-  int4, the type Django's inspectdb reads for an IntegerField (a serial key, SQLite's
-  rowid, stays int8). A lookup over other columns keeps the fast
-  path.
+  int4, the type Django's inspectdb reads for an IntegerField. A serial key, SQLite's
+  rowid, is int4 too when its DDL says so (a serial's or an integer identity's, as
+  created since the fix for Django's suite), and leaves the fast path with it; a key
+  written `INTEGER PRIMARY KEY` by hand, and a serial key from before, stays int8 and on
+  the fast path. A lookup over other columns keeps the fast path.
 - Answers that were wrong or refused and are Postgres' now, in statements the AST path
   translates since stage 4 (tests/wire/ast_shapes.rs): a subscript of an expression
   `(a)[2]` and a slice `a[2:3]`; `a || b` of arrays and of an array and an element,
@@ -552,6 +556,22 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   of a truth value), now by the printer. A json, range or `%` operator over operands
   of known types Postgres has no such operator for is 42883 (it reached SQLite).
 
+- What Django's suite found wrong after the SQL layer moved to the parse tree, and is
+  Postgres' answer now (tests/wire/django_regressions.rs): a row compared with a row
+  (`(a, b) = (1, 2)`, `<`, `<=`, `>`, `>=`, `<>`, `IN ((..), (..))`, against a scalar
+  subquery, `IN (SELECT a, b ...)` and NOT IN), member by member as Postgres defines
+  it; avg over no rows, or only NULLs, is NULL, and avg and sum of a double are float8
+  over no rows too; -9223372036854775808 is a bigint (a long number SQLite would read
+  as a double leaves the fast path); a serial, smallserial or integer identity key goes
+  out at its width; lower() and upper() of the empty range are NULL, of a date,
+  timestamptz or numeric range typed; a range goes out under its range type, text and
+  binary, as do timestamptz[], time[] and hstore[] under theirs; json_agg and
+  jsonb_agg aggregate json as json and are NULL over no rows; a run of subscripts is
+  one element, NULL out of bounds or short of the dimensions; a jsonb key with a
+  backslash, a quote or a leading `$` is found by `->`, and `?|`/`?&` keys are text;
+  ALTER COLUMN TYPE of a serial key keeps the rowid; a Describe of a portal reports the
+  formats it was bound with (psycopg's binary cursor read binary rows as text).
+
 ## Limits
 
 Intentional, each for a case not worth more code. Grouped by what a client sees, the
@@ -571,9 +591,22 @@ such a value is read as the text passes read it.
 ### Silent: a different answer and no error
 
 - A timestamp with an offset is read as a time where a timestamp column receives or
-  meets it: in a write, a comparison with a column (`=`, `<`, on either side), a cast,
-  and a default. An expression's type is not known, so anything else keeps the text:
-  `tz IN ('...+02')`, `tz BETWEEN ...` and `lower(s) < '...+02'` compare as text.
+  meets it: in a write, a comparison with a column (`=`, `<`, on either side, IN,
+  BETWEEN), a cast, and a default. An expression whose type the typing does not know
+  keeps the text: `lower(s) < '...+02'` compares as text.
+- A timestamp, a date or text meeting a timestamptz is a wall clock in the session's
+  TimeZone wherever it meets one (a comparison, IN, BETWEEN, COALESCE and its kin, a
+  write, a key, a cast, a timestamptz[] cast, a tstzrange bound, a DEFAULT), through one
+  conversion (`as_timestamptz`, overlite_tz_in). A timestamptz DEFAULT of a zone-less
+  literal or a timestamp is that instant in the zone of the session that creates or
+  alters the table, which ADD COLUMN's rows and later inserts share; Postgres reads a
+  `'...'::timestamp` default in the inserting session's zone each time. A timestamptz
+  plus or minus an interval adds its months and days on the session's wall clock, as
+  Postgres does across a change of offset.
+- An instant past 9999-12-31 23:59:59 UTC (Django's datetime.max in a zone west of
+  UTC) is stored as `10000-01-01 ...`, which is read and written back as Postgres
+  writes it, but compares as text, before every year under 10000: `expires > now`
+  is false for it, and a DELETE of what has expired takes it.
 - AT TIME ZONE goes by the declared type of a column, through aliases and subqueries,
   and of a cast. An operand that is any other expression, but for the `+ interval` of a
   column, is taken for an instant: nothing here knows its type.
@@ -686,25 +719,29 @@ Each answers without an error unless marked so; found with Django's own tests an
 to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 
 - Arrays (silent): ARRAY_AGG goes out as text (OID 25) with FILTER, a window or ORDER BY,
-  timestamptz[] and range[] elements go out untyped, `<` and `>` of arrays compare the
-  JSON text outside a typed statement (ARRAY_AGG is not in the AST slice yet), `&&` in HAVING over ARRAY_AGG finds nothing, and JSONB_AGG over no rows is
-  `[]` where Postgres gives NULL.
-- Ranges (silent): a range goes out as text (OID 25) with no binary form; lower() and
-  upper() of a daterange or tsrange are text; outside a typed statement, `<`, `>` and `=`
-  of ranges compare text, `@>` between two casts is a syntax error (an error) and `-|-`,
-  `<<`, `>>`, `&<`, `&>` as operators are a syntax error (an error); a range stored before canonical ranges keeps
-  its text (`[1,5]` beside `[1,6)`).
+  `<` and `>` of arrays compare the JSON text outside a typed statement (ARRAY_AGG is
+  not in the AST slice yet), `&&` in HAVING over ARRAY_AGG finds nothing. A jsonb[]
+  holds its elements as strings, so a subscript of one is text. A slice followed by a
+  subscript (`g[1:1][2]`) takes the subscript as an index, where Postgres takes every
+  subscript of it as a slice. An int[][] stored before `int[][]` was read as an array of
+  ints holds its elements as strings. hstore[]::text writes its elements as JSON
+  objects (the column itself goes out as hstore[]).
+- Ranges (silent): `*` and `+` of ranges are not the intersection and the union;
+  outside a typed statement, `<`, `>` and `=` of ranges compare text, `@>` between two
+  casts is a syntax error (an error) and `-|-`, `<<`, `>>`, `&<`, `&>` as operators
+  are a syntax error (an error); a range stored before canonical ranges keeps its text
+  (`[1,5]` beside `[1,6)`).
 - Full-text search (silent): tsquery `&&` and `||` combine into a wrong query; `!!` is a
   syntax error.
-- JSONB (silent): a key with a backslash through E'' finds nothing, `?&` with keys that
-  look like numbers matches every row, DISTINCT ON over a jsonb expression orders and
-  returns it as text.
+- JSONB (silent): jsonb_build_object keeps its keys in the order given, where jsonb
+  orders them (by length, then bytes); the text of a jsonb is not spaced as Postgres
+  spaces it.
 - DISTINCT ON with LIMIT and OFFSET returns no row (silent).
 - ADD COLUMN bytea DEFAULT '\x..'::bytea fills existing rows with the wrong bytes
   (silent).
 - STRICT_WORD_SIMILARITY and `<<<->` are float8, where Postgres gives real (silent in
   the digits past float4's).
-- Catalogs (silent): smallserial reads as integer, inet as text, a column's COLLATE "C"
+- Catalogs (silent): inet goes out as text, a column's COLLATE "C"
   is not in pg_attribute, information_schema.columns.column_default of a serial is NULL,
   an index's reloptions are NULL, result-column OIDs after ADD COLUMN are int8, the
   sequence list misses some.
