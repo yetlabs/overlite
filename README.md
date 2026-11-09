@@ -180,79 +180,77 @@ started with, and a connection to it can only ever see that file. See [Many data
 
 ## Status
 
-High level, at a glance — including what's still needed to be **Postgres-ready
-for a real production system**. ✅ done · 🟡 partial · ⬜ not yet.
+overlite is a Rust server. It is tested end to end with real clients and real
+applications, and held to PostgreSQL 17's answers rather than to SQLite's.
 
-Across the full feature matrix — **157 items: ✅ 142 · 🟡 14 · ⬜ 1**
-(90% done, 99% at least partial):
+| Evidence | Result |
+|---|---|
+| Django 6.0 test suite (postgresql backend) | 98.5% of the tests that pass on PostgreSQL 17 also pass (17,912 of 18,179) |
+| Wagtail `bakerydemo` | 255 migrations, fixtures, admin edit/publish/revert, dump and reload: same as PostgreSQL |
+| Gitea | install, users, orgs, repos, push, issues, pull requests with review and merge, releases, wiki, search, repository deletion: same as PostgreSQL |
+| Prisma | `migrate deploy`, `migrate status`, `db pull` |
+| Clients | `psql`, `pg_dump`, pgx, psycopg 3, node-postgres, Prisma, gorm, pgbench |
+| This repository | about 530 wire tests that drive the real binary as a client, plus unit tests and a differential test of the SQL translation |
 
-| Area | ✅ | 🟡 | ⬜ |
-|---|--:|--:|--:|
-| Wire protocol | 14 | 0 | 0 |
-| Authentication | 9 | 0 | 0 |
-| DML (queries) | 12 | 1 | 0 |
-| DDL (schema) | 30 | 5 | 0 |
-| Data types | 11 | 4 | 0 |
-| Transactions | 8 | 1 | 0 |
-| Schemas | 10 | 0 | 0 |
-| Catalog / introspection | 21 | 1 | 1 |
-| Functions & dialect | 21 | 1 | 0 |
-| Tooling (psql/pg_dump/GUIs) | 6 | 1 | 0 |
+Point lookups on a 73.8M-row table, one machine (16 cores), against PostgreSQL 14
+with the table warm in memory:
 
-Every ✅ is exercised end-to-end against real `psql` and pgx (`make test`). The
-remaining 🟡/⬜ items — the gap to a drop-in production Postgres — are listed in
-full under [Limitations](#limitations).
+| | overlite | PostgreSQL |
+|---|--:|--:|
+| 1 client | 27k q/s | 23k q/s |
+| 8 clients | 129k q/s | 126k q/s |
+| 16 clients | 151k q/s | 163k q/s |
+| 64 clients | 139k q/s | 170k q/s |
+| new connection | 7.4 ms | 5.6 ms |
+| concurrent writes | 29k q/s | 117k q/s |
 
-Deciding whether to migrate? [**overlite vs
-PostgreSQL**](POSTGRES_ROADMAP.md) goes subsystem by subsystem — what you get,
-what is planned, and what will never be there because it belongs to SQLite.
+Writes go through SQLite's single writer, so many concurrent writers is where
+PostgreSQL stays ahead.
+
+SQL is being moved from text rewriting to a translation from PostgreSQL's own
+parse tree ([ADR 0001](docs/adr/0001-sql-ast.md)); both routes run side by side
+until the move is done.
 
 ## Limitations
 
-Everything not listed here is implemented (see Status). This is the complete set
-of gaps — 🟡 **partial** (works, with caveats) · ⬜ **not implemented**.
+The full list, with the reasons, is in [NOTES.md](NOTES.md#limits). The ones a
+client is most likely to meet:
 
-### Types
+### Answers that differ without an error
 
-- 🟡 **`numeric` infix arithmetic** — `+` `-` `*` `/` use SQLite's float operators
-  (which can't be overridden); storage, ordering, and `sum`/`avg` are exact, and
-  `dec_add`/`dec_mul`/… give exact results explicitly. Scale isn't enforced.
-- 🟡 **`hstore` `->`** returns the JSON-quoted scalar (use `->>` for text); a bare
-  insert needs the `::hstore` cast.
-- 🟡 **range & geometric/network types** — ranges work (text-stored, constructors,
-  accessors, `@>`, `&&`), but the closed `[a,b]` form is ambiguous with a
-  2-element array; `point`/`box`/… and `inet`/`cidr`/`macaddr` aren't modeled.
-- 🟡 **enum columns** — enforced via `TEXT` + `CHECK` and reported with the
-  enum's own type (so a dump round-trips), but no ordering/comparison.
-- 🟡 **composite types** — `CREATE TYPE … AS (…)` shows in `pg_type`/`\dT`, but the
-  fields aren't modeled.
-- 🟡 **`interval`** — `ts ± interval '1 day'` and `age()` work; no bare `interval`
-  value type.
-- 🟡 **integer OIDs** — every integer advertises as `int8` and `numeric` as
-  `float8` in `RowDescription` (catalog oids exceed `int4`).
+- **Arrays**: `ARRAY_AGG` with `FILTER`, a window or `ORDER BY` goes out as text,
+  and `<`/`>` between arrays compare their text.
+- **Ranges**: a range value goes out as text, and `lower()`/`upper()` of date and
+  timestamp ranges are text.
+- **Types the translation cannot see**: an expression whose type is not known
+  (a function it does not know, some subqueries) compares by SQLite's rules, e.g. a
+  date against a timestamp column, or a numeric out of an unknown function against
+  a number.
+- **Identity and serial keys** are SQLite rowids: the next id follows the highest
+  row, even one inserted with an explicit id.
+- **Transactions**: a transaction reads like READ COMMITTED until it first writes;
+  every row lock is the database's write lock, so `SKIP LOCKED` skips nothing.
+- **Full-text search** knows the `simple` and `english` configurations only.
+- **Role names** compare without case.
 
-### Functions, triggers, extensions
+### Accepted where PostgreSQL refuses
 
-- 🟡 **PL/pgSQL functions / procedures / aggregates** — accepted so migrations
-  proceed, but the body isn't executed (no procedural engine). `CREATE FUNCTION …
-  LANGUAGE sql` **is** fully supported (executed, shown in `\df`/`\sf`, dumped).
-- 🟡 **`CREATE TRIGGER`** — accepted; Postgres trigger functions (PL/pgSQL) aren't
-  executed.
-- 🟡 **`CREATE`/`DROP EXTENSION`** — a no-op; the common functions (e.g.
-  `gen_random_uuid`) are provided directly.
+- SQLite's typing still decides some expressions: `SELECT 1/0` is NULL, and a column
+  can hold a value of another type (`'abc'` in an integer column).
+- `CREATE INDEX ... USING gin|gist|brin` makes a btree index; the method is only
+  reported.
 
-### DDL & constraints
+### Not implemented
 
-- 🟡 **`information_schema.check_constraints`** — empty (SQLite checks are
-  indistinguishable from the enum-backing `IN (…)` checks).
+- **PL/pgSQL**: `CREATE FUNCTION ... LANGUAGE plpgsql` and trigger functions are
+  accepted but not run (`LANGUAGE sql` functions are).
+- **Deferred `UNIQUE`** constraints are checked at each statement (deferred foreign
+  keys are checked at commit).
+- **Composite and geometric types**, planner statistics, `ts_headline`, table
+  partitioning and foreign data wrappers (the last two answer with an error).
 
-### Query & runtime
+### Reported differently
 
-- 🟡 **`LATERAL` correlated subquery** — can't reference the left side (a SQLite
-  limit); `LATERAL` over set-returning functions works.
-- 🟡 **configurable isolation levels** — `SET`/`BEGIN ISOLATION LEVEL` accepted,
-  no effect (SQLite serializes writes).
-- 🟡 **DBeaver** — connects and browses/reads data; full validation in progress.
-- ⬜ **planner statistics** (`pg_statistic`, `pg_statistic_ext`) — empty; SQLite
-  keeps stats in a different shape (`sqlite_stat1`). (Everything backed by real
-  data — `pg_auth_members`, `pg_policy`, `pg_depend`/`pg_shdepend` — is populated.)
+- Integer columns go out as `int8` whatever their width.
+- `EXPLAIN` gives SQLite's plan in PostgreSQL's shape, with all costs at 0.
+- Error codes are PostgreSQL's; the text of errors that come from SQLite is SQLite's.
