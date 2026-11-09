@@ -13,7 +13,9 @@
 //! What a translation depends on, and how each is held:
 //!
 //! - the statement's text, the key. What the session expands before `rewrite` (enum
-//!   columns, sequence calls, session identity, RLS filters) is in that text already.
+//!   columns, sequence calls, session identity, RLS filters) is in that text already;
+//!   an expanded statement's labels are those of the statement as sent, so
+//!   `rewrite_expanded` keys it by both texts.
 //! - the collations CREATE COLLATION made (`rewrite_collate` asks the engine whether a
 //!   name is one): each entry keeps the registry's generation it was made under, and
 //!   one made under another is not answered.
@@ -23,8 +25,8 @@
 //!
 //! What it does not depend on, because it is applied after `rewrite`, on every
 //! execution: search_path and schema qualification, the session's TimeZone, the
-//! catalog's tables, columns and types (the engine's `resolve` passes), and
-//! `apply_labels`. tests/wire/translation_cache.rs runs one text across each change.
+//! catalog's tables, columns and types (the engine's `resolve` passes).
+//! tests/wire/translation_cache.rs runs one text across each change.
 
 use overlite_core::sync::MutexExt;
 use std::collections::HashMap;

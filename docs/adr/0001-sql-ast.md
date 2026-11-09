@@ -1,6 +1,6 @@
 # 0001: Translate SQL from a parse tree, not from text
 
-Status: accepted; stages 0 and 1 landed on main (below), stage 1's week of the owner's apps pending
+Status: accepted; stages 0, 1 and 2 landed on main (below), stage 1's week of the owner's apps pending
 Date: 2026-11-08
 
 ## Context
@@ -389,6 +389,121 @@ apps with no difference logged: not done, it needs the week. The means is in pla
 `OVERLITE_AST_SHADOW=n` translates one statement in n through the text passes too and
 logs a warning with both outputs for any difference the differential test would not
 explain (off by default, since the line holds the statement and its literals).
+
+## Stage 2 result
+
+For every statement the AST path translates, names and types now come from the tree,
+and the text readers of each run only for the statements left to the text passes and
+on the fast path. The passes themselves stay: 7785 statements of the corpus still need
+them (below), and stage 5 deletes what is left of `rewrite_full`.
+
+- **NULLS ordering and LIKE.** `rewrite_null_order` and `rewrite_like` no longer run
+  over the AST path's output: the printer writes each sort key's NULLS (it did since
+  the spike) and every LIKE and ILIKE as the engine matches them, ESCAPE included
+  (`a ~~ like_escape(p, e)` in the tree). `rewrite` runs `text_tail` after the text
+  passes and on the fast path only. The fast path now leaves a LIKE whose pattern is
+  not a literal or a parameter to the AST path.
+- **OFFSET** was the printer's since the spike (`LIMIT -1 OFFSET`, `LIMIT ALL`, `OFFSET
+  n ROWS`, FETCH FIRST in either order).
+- **Casts.** The printer writes a cast to every type the engine's input functions read:
+  the integer, float, numeric, boolean, char and varchar types by any spelling, date,
+  time, timetz, timestamp and timestamptz with a precision, interval without fields,
+  uuid, json, jsonb with its COLLATE JSONB, bytea, name, inet, cidr, the six range
+  types, and hstore (`hstore_in` of a literal, anything else as it is). Arrays, reg*
+  types, tsvector and an interval with fields stay with the text passes (stages 3 and
+  5).
+- **Labels.** A statement the session expands before `rewrite` (`nextval('s')` into a
+  number, an RLS filter, an enum check) was labelled by `result_labels`/`apply_labels`
+  on the text. `rewrite_expanded` now reads the labels from the tree of the statement
+  as sent and prints the expansion's tree with them (`emit::statement_labelled`) when
+  the AST path covers the expansion, keyed in the cache by both texts. Describe's
+  neutralized statement takes the same way.
+- **Parameter types.** Describe types the parameters of a statement the AST path
+  translates from its tree alone (`params::facts`): the INSERT slot each fills, by
+  column list or position, the column each meets by scope, and the row counts of
+  LIMIT, OFFSET and FETCH. The regexes of `param_types.rs` (`INSERT_INTO`,
+  `INSERT_BARE`, `LIMIT_OFFSET`, the catalog's `COMPARED`) and the text reader
+  `param_columns` run for the other statements only.
+  `parameter_slots_match_the_text_readers_over_the_corpus` holds the tree's slots and
+  counts to the regexes': of the 77 translated statements with either, the tree finds
+  the same in 75 and more in 2, never fewer.
+- **The slice, wider.** Functions no pass touches (each name looked for in the rewrite,
+  types and session code: string, math and aggregate functions, date_trunc, to_char,
+  age), GREATEST and LEAST, IS [NOT] TRUE and FALSE.
+
+**The corpus** (`make ast-corpus` added the 203 statements the wire suite now sends
+that it lacked: 15653 statements), main before this stage against it:
+
+| | fast path | text passes | AST path |
+|---|---|---|---|
+| before stage 2 | 3809 | 8435 | 3409 |
+| stage 2 | 3808 | 7785 | 4060 |
+
+Of the 4060: identical 2397, identical but parentheses 1581, intended 82, unexplained 0.
+The statement that left the fast path is `LIKE CASE ...` (below). The intended
+differences, by reason:
+
+- 26 labels: FigureColname calls an expression over a cast or a column `?column?` and
+  a CASE `case`, where the text path named it by its operand (`b LIKE 'x'` was `b`,
+  a CASE whose arms cast to jsonb was `jsonb`).
+- 23 `NOT (x IN (subquery))` written `x NOT IN (subquery)`; 11 set members needing no
+  wrapper; 2 parenthesized columns; 1 quoted name (as in stage 1).
+- 13 jsonb: the text path gave `::jsonb` its COLLATE JSONB and not `::JSONB`, Django's
+  spelling, so `'[3]'::JSONB < '[10]'::JSONB` compared the texts and was false.
+- 4 casts of casts: `'[0,10)'::int4range::int4range` (Django's range fields) left a `::`
+  in the SQLite SQL, or after a `NULL::int8range` the text path wrapped the whole
+  VALUES row in a CAST; both syntax errors.
+- 2 LIKE patterns: the text pass reads a pattern up to a word that may end one, and
+  `LIKE CASE WHEN ...` became `GLOB overlite_like_glob(CASE, '\') WHEN ...`.
+
+Each of those bugs has a wire test in tests/wire/ast_fixes.rs that fails on the
+commit before this stage: the LIKE over a CASE, the range casts, the capitalized
+jsonb, the labels of an expanded statement (`SELECT b LIKE 'x%', nextval('s')`), and
+`LIMIT ($1)`, whose parameter the regex left unspecified and the tree types bigint.
+
+Unsupported now, by first node: utility statements 3299, operators 2682 (2419 of them
+`~`, the regex tests of the wire suite), functions 550, catalog relations 256,
+qualified functions 232, FROM items 127, parse errors 106, the rest under 81 each; cast
+types fell from 310 to 25 and LIKE ESCAPE from 58 to 0.
+
+**Performance.** pgbench as in stage 1 (4 clients, 4 threads, 8 s, each binary on its
+own copy of the table, main e907372 against stage 2, the order of the two swapped in
+round 2), tps per round:
+
+| script, mode | main | stage 2 | means |
+|---|---|---|---|
+| lookup (fast path), simple | 114583 / 115115 / 115123 | 113923 / 114799 / 115373 | −0.2% |
+| lookup (fast path), prepared | 97960 / 98260 / 97398 | 98861 / 98208 / 96857 | +0.1% |
+| lookup2 (AST slice), simple | 72947 / 73257 / 73100 | 74351 / 74251 / 73698 | +1.4% |
+| lookup2 (AST slice), prepared | 71133 / 71243 / 70829 | 71565 / 71349 / 71151 | +0.4% |
+| mix, simple | 13091 / 13142 / 13128 | 13201 / 12980 / 13093 | −0.2% |
+| mix, prepared | 13166 / 13238 / 13179 | 13255 / 13120 / 12967 | −0.6% |
+
+All within the spread of one binary's own rounds. The statement mix in-process
+(`time_the_statement_mix`, µs per statement, three rounds, main's test binary then
+this one's, the corpus before its growth):
+
+| mix | text passes | AST path, no cache | `rewrite()`, cache warm |
+|---|---|---|---|
+| all 15450, main | 17.1 / 17.0 / 17.3 | 18.1 / 18.0 / 18.2 | 5.28 / 5.16 / 5.21 |
+| all 15450, stage 2 | 17.2 / 16.9 / 17.2 | 16.2 / 16.6 / 15.9 | 5.19 / 5.28 / 5.12 |
+| the 12068 that read or write rows, main | 17.0 / 16.7 / 16.7 | 15.8 / 15.7 / 15.6 | 0.20 / 0.18 / 0.19 |
+| the 12068 that read or write rows, stage 2 | 16.8 / 16.6 / 16.5 | 13.3 / 13.2 / 13.4 | 0.18 / 0.19 / 0.19 |
+
+The uncached AST route is 1.5-2.4 µs faster per statement: more statements skip the
+text passes, and none pays the two token scans after the printer.
+
+**Exit criteria.** `make check` green with the AST path on, and the differential test
+at zero unexplained: met. The stage's share of the corpus translated: 644 statements
+more, every cast and LIKE ESCAPE of the slice's statements among them. "Those passes
+deleted; `literals_survive_the_whole_rewrite` loses their words": not met, by the
+order of this plan: `result_labels`/`apply_labels`, the regexes of `param_types.rs`,
+`casts`, `typed_cast`, `bool_cast`, `null_order`, `offset` and `like` still serve the
+7785 statements of the corpus the slice leaves to the text passes, and the fast path
+(`null_order`, `like`). They no longer run on a statement the AST path translates,
+which is what stage 2 can do while the text passes route exists; they go when that
+route does (stage 5), or each as soon as `rewrite_full` counts no statement needing
+it.
 
 ## Risks
 
