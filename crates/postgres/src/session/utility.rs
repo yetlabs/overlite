@@ -50,7 +50,7 @@ pub(crate) fn intercept_utility(sql: &str) -> Option<ResultSet> {
             // CREATE/DROP EXTENSION is ddl/objects.rs's: it takes only what is provided.
             // CREATE/DROP PROCEDURE/AGGREGATE: SQLite has no stored routines, but
             // accept the DDL so migrations proceed. FUNCTION is NOT here: it reaches
-            // the engine, which executes LANGUAGE sql bodies (by inlining) and no-ops
+            // the engine, which stores LANGUAGE sql bodies (the session inlines them) and no-ops
             // other languages. The keyword is where the object's kind goes, never a
             // table or an index named so.
             let up = sql.to_uppercase();
@@ -90,6 +90,8 @@ pub(crate) fn alter_is_noop(sql: &str) -> bool {
         "DATABASE" => false,
         // VALIDATE CONSTRAINT: a constraint here held for every row when it was added.
         "TABLE" => up.contains(" OWNER TO ") || up.contains(" ADD CONSTRAINT ") || up.contains(" VALIDATE CONSTRAINT "),
+        // A function's owner decides what its SECURITY DEFINER body may read: GRANT's.
+        "FUNCTION" | "ROUTINE" | "PROCEDURE" => false,
         _ => up.contains(" OWNER TO "),
     }
 }

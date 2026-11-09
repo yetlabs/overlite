@@ -5,7 +5,7 @@ use crate::catalog::rls_cache::RlsCache;
 use crate::catalog::schema::db_name_from_path;
 use crate::resolve::booleans::BoolColumns;
 use overlite_core::sync::{MutexExt, RwLockExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
@@ -22,6 +22,9 @@ pub(crate) struct DbState {
     pub(crate) rls: RlsCache,
     /// The boolean columns, as resolve_booleans reads them; None until first asked.
     pub(crate) bools: RwLock<Option<Arc<BoolColumns>>>,
+    /// The names, lower-cased, of the LANGUAGE sql functions a call may reach
+    /// (sql_funcs): each connection that changes them, or opens, reads them again.
+    pub(crate) func_names: RwLock<Arc<HashSet<String>>>,
 }
 
 static DB_STATES: LazyLock<Mutex<HashMap<String, Arc<DbState>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -41,6 +44,7 @@ pub(crate) fn state_for(path: &str) -> Arc<DbState> {
         schema_generation: AtomicU64::new(0),
         rls: RlsCache::default(),
         bools: RwLock::new(None),
+        func_names: RwLock::new(Arc::new(HashSet::new())),
     });
     states.insert(path.to_string(), st.clone());
     st

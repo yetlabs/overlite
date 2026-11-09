@@ -13,7 +13,6 @@ use crate::resolve::regclass::resolve_to_regclass;
 use crate::resolve::schema_qualify::qualify_schema_names;
 use crate::resolve::search_path::resolve_search_path;
 use crate::resolve::time_zone::{resolve_time_zones, resolve_zone_values};
-use crate::sql_funcs::rewrite::rewrite_sql_functions;
 use crate::sqlite::{DbSession, Script, Stmt, cell, do_exec, make_columns};
 use overlite_core::{Column, SqlState, Value};
 use rusqlite::{Connection, ffi};
@@ -91,7 +90,6 @@ impl DbSession {
         let query = resolve_current_schema(sp, st, &query);
         let query = resolve_current_database(st, &query);
         let query = resolve_to_regclass(&query);
-        let query = rewrite_sql_functions(&query);
         let query = resolve_time_zones(q, &query);
         let query = resolve_zone_values(q, &query, args);
         let query = crate::resolve::tsvector::resolve_tsvectors(q, &query);

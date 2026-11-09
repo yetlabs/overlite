@@ -81,14 +81,12 @@ impl Session {
             self.mark_tx_failed();
             return self.c.send_error(e.sql_state(), e.message());
         }
-        let rewritten = match self.rewrite_for_exec(&final_, &[]) {
-            Ok(r) => r,
-            Err(e) => return self.send_exec_error(&e),
-        };
-        let rs = match self.exec(&rewritten, &[]) {
+        // As the statement itself runs, its INSERT held to its table's policies.
+        let rs = match self.run_statement(&final_, &[]) {
             Ok(rs) => rs,
             Err(e) => {
-                log_query_error("execute-sql", &e, &final_, &rewritten);
+                log_query_error("execute-sql", &e, &final_, &final_);
+                self.mark_tx_failed();
                 return self.send_exec_error(&e);
             }
         };

@@ -86,6 +86,7 @@ impl SqlState {
     pub const INVALID_COLUMN_REFERENCE: SqlState = SqlState("42P10");
     pub const INVALID_RECURSION: SqlState = SqlState("42P19");
     pub const PROGRAM_LIMIT_EXCEEDED: SqlState = SqlState("54000");
+    pub const STATEMENT_TOO_COMPLEX: SqlState = SqlState("54001");
     pub const TOO_MANY_COLUMNS: SqlState = SqlState("54011");
     pub const WINDOWING_ERROR: SqlState = SqlState("42P20");
     pub const DISK_FULL: SqlState = SqlState("53100");

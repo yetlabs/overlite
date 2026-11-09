@@ -1,14 +1,25 @@
-//! LANGUAGE sql functions are executed by inlining: a call f(a, b) is rewritten
-//! into the function's body with the arguments substituted, wrapped in
-//! parentheses. PL/pgSQL and other languages are accepted as a no-op.
+//! LANGUAGE sql functions are executed by inlining: a call f(a, b) is replaced by the
+//! function's body with the arguments substituted, wrapped in parentheses.
+//! PL/pgSQL and other languages are accepted as a no-op.
 //!
-//! Definitions live in `_overlite_functions` (persistent, hidden) and are cached
-//! in memory for the rewrite; the cache is reloaded on CREATE/DROP FUNCTION and
-//! per connection.
+//! The engine stores the definitions and finds the calls ([`DbSession::function_calls`]);
+//! it inlines nothing itself. The protocol layer does, before it runs a statement,
+//! because what a body reads is held to the privileges and policies of the role the
+//! body runs as (the caller's, or its owner's for SECURITY DEFINER), which only that
+//! layer knows. A call the protocol layer has not inlined reaches SQLite as a call of
+//! a function SQLite does not have, and fails.
+//!
+//! Definitions live in `_overlite_functions` (persistent, hidden). The names of the
+//! functions a call may reach are kept per database ([`DbState`]), to find calls without
+//! a query; the definitions are read from the table, so a transaction sees its own. A
+//! function named as one SQLite has (a built-in, or a function of this engine's) is
+//! stored but never inlined: a call of that name is the built-in's, as pg_catalog comes
+//! first in Postgres.
 
 pub(crate) mod parse;
 pub(crate) mod rewrite;
 
+use crate::db_state::DbState;
 use crate::error::Result;
 use crate::resolve::schema_qualify::lowercase;
 use crate::sql_funcs::parse::{parse_create_function, parse_drop_function};
@@ -19,7 +30,7 @@ use overlite_core::text::{eq_fold, split_words, trim_start_chars};
 use overlite_core::{ResultSet, Value};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 pub(crate) const FUNCTIONS_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS _overlite_functions (
   name    TEXT COLLATE NOCASE,
@@ -30,14 +41,23 @@ pub(crate) const FUNCTIONS_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS _over
   args    TEXT DEFAULT '',
   rettype TEXT DEFAULT '',
   src     TEXT DEFAULT '',
+  owner   TEXT DEFAULT '',
+  secdef  INTEGER DEFAULT 0,
+  acl     TEXT DEFAULT NULL,
   PRIMARY KEY (name, arity)
 )"#;
 
-/// Migrate older tables (each errors harmlessly if present).
-pub(crate) static FUNCTIONS_ADD_COLS_DDL: [&str; 3] = [
+/// Migrate older tables (each errors harmlessly if present). A function from before
+/// owners has none: like a table with no owner row, only a role that bypasses the
+/// checks may change it. It was created SECURITY INVOKER whatever it said, which is how
+/// it ran. acl NULL is the default ACL: EXECUTE for PUBLIC, and its owner.
+pub(crate) static FUNCTIONS_ADD_COLS_DDL: [&str; 6] = [
     r#"ALTER TABLE _overlite_functions ADD COLUMN args TEXT DEFAULT ''"#,
     r#"ALTER TABLE _overlite_functions ADD COLUMN rettype TEXT DEFAULT ''"#,
     r#"ALTER TABLE _overlite_functions ADD COLUMN src TEXT DEFAULT ''"#,
+    r#"ALTER TABLE _overlite_functions ADD COLUMN owner TEXT DEFAULT ''"#,
+    r#"ALTER TABLE _overlite_functions ADD COLUMN secdef INTEGER DEFAULT 0"#,
+    r#"ALTER TABLE _overlite_functions ADD COLUMN acl TEXT DEFAULT NULL"#,
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -48,6 +68,8 @@ pub(crate) struct SqlFunc {
     params: Vec<String>, // parameter names ("" for an unnamed slot), len == arity
     body: String,        // the SQL body, e.g. "SELECT price * (1 + rate)"
     lang: String,
+    /// SECURITY DEFINER, as CREATE FUNCTION said.
+    secdef: bool,
     pub(crate) args: String,    // raw param list, e.g. "price numeric, rate numeric"
     pub(crate) rettype: String, // e.g. "numeric" or "TABLE(id int, sal int)"
     pub(crate) src: String,     // the original CREATE FUNCTION statement
@@ -56,57 +78,62 @@ pub(crate) struct SqlFunc {
 /// Offsets a function's rowid into its catalog oid.
 const FUNC_OID_BASE: i64 = 500000;
 
-#[derive(Debug, Default)]
-struct FuncCache {
-    func_cache: HashMap<String, Arc<SqlFunc>>, // key: lower(name)+"/"+arity
-    func_names: HashSet<String>,               // lower(name) present, for a quick scan guard
-    func_by_oid: HashMap<i64, Arc<SqlFunc>>,   // oid -> def, for pg_get_function*
-}
-
-static FUNC_CACHE: LazyLock<RwLock<FuncCache>> = LazyLock::new(|| RwLock::new(FuncCache::default()));
+/// The definitions by oid, for pg_get_functiondef and its kin, which run as SQLite
+/// functions and see no database: what they render is display only.
+static FUNC_BY_OID: LazyLock<RwLock<HashMap<i64, Arc<SqlFunc>>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// The definition for a user-function oid.
 pub(crate) fn func_by_oid_lookup(oid: i64) -> Option<Arc<SqlFunc>> {
-    FUNC_CACHE.read_locked().func_by_oid.get(&oid).cloned()
+    FUNC_BY_OID.read_locked().get(&oid).cloned()
 }
 
-fn func_key(name: &str, arity: i64) -> String {
-    format!("{}/{}", lowercase(name), arity)
+/// The names, lower-cased, of every function SQLite has on a connection: its own and
+/// this engine's, the same on every connection. Set once, by the first connection.
+static BUILTINS: OnceLock<HashSet<String>> = OnceLock::new();
+
+/// Notes the functions SQLite has on q, once its functions are registered.
+pub(crate) fn note_builtins(q: &Connection) {
+    if BUILTINS.get().is_some() {
+        return;
+    }
+    let names = q
+        .prepare("SELECT DISTINCT lower(name) FROM pragma_function_list")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()
+        });
+    if let Ok(names) = names {
+        let _ = BUILTINS.set(names);
+    }
 }
 
-fn set_function_cache(fns: Vec<SqlFunc>) {
-    let mut m = HashMap::with_capacity(fns.len());
+/// Whether a call of name may reach a stored function: not when SQLite has a function
+/// of that name, nor for the prefixes of the catalog's and this engine's.
+fn inlinable(name: &str) -> bool {
+    let low = lowercase(name);
+    !(low.starts_with("pg_")
+        || low.starts_with("overlite_")
+        || BUILTINS.get().is_some_and(|b| b.contains(low.as_ref())))
+}
+
+fn set_function_cache(st: &DbState, fns: Vec<SqlFunc>) {
     let mut names = HashSet::with_capacity(fns.len());
-    let mut by_oid = HashMap::with_capacity(fns.len());
+    let mut by_oid = FUNC_BY_OID.write_locked();
     for f in fns {
         let f = Arc::new(f);
-        m.insert(func_key(&f.name, f.arity), f.clone());
-        names.insert(lowercase(&f.name).into_owned());
+        if inlinable(&f.name) {
+            names.insert(lowercase(&f.name).into_owned());
+        }
         if f.oid != 0 {
             by_oid.insert(f.oid, f);
         }
     }
-    *FUNC_CACHE.write_locked() = FuncCache {
-        func_cache: m,
-        func_names: names,
-        func_by_oid: by_oid,
-    };
+    drop(by_oid);
+    *st.func_names.write_locked() = Arc::new(names);
 }
 
-fn lookup_func(name: &str, arity: i64) -> Option<Arc<SqlFunc>> {
-    FUNC_CACHE.read_locked().func_cache.get(&func_key(name, arity)).cloned()
-}
-
-fn any_func_named(name: &str) -> bool {
-    FUNC_CACHE.read_locked().func_names.contains(lowercase(name).as_ref())
-}
-
-fn have_functions() -> bool {
-    !FUNC_CACHE.read_locked().func_cache.is_empty()
-}
-
-/// Rebuilds the cache from _overlite_functions. A failed read keeps the cache.
-fn reload_functions(q: &Connection) {
+/// Rebuilds the names from _overlite_functions. A failed read keeps them.
+pub(crate) fn reload_functions(st: &DbState, q: &Connection) {
     let Ok(rs) = do_query(
         q,
         "SELECT rowid, name, arity, params, body, lang, args, rettype, src FROM _overlite_functions",
@@ -124,7 +151,7 @@ fn reload_functions(q: &Connection) {
             fns.push(f);
         }
     }
-    set_function_cache(fns);
+    set_function_cache(st, fns);
 }
 
 /// Scans one row of reload_functions; `None` is a Scan error (a NULL column).
@@ -159,7 +186,7 @@ fn scan_func(row: &[Value]) -> Option<SqlFunc> {
 /// Rebuilds the cache from rows of columns joined with char(30) (params itself
 /// uses char(31) between names). Used by setup_connection, which only has a
 /// single-column query helper.
-pub(crate) fn refresh_functions_from_rows(rows: &[String]) {
+pub(crate) fn refresh_functions_from_rows(st: &DbState, rows: &[String]) {
     let mut fns = Vec::new();
     for r in rows {
         let c: Vec<&str> = r.split('\x1e').collect();
@@ -184,13 +211,17 @@ pub(crate) fn refresh_functions_from_rows(rows: &[String]) {
         }
         fns.push(f);
     }
-    set_function_cache(fns);
+    set_function_cache(st, fns);
 }
 
 /// Handles CREATE/DROP FUNCTION. A LANGUAGE sql function is stored and cached;
 /// any other language is accepted without storing (a no-op). Storage errors are
 /// swallowed, so this never returns Err.
-pub(crate) fn try_function_ddl(q: &Connection, sql: &str) -> Result<Option<ResultSet>> {
+///
+/// CREATE OR REPLACE keeps the function's owner and ACL, as Postgres does; the
+/// protocol layer records the owner of a new one and has checked who may replace or
+/// drop one.
+pub(crate) fn try_function_ddl(st: &DbState, q: &Connection, sql: &str) -> Result<Option<ResultSet>> {
     let w = leading_word(sql);
     if eq_fold(w, "create") && has_function_keyword(sql) {
         if let Some(f) = parse_create_function(sql)
@@ -207,15 +238,18 @@ pub(crate) fn try_function_ddl(q: &Connection, sql: &str) -> Result<Option<Resul
                 Value::Text(f.args),
                 Value::Text(f.rettype),
                 Value::Text(sql.trim().to_string()),
+                Value::Int(i64::from(f.secdef)),
             ];
             let r = do_exec(
                 q,
-                "INSERT OR REPLACE INTO _overlite_functions (name, arity, params, body, lang, args, rettype, src) VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO _overlite_functions (name, arity, params, body, lang, args, rettype, src, secdef) VALUES (?,?,?,?,?,?,?,?,?) \
+                 ON CONFLICT (name, arity) DO UPDATE SET params = excluded.params, body = excluded.body, lang = excluded.lang, \
+                 args = excluded.args, rettype = excluded.rettype, src = excluded.src, secdef = excluded.secdef",
                 &args,
                 "",
             );
             if r.is_ok() {
-                reload_functions(q);
+                reload_functions(st, q);
             }
         }
         return Ok(Some(ResultSet {
@@ -237,7 +271,7 @@ pub(crate) fn try_function_ddl(q: &Connection, sql: &str) -> Result<Option<Resul
                 let args = [Value::Text(name)];
                 let _ = do_exec(q, "DELETE FROM _overlite_functions WHERE name = ?", &args, "");
             }
-            reload_functions(q);
+            reload_functions(st, q);
         }
         return Ok(Some(ResultSet {
             command: "DROP FUNCTION".into(),
@@ -245,6 +279,25 @@ pub(crate) fn try_function_ddl(q: &Connection, sql: &str) -> Result<Option<Resul
         }));
     }
     Ok(None)
+}
+
+/// The function a CREATE or DROP FUNCTION names: its name, its arity (-1 for a DROP
+/// without an argument list, which means every one of that name), and whether it is a
+/// CREATE of a LANGUAGE sql function. None for any other statement.
+pub fn function_ddl_target(sql: &str) -> Option<(String, i64, bool)> {
+    let w = leading_word(sql);
+    if !(eq_fold(w, "create") || eq_fold(w, "drop")) || !has_function_keyword(sql) {
+        return None;
+    }
+    if eq_fold(w, "create") {
+        let f = parse_create_function(sql)?;
+        return Some((f.name, f.arity, eq_fold(&f.lang, "sql")));
+    }
+    if eq_fold(w, "drop") {
+        let (name, arity) = parse_drop_function(sql)?;
+        return Some((name, arity, false));
+    }
+    None
 }
 
 fn has_function_keyword(sql: &str) -> bool {

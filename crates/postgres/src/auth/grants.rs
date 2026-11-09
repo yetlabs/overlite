@@ -6,17 +6,20 @@ use crate::ddl::alter::split_qualified_ref;
 use crate::ddl::sequences::is_ident_part;
 use crate::error::{Result, errf};
 use crate::session::Session;
-use crate::session::utility::first_word_upper;
+use crate::session::utility::{first_word_upper, second_word_upper};
 use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted, split_words, trim_chars, trim_end_chars};
 use overlite_core::{Command, SqlState, Value};
 use overlite_engine::{code_only, forget_table_rows_sql, split_stored_name, stored_table_name};
 use pg_query::NodeEnum;
 use pg_query::protobuf as pb;
 
-/// Whether sql is a GRANT or REVOKE statement.
+/// Whether sql is a GRANT or REVOKE statement, or an ALTER FUNCTION (ROUTINE,
+/// PROCEDURE), which changes who owns a function and as whom its body runs.
 pub(crate) fn is_grant(sql: &str) -> bool {
     let w = first_word_upper(sql);
-    w == "GRANT" || w == "REVOKE"
+    w == "GRANT"
+        || w == "REVOKE"
+        || (w == "ALTER" && matches!(second_word_upper(sql).as_str(), "FUNCTION" | "ROUTINE" | "PROCEDURE"))
 }
 
 impl Session {
@@ -24,6 +27,15 @@ impl Session {
     /// TO role) and non-table object grants are accepted as no-ops. Returns the
     /// command tag ("GRANT"/"REVOKE").
     pub(crate) fn apply_grant(&mut self, sql: &str) -> Result<Command> {
+        if let Some(r) = self.try_function_acl(sql) {
+            return r;
+        }
+        if eq_fold(&first_word_upper(sql), "ALTER") {
+            return Err(errf!(
+                SqlState::FEATURE_NOT_SUPPORTED,
+                "ALTER FUNCTION supports OWNER TO and SECURITY DEFINER | INVOKER only"
+            ));
+        }
         let revoke = eq_fold(&first_word_upper(sql), "REVOKE");
         let tag = Command::from(if revoke { "REVOKE" } else { "GRANT" });
 
@@ -249,7 +261,50 @@ impl Session {
     /// Keeps _overlite_owners in step with CREATE and DROP TABLE, run after the
     /// statement. A row holds the table's stored name, as privileges read it.
     pub(crate) fn record_ownership(&mut self, sql: &str) {
+        self.record_function_owner(sql);
         let f = split_words(sql);
+        // A view is its creator's, as a table is: it reads with its owner's privileges.
+        if f.len() >= 3 && eq_fold(f[0], "create") {
+            let or_replace = eq_fold(f[1], "or") && f.len() > 4;
+            let kind = if or_replace { 3 } else { 1 };
+            let kind = kind
+                + f[kind..]
+                    .iter()
+                    .take_while(|w| eq_fold(w, "temp") || eq_fold(w, "temporary"))
+                    .count();
+            if f.get(kind).is_some_and(|w| eq_fold(w, "view")) {
+                let mut at = kind + 1;
+                if f.get(at).is_some_and(|w| eq_fold(w, "if")) {
+                    at += 3;
+                }
+                let name = f.get(at).map(|n| n.split('(').next().unwrap_or(n)).unwrap_or_default();
+                if !name.is_empty() {
+                    let conflict = if or_replace { "IGNORE" } else { "REPLACE" };
+                    let q = format!(
+                        "INSERT OR {conflict} INTO _overlite_owners (tablename, owner) VALUES ({}, {})",
+                        quote_literal(&self.stored_name(name)),
+                        quote_literal(&self.current_role)
+                    );
+                    let _ = self.exec(&q, &[]);
+                }
+                return;
+            }
+        }
+        if f.len() >= 3 && eq_fold(f[0], "drop") && eq_fold(f[1], "view") {
+            let mut at = 2;
+            if f.get(2).is_some_and(|w| eq_fold(w, "if")) {
+                at = 4;
+            }
+            for name in f[at.min(f.len())..].join(" ").split(',') {
+                let name = name.split_whitespace().next().unwrap_or_default().trim_end_matches(';');
+                if name.is_empty() || eq_fold(name, "cascade") || eq_fold(name, "restrict") {
+                    continue;
+                }
+                let stored = self.stored_name(name);
+                self.forget_table(&stored);
+            }
+            return;
+        }
         if f.len() < 3 || !eq_fold(f[1], "table") {
             return;
         }

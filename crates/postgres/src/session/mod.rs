@@ -12,6 +12,7 @@ pub(crate) mod search_path;
 pub(crate) mod time_zone;
 pub(crate) mod utility;
 
+use crate::auth::functions::Inline;
 use crate::auth::grants::is_grant;
 use crate::auth::rls::is_rls_ddl;
 use crate::auth::roles::is_role_ddl;
@@ -123,6 +124,9 @@ pub(crate) struct Session {
 
     /// DECLAREd cursors.
     pub(crate) cursors: cursor::Cursors,
+
+    /// The triggers whose bodies the privilege check is inside, innermost last.
+    pub(crate) checking_triggers: Vec<String>,
 }
 
 /// How a prepared statement runs: most reach the engine, and the rest are the
@@ -154,6 +158,9 @@ enum Route {
     SearchPath(String),
     /// DECLARE, FETCH, MOVE, CLOSE.
     Cursor(String),
+    /// EXPLAIN, run at Execute, as ANALYZE runs what it explains; with the columns
+    /// a Describe answers.
+    Explain(String, ResultSet),
 }
 
 #[derive(Debug, Default)]
@@ -188,7 +195,7 @@ impl Prepared {
     /// The result to describe, for a statement that has one in hand.
     fn utility(&self) -> Option<&ResultSet> {
         match &self.route {
-            Route::Utility(rs) => Some(rs),
+            Route::Utility(rs) | Route::Explain(_, rs) => Some(rs),
             _ => None,
         }
     }
@@ -267,6 +274,7 @@ impl Session {
             notify,
             tx_advisory: Vec::new(),
             cursors: cursor::Cursors::default(),
+            checking_triggers: Vec::new(),
         }
     }
 
@@ -278,6 +286,12 @@ impl Session {
         let skip_all = self.take_row_locks(raw)?;
         let raw = &*self.identity_insert(raw)?;
         let x = self.apply_rls(raw);
+        // After the statement's own policies: each body inlined is read through the
+        // policies of the role it runs as, and is not to be read through these again.
+        let x = match self.db.has_sql_functions().then(|| inline_mode(&x)).flatten() {
+            Some(mode) => self.inline_functions(&x, mode)?,
+            None => x,
+        };
         let x = self.expand_session_user(&x);
         let x = self.expand_sequences(&x)?;
         let x = self.expand_advisory_locks(&x, params)?;
@@ -293,6 +307,31 @@ impl Session {
             return Ok(["SELECT * FROM (", &sql, ") WHERE 0"].concat());
         }
         Ok(sql)
+    }
+
+    /// Runs a statement that reaches the engine as a statement does once its
+    /// privileges are checked: its nextval defaults, the INSERT check of its table's
+    /// policies, the rewrite, and the ownership of what it creates.
+    pub(crate) fn run_statement(&mut self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        let sql = self.apply_column_defaults(sql);
+        if let Some(r) = self.try_rls_insert(&sql, params) {
+            return r;
+        }
+        let rewritten = self.rewrite_for_exec(&sql, params)?;
+        let rs = self.exec(&rewritten, params)?;
+        self.record_ownership(&sql);
+        Ok(rs)
+    }
+
+    /// raw with its calls of stored functions inlined as written, for a Describe:
+    /// the engine inlines none, and a call left in fails there.
+    fn described_text(&mut self, raw: &str) -> String {
+        match self.db.has_sql_functions().then(|| inline_mode(raw)).flatten() {
+            Some(_) => self
+                .inline_functions(raw, Inline::Plain)
+                .unwrap_or_else(|_| raw.to_string()),
+            None => raw.to_string(),
+        }
     }
 
     /// A SELECT ... FOR UPDATE (SHARE, ...) in a transaction takes the write lock,
@@ -523,7 +562,12 @@ impl Session {
         if let Some(route) = self.route_of(&raw) {
             return self.put_prepared(name, Prepared::routed(route));
         }
-        let sql = rewrite(&raw);
+        let described = self.described_text(&raw);
+        let sql = if described == raw {
+            rewrite(&raw)
+        } else {
+            crate::rewrite::rewrite_expanded(&raw, &described)
+        };
         let num_params = count_params(&sql);
         self.put_prepared(
             name,
@@ -582,10 +626,11 @@ impl Session {
             return Some(Route::SetRole(text()));
         }
         if explain::is_explain(raw) {
-            // The plan is built here, at Parse; a statement the plan cannot be had
-            // for goes to the engine, which reports why.
-            if let Ok(rs) = self.explain(raw) {
-                return Some(Route::Utility(rs));
+            // The plan is built at Execute, after the privilege check, as ANALYZE runs
+            // the statement. One the session does not explain (SQLite's EXPLAIN QUERY
+            // PLAN) goes to the engine, checked there.
+            if let Some(columns) = explain::plan_columns(raw) {
+                return Some(Route::Explain(text(), columns));
             }
         }
         if let Some(rs) = intercept_utility(raw) {
@@ -765,7 +810,9 @@ impl Session {
         if has_seq_func(&raw) || has_advisory_func(&raw) {
             // Describe must parse for column types but never advance a sequence
             // or take a lock; neutralize the calls to a constant, then rewrite.
-            desc_sql = crate::rewrite::rewrite_expanded(&raw, &neutralize_advisory_locks(&neutralize_sequences(&raw)));
+            let described = self.described_text(&raw);
+            desc_sql =
+                crate::rewrite::rewrite_expanded(&raw, &neutralize_advisory_locks(&neutralize_sequences(&described)));
         }
         let cols = match self.describe_sql(&desc_sql, &args) {
             Ok(c) => c,
@@ -975,6 +1022,21 @@ impl Session {
                 }
                 return self.c.send_command_complete(&u.command_tag());
             }
+            Route::Explain(sql, _) => {
+                let r = self.check_privileges(sql).and_then(|()| self.explain(sql));
+                return match r {
+                    Ok(rs) => {
+                        if !self.send_rows_of(&rs, &pt.formats)? {
+                            return Ok(());
+                        }
+                        self.c.send_command_complete(&rs.command_tag())
+                    }
+                    Err(e) => {
+                        self.mark_tx_failed();
+                        self.proto_exec_error(&e)
+                    }
+                };
+            }
             Route::Cursor(sql) => {
                 return match self.cursor_statement(sql, &pt.params) {
                     Ok(out) => {
@@ -1167,6 +1229,29 @@ impl Drop for Session {
 }
 
 /// Whether a statement writes and hands rows back.
+/// How the calls of stored functions in sql are inlined before it runs: for running
+/// it, or as written in what it stores (a view, a trigger, a column's default), or
+/// not at all in a statement that defines or drops a function.
+fn inline_mode(sql: &str) -> Option<Inline> {
+    let words = overlite_core::text::split_words(sql);
+    let word = |i: usize| words.get(i).map(|w| w.to_ascii_lowercase()).unwrap_or_default();
+    match word(0).as_str() {
+        "create" => {
+            if crate::auth::privileges::create_table_as_query(sql).is_some() {
+                return Some(Inline::Exec);
+            }
+            let kind = if word(1) == "or" { word(3) } else { word(1) };
+            match kind.as_str() {
+                "function" | "procedure" | "aggregate" => None,
+                _ => Some(Inline::Plain),
+            }
+        }
+        "drop" | "comment" | "grant" | "revoke" => None,
+        "alter" => Some(Inline::Plain),
+        _ => Some(Inline::Exec),
+    }
+}
+
 fn returns_rows_from_write(sql: &str) -> bool {
     matches!(first_word_upper(sql).as_str(), "INSERT" | "UPDATE" | "DELETE")
         && code_only(sql)

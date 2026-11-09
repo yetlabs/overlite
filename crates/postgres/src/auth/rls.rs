@@ -7,6 +7,7 @@
 //! A superuser, a BYPASSRLS role, an unmanaged role, or the table owner (unless
 //! FORCE) is not subject. With RLS on and no permissive policy, access is denied.
 
+use crate::auth::functions::Inline;
 use crate::auth::grants::index_word;
 use crate::auth::privileges::{Privilege, lowercase, tables_after, truthy};
 use crate::ddl::alter::split_qualified_ref;
@@ -41,7 +42,7 @@ pub(crate) fn is_rls_ddl(sql: &str) -> bool {
 
 /// What a policy applies to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PolicyCommand {
+pub(crate) enum PolicyCommand {
     #[default]
     All,
     Select,
@@ -338,11 +339,21 @@ impl Session {
     pub(crate) fn apply_rls(&mut self, sql: &str) -> String {
         match first_word_upper(sql).as_str() {
             "SELECT" | "WITH" | "TABLE" | "VALUES" => self.wrap_rls_select(sql),
-            "UPDATE" => self.inject_rls_where(sql, PolicyCommand::Update),
-            "DELETE" => self.inject_rls_where(sql, PolicyCommand::Delete),
+            // What an UPDATE or DELETE reads besides its target (a subquery, FROM,
+            // USING) is read through its own policies, as in Postgres.
+            "UPDATE" => {
+                let read = self.wrap_rls_tables(sql, false);
+                self.inject_rls_where(&read, PolicyCommand::Update)
+            }
+            "DELETE" => {
+                let read = self.wrap_rls_tables(sql, true);
+                self.inject_rls_where(&read, PolicyCommand::Delete)
+            }
             // Filter the read side of INSERT ... SELECT: wrap_rls_select only touches
             // tables after FROM/JOIN, i.e. the source query, never the target.
             "INSERT" => self.wrap_rls_select(sql),
+            // CREATE TABLE AS reads its query as a SELECT does.
+            "CREATE" if crate::auth::privileges::create_table_as_query(sql).is_some() => self.wrap_rls_select(sql),
             _ => sql.to_string(),
         }
     }
@@ -375,7 +386,7 @@ impl Session {
 
     /// The combined USING filter for command on table, by its stored name; None when
     /// the current role is not subject to RLS there.
-    fn rls_filter(&mut self, table: &str, command: PolicyCommand) -> Option<String> {
+    pub(crate) fn rls_filter(&mut self, table: &str, command: PolicyCommand) -> Option<String> {
         if self.rls_known_off(table) {
             return None;
         }
@@ -482,6 +493,12 @@ impl Session {
     /// Replaces every base-table reference in a FROM/JOIN clause that is under
     /// RLS with a filtering subquery.
     fn wrap_rls_select(&mut self, sql: &str) -> String {
+        self.wrap_rls_tables(sql, false)
+    }
+
+    /// wrap_rls_select, leaving out a DELETE's target (the table after its first
+    /// FROM), whose USING list it reads as a FROM list.
+    fn wrap_rls_tables(&mut self, sql: &str, delete: bool) -> String {
         #[derive(Debug)]
         struct Repl {
             start: usize,
@@ -491,11 +508,19 @@ impl Session {
         let toks = rls_tokens(sql);
         let mut reps: Vec<Repl> = Vec::new();
         let (mut in_from_list, mut expect_table) = (false, false);
+        // A DELETE's target: not yet passed, then passed and its USING still to come.
+        let (mut target_pending, mut after_target) = (delete, false);
         for i in 0..toks.len() {
             let t = &toks[i];
             match t.kind {
                 b'w' => {
                     let w = lowercase(t.text);
+                    if after_target && w == "using" {
+                        after_target = false;
+                        in_from_list = true;
+                        expect_table = true;
+                        continue;
+                    }
                     match w.as_ref() {
                         "from" => {
                             in_from_list = true;
@@ -514,6 +539,13 @@ impl Session {
                             continue;
                         }
                         _ => {}
+                    }
+                    if expect_table && target_pending {
+                        target_pending = false;
+                        after_target = true;
+                        in_from_list = false;
+                        expect_table = false;
+                        continue;
                     }
                     if expect_table {
                         if !bare_table_name(t.text).is_empty() {
@@ -673,14 +705,27 @@ impl Session {
 
         // The VALUES may carry the same $N placeholders as the original INSERT, so
         // bind params to both counts.
-        let prov = match self.exec(&rewrite(&format!("{cte}SELECT count(*) FROM _rls_src")), params) {
+        // The calls of the source are inlined, each body read through its own role's
+        // policies, as the INSERT will read them.
+        let counted = match self.inline_functions(&format!("{cte}SELECT count(*) FROM _rls_src"), Inline::Exec) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(e)),
+        };
+        let prov = match self.exec(&rewrite(&counted), params) {
             Ok(rs) if !rs.rows.is_empty() => rs,
-            _ => return None, // can't validate the VALUES shape; fall back to normal exec
+            // A source the check cannot count is not let through unchecked.
+            Ok(_) => return Some(Err(rls_violation(&bare))),
+            Err(e) => return Some(Err(e)),
         };
         let q = self.expand_session_user(&format!("{cte}SELECT count(*) FROM _rls_src WHERE {expr}"));
+        let q = match self.inline_functions(&q, Inline::Exec) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(e)),
+        };
         let pass = match self.exec(&rewrite(&q), params) {
             Ok(rs) if !rs.rows.is_empty() => rs,
-            _ => return None,
+            Ok(_) => return Some(Err(rls_violation(&bare))),
+            Err(e) => return Some(Err(e)),
         };
         if to_int(&pass.rows[0][0]) < to_int(&prov.rows[0][0]) {
             return Some(Err(rls_violation(&bare)));

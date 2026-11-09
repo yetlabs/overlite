@@ -1694,7 +1694,7 @@ fn pg_proc_view() -> String {
         " arity AS pronargs, 0 AS proretset, NULL AS proacl, body AS prosrc, NULL AS probin,",
         " 'v' AS provolatile, 0 AS proisstrict, NULL AS proargmodes,",
         " CASE WHEN params='' THEN NULL ELSE '{'||replace(params,char(31),',')||'}' END AS proargnames,",
-        " NULL AS proallargtypes, 0 AS prosecdef, NULL AS proconfig, 100 AS procost,",
+        " NULL AS proallargtypes, coalesce(secdef, 0) AS prosecdef, NULL AS proconfig, 100 AS procost,",
         " 0 AS prorows, 0 AS provariadic, 0 AS prosupport, 0 AS proleakproof,",
         " 's' AS proparallel, NULL AS proargdefaults, 0 AS pronargdefaults, NULL AS prosqlbody,",
         " NULL AS protrftypes, 1255 AS tableoid FROM _overlite_functions WHERE lang='sql'"

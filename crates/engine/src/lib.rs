@@ -52,5 +52,7 @@ pub use cluster::{Cluster, DEFAULT_MAX_OPEN_DATABASES, open_cluster, single};
 pub use error::{Error, ErrorKind, Result};
 pub use resolve::names::{Meets, NamedTable, ParamColumn, param_columns};
 pub use resolve::schema_qualify::split_stored_name;
-pub use sqlite::{DbSession, InterruptHandle, Sqlite};
+pub use sql_funcs::function_ddl_target;
+pub use sql_funcs::rewrite::{FunctionCall, inline_function_body};
+pub use sqlite::{DbSession, InterruptHandle, Sqlite, ViewsAndTriggers};
 pub use storage::{FORMAT_VERSION, backup_path};

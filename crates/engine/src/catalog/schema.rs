@@ -389,7 +389,7 @@ fn setup_connection_with(
     if let Ok(rows) = query(
         "SELECT rowid || char(30) || name || char(30) || arity || char(30) || params || char(30) || body || char(30) || lang || char(30) || args || char(30) || rettype || char(30) || src FROM _overlite_functions",
     ) {
-        refresh_functions_from_rows(&rows);
+        refresh_functions_from_rows(&st, &rows);
     }
     // Refresh the trigger oid->definition registry that pg_get_triggerdef() reads
     // (public schema; oid matches the pg_trigger view).

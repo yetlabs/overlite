@@ -17,7 +17,6 @@ use crate::resolve::schema_qualify::qualify_schema_names;
 use crate::resolve::search_path::resolve_search_path;
 use crate::resolve::time_zone::{resolve_time_zones, resolve_zone_values};
 use crate::resolve::tsvector::resolve_tsvectors;
-use crate::sql_funcs::rewrite::rewrite_sql_functions;
 use crate::sql_funcs::try_function_ddl;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use overlite_core::sync::MutexExt;
@@ -107,6 +106,7 @@ fn open_connection(path: &str) -> Result<Connection> {
         conn.execute_batch("pragma journal_mode(WAL)").map_err(sqlite_error)?;
     }
     register_functions(&conn)?;
+    crate::sql_funcs::note_builtins(&conn);
     crate::builtins::collation::register(&conn).map_err(sqlite_error)?;
     setup_connection(&conn, path)?;
     // A double-quoted name is a name, as in Postgres, where SQLite would fall back to
@@ -146,6 +146,7 @@ impl Sqlite {
             cursors: crate::cursor::OpenQueries::default(),
             pending_begin: Cell::new(false),
             immediate_fks: Cell::new(false),
+            views_and_triggers: std::cell::RefCell::new(None),
             _permit: permit,
         };
         Ok(Arc::new(Sqlite {
@@ -180,6 +181,7 @@ impl Sqlite {
             cursors: crate::cursor::OpenQueries::default(),
             pending_begin: Cell::new(false),
             immediate_fks: Cell::new(false),
+            views_and_triggers: std::cell::RefCell::new(None),
             _permit: permit,
         })
     }
@@ -212,7 +214,20 @@ pub struct DbSession {
     pending_begin: Cell<bool>,
     /// SET CONSTRAINTS ALL IMMEDIATE holds in the open transaction: deferred.rs.
     pub(crate) immediate_fks: Cell<bool>,
+    /// The views and triggers of the schema, as [`DbSession::views_and_triggers`]
+    /// read them, at the schema_version they were read at.
+    views_and_triggers: std::cell::RefCell<Option<(i64, std::sync::Arc<ViewsAndTriggers>)>>,
     _permit: ConnPermit,
+}
+
+/// The views of a schema and the triggers of its tables: what a statement reaches
+/// beyond the tables it names. Keyed by lower-cased name.
+#[derive(Debug, Default)]
+pub struct ViewsAndTriggers {
+    /// Each view's CREATE VIEW.
+    pub views: std::collections::HashMap<String, String>,
+    /// Each table's (or view's) triggers: name and CREATE TRIGGER.
+    pub triggers: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 impl Drop for DbSession {
@@ -258,6 +273,13 @@ impl DbSession {
     /// Whatever SQLite reports for the statement.
     pub fn execute_sp(&self, sql: &str, args: &[Value], sp: Option<&[String]>) -> Result<ResultSet> {
         self.sync_schemas()?;
+        if sql
+            .trim_start()
+            .get(..8)
+            .is_some_and(|w| w.eq_ignore_ascii_case("rollback"))
+        {
+            self.forget_schema_objects();
+        }
         if let Some(rs) = self.set_constraints(sql) {
             return rs;
         }
@@ -281,6 +303,13 @@ impl DbSession {
     /// Whatever SQLite reports for the statement.
     pub fn tx_execute(&self, sql: &str, args: &[Value], sp: Option<&[String]>) -> Result<ResultSet> {
         self.sync_schemas()?;
+        if sql
+            .trim_start()
+            .get(..8)
+            .is_some_and(|w| w.eq_ignore_ascii_case("rollback"))
+        {
+            self.forget_schema_objects();
+        }
         if let Some(rs) = self.set_constraints(sql) {
             return rs;
         }
@@ -409,7 +438,98 @@ impl DbSession {
         if self.pending_begin.replace(false) {
             return Ok(());
         }
-        self.conn.execute_batch("rollback").map_err(sqlite_error)
+        let r = self.conn.execute_batch("rollback").map_err(sqlite_error);
+        self.forget_schema_objects();
+        // A function created or dropped in the transaction is gone again, or back.
+        crate::sql_funcs::reload_functions(&self.state, &self.conn);
+        r
+    }
+
+    /// Whether the database has a LANGUAGE sql function a call may reach.
+    pub fn has_sql_functions(&self) -> bool {
+        use overlite_core::sync::RwLockExt;
+        !self.state.func_names.read_locked().is_empty()
+    }
+
+    /// The outermost calls in sql of a name a stored LANGUAGE sql function has and
+    /// skip does not refuse: what the protocol layer inlines before a statement runs.
+    pub fn function_calls(&self, sql: &str, skip: &dyn Fn(&str) -> bool) -> Vec<crate::FunctionCall> {
+        crate::sql_funcs::rewrite::function_calls(&self.state, sql, skip)
+    }
+
+    /// The kind of the schema object a stored name is ("table", "view", "index",
+    /// "trigger") and its SQL, from sqlite_master as this connection sees it.
+    pub fn schema_object(&self, name: &str) -> Option<(String, String)> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT type, coalesce(sql, '') FROM main.sqlite_master WHERE name = ?1 COLLATE NOCASE")
+            .ok()?;
+        st.query_row([name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .ok()
+    }
+
+    /// The views and triggers of the schema as this connection sees it, read again
+    /// when its schema_version moves. A version can come back after a rollback of
+    /// this connection's own, which forgets what was read (forget_schema_objects).
+    pub fn views_and_triggers(&self) -> std::sync::Arc<ViewsAndTriggers> {
+        let version = self
+            .conn
+            .prepare_cached("PRAGMA schema_version")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .unwrap_or(-1);
+        if let Some((v, kept)) = self.views_and_triggers.borrow().as_ref()
+            && *v == version
+            && version >= 0
+        {
+            return kept.clone();
+        }
+        let mut read = ViewsAndTriggers::default();
+        if let Ok(mut st) = self.conn.prepare_cached(
+            "SELECT type, name, tbl_name, coalesce(sql, '') FROM main.sqlite_master WHERE type IN ('view', 'trigger') ORDER BY name",
+        ) && let Ok(rows) = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        }) {
+            for (kind, name, table, sql) in rows.flatten() {
+                if kind == "view" {
+                    read.views.insert(name.to_lowercase(), sql);
+                } else {
+                    read.triggers.entry(table.to_lowercase()).or_default().push((name, sql));
+                }
+            }
+        }
+        let read = std::sync::Arc::new(read);
+        *self.views_and_triggers.borrow_mut() = Some((version, read.clone()));
+        read
+    }
+
+    /// The first column of each row of a query of the server's own tables, as text,
+    /// by a statement prepared once per connection: the privilege checks' lookups,
+    /// which run on every statement of a role that is checked. None when it fails.
+    pub fn lookup(&self, sql: &str, args: &[&str]) -> Option<Vec<String>> {
+        let mut st = self.conn.prepare_cached(sql).ok()?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(match r.get_ref(0)? {
+                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                    rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                    rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                    rusqlite::types::ValueRef::Null => String::new(),
+                    rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+                })
+            })
+            .ok()?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().ok()
+    }
+
+    /// Forgets what views_and_triggers read, after a rollback: the schema_version it
+    /// was read at may come back with another schema.
+    fn forget_schema_objects(&self) {
+        self.views_and_triggers.borrow_mut().take();
     }
 
     pub fn interrupt_handle(&self) -> InterruptHandle {
@@ -497,7 +617,7 @@ pub(crate) fn sqlite_error(e: rusqlite::Error) -> Error {
 }
 
 fn execute(sp: Option<&[String]>, st: &DbState, q: &Connection, query: &str, args: &[Value]) -> Result<ResultSet> {
-    if let Some(rs) = try_function_ddl(q, query)? {
+    if let Some(rs) = try_function_ddl(st, q, query)? {
         return Ok(rs);
     }
     let query = qualify_schema_names(st, query);
@@ -506,7 +626,6 @@ fn execute(sp: Option<&[String]>, st: &DbState, q: &Connection, query: &str, arg
     let query = resolve_current_schema(sp, st, &query);
     let query = resolve_current_database(st, &query);
     let query = resolve_to_regclass(&query);
-    let query = rewrite_sql_functions(&query);
     let query = resolve_time_zones(q, &query);
     let query = resolve_zone_values(q, &query, args);
     let query = resolve_tsvectors(q, &query);
@@ -1049,7 +1168,6 @@ fn describe(
     let query = resolve_current_schema(sp, st, &query);
     let query = resolve_current_database(st, &query);
     let query = resolve_to_regclass(&query);
-    let query = rewrite_sql_functions(&query);
     let query = resolve_time_zones(q, &query);
     let query = resolve_zone_values(q, &query, args);
     let query = resolve_tsvectors(q, &query);

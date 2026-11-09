@@ -16,6 +16,48 @@ pub(crate) fn is_explain(sql: &str) -> bool {
     head.len() > 7 && head[..7].eq_ignore_ascii_case(b"explain") && !head[7].is_ascii_alphanumeric()
 }
 
+/// The statement an EXPLAIN explains, whatever its options, SQLite's EXPLAIN QUERY
+/// PLAN included: what its privileges are checked on. None for any other statement,
+/// and for options this server refuses, which run nothing.
+pub(crate) fn explained(sql: &str) -> Option<&str> {
+    if !is_explain(sql) {
+        return None;
+    }
+    let Ok((_, inner)) = parse(sql) else { return None };
+    let inner = inner.trim_end().trim_end_matches(';').trim();
+    let words: Vec<&str> = inner.splitn(3, char::is_whitespace).collect();
+    if let [query, plan, rest] = words.as_slice()
+        && query.eq_ignore_ascii_case("query")
+        && plan.eq_ignore_ascii_case("plan")
+    {
+        return Some(rest.trim_start());
+    }
+    Some(inner)
+}
+
+/// The column an EXPLAIN answers in, for a Describe before it runs; None for one the
+/// session does not explain (SQLite's EXPLAIN QUERY PLAN) or cannot read.
+pub(crate) fn plan_columns(sql: &str) -> Option<ResultSet> {
+    let (o, inner) = parse(sql).ok()?;
+    if inner
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("query"))
+    {
+        return None;
+    }
+    let decl = if o.format == Format::Json { "JSON" } else { "TEXT" };
+    Some(ResultSet {
+        is_query: true,
+        columns: vec![Column {
+            name: "QUERY PLAN".to_string(),
+            decl_type: decl.to_string(),
+        }],
+        command: Command::from("EXPLAIN"),
+        ..Default::default()
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
     Text,
@@ -105,6 +147,8 @@ fn parse(sql: &str) -> Result<(Options, &str)> {
 
 impl Session {
     /// Answers an EXPLAIN.
+    /// Its privileges are the caller's to check (check_privileges reads through the
+    /// EXPLAIN).
     pub(crate) fn explain(&mut self, sql: &str) -> Result<ResultSet> {
         let (o, inner) = parse(sql)?;
         let inner = inner.trim_end().trim_end_matches(';');
@@ -115,8 +159,9 @@ impl Session {
         let mut root = plan(inner, &rows.rows);
         let mut executed = None;
         if o.analyze {
+            // As the statement runs: its write held to its policies, and done.
             let t = Instant::now();
-            let rs = self.exec(&rewritten, &[])?;
+            let rs = self.run_statement(inner, &[])?;
             executed = Some(t.elapsed());
             root.actual_rows = Some(if rs.is_query { rs.rows.len() } else { 0 });
         }

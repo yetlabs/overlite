@@ -141,6 +141,12 @@ impl Session {
                 quoted(&unquote_reference(reference))
             ));
         }
+        // Its query is read now, as a query is, with the creator's privileges and
+        // through the creator's policies; WITH NO DATA reads nothing.
+        if with_data {
+            self.check_privileges(query)?;
+        }
+        let fill = self.rewrite_for_exec(&["SELECT * FROM (", query, ")"].concat(), &[])?;
         let view = quote_ident(&(MATVIEW_PREFIX.to_string() + &stored));
         let view_sql = ["CREATE VIEW ", &view, column_list.map_or("", |c| c), " AS ", query].concat();
         let view_sql = self.rewrite_for_exec(&view_sql, &[])?;
@@ -176,10 +182,7 @@ impl Session {
             if !with_data {
                 return Ok(0);
             }
-            let rs = self.exec(
-                &["INSERT INTO ", &quote_ident(&stored), " SELECT * FROM ", &view].concat(),
-                &[],
-            )?;
+            let rs = self.exec(&["INSERT INTO ", &quote_ident(&stored), " ", &fill].concat(), &[])?;
             Ok::<_, crate::error::Error>(rs.rows_affected)
         })();
         let rows = match made {
@@ -191,6 +194,12 @@ impl Session {
             }
         };
         self.exec("RELEASE _mv", &[])?;
+        // Its creator's, as a table is.
+        let owner = self.current_role.clone();
+        self.exec(
+            "INSERT OR REPLACE INTO _overlite_owners (tablename, owner) VALUES (?1, ?2)",
+            &[Value::from(stored.as_str()), Value::from(owner.as_str())],
+        )?;
         if with_data {
             return Ok(Command::from(format!("SELECT {rows}").as_str()));
         }
@@ -225,6 +234,26 @@ impl Session {
                 "relation {:?} does not exist",
                 quoted(&reference)
             ));
+        }
+        // Its owner alone refreshes it, and its query reads with the owner's
+        // privileges, whoever asks, as in Postgres.
+        if !self.priv_bypass() && !self.has_privilege(&stored, crate::auth::privileges::Privilege::Owner) {
+            return Err(errf!(
+                SqlState::INSUFFICIENT_PRIVILEGE,
+                "must be owner of materialized view {reference}"
+            ));
+        }
+        if !no_data
+            && let Some(owner) = self.table_owner(&stored)
+            && !self.role_bypasses(&owner)
+        {
+            let ddl = self
+                .db
+                .schema_object(&(MATVIEW_PREFIX.to_string() + &stored))
+                .map(|(_, ddl)| ddl)
+                .unwrap_or_default();
+            let query = crate::auth::privileges::view_query(&ddl).unwrap_or("").to_string();
+            self.as_role(&owner, |s| s.check_owned_query(&query, 1, "materialized view", &stored))?;
         }
         let view = quote_ident(&(MATVIEW_PREFIX.to_string() + &stored));
         self.exec("SAVEPOINT _mv", &[])?;

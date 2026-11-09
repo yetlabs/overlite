@@ -39,6 +39,14 @@ pub(crate) fn parse_create_function(sql: &str) -> Option<SqlFunc> {
     // language: search outside the body region (default order puts it after).
     let region = format!("{} {}", &sql[..bs], &sql[be..]);
     f.lang = word_after_keyword(&region, "language");
+    // SECURITY DEFINER, or EXTERNAL SECURITY DEFINER; the last one said wins.
+    let low_region = region.to_ascii_lowercase();
+    let words = split_words(&low_region);
+    for w in words.windows(2) {
+        if w[0] == "security" && (w[1] == "definer" || w[1] == "invoker") {
+            f.secdef = w[1] == "definer";
+        }
+    }
     // return type: between RETURNS and the AS/LANGUAGE that follows (before body).
     f.rettype = extract_returns(&sql[after_params..bs]);
     Some(f)
