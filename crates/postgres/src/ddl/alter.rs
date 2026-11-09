@@ -13,13 +13,12 @@ use crate::ddl::drop_constraint::{parse_drop_column, parse_drop_constraint};
 use crate::ddl::exclude::parse_exclusion;
 use crate::ddl::identity::retype_identity;
 use crate::ddl::sequences::{is_ident_part, is_ident_start, split_top_level};
+use crate::ddl::tree::code_tokens;
 use crate::error::{Error, Result, errf};
 use crate::rewrite::catalog::{RE_PUBLIC, is_word_byte};
 use crate::rewrite::ddl_syntax::mark_key_deferral;
 use crate::rewrite::operators::rewrite_collate;
 use crate::rewrite::rewrite;
-use crate::rewrite::strings::end_of_string_literal;
-use crate::rewrite::tokens::code_tokens;
 use crate::session::Session;
 use crate::session::utility::{alter_is_noop, first_word_upper, log_query, second_word_upper, unquote_ident};
 use crate::types::numeric::retype_numeric;
@@ -856,33 +855,41 @@ fn drop_collate(cons: &str) -> String {
     out.trim().to_string()
 }
 
-/// Removes a DEFAULT clause (value or parenthesized expression).
+/// Removes a DEFAULT clause: its expression runs, as Postgres' grammar reads it, up to
+/// the next of the column's constraints.
 pub(crate) fn drop_default(cons: &str) -> String {
     // A column's own: not one in a literal or a CHECK, or ON DELETE SET DEFAULT.
     let toks = code_tokens(cons);
     let at = (0..toks.len()).find(|&i| {
         toks[i].depth == 0 && toks[i].is_word(cons, "default") && !(i > 0 && toks[i - 1].is_word(cons, "set"))
     });
-    let i = match at {
-        Some(at) => toks[at].span.start,
-        None => return cons.to_string(),
+    let Some(at) = at else {
+        return cons.to_string();
     };
-    let b = cons.as_bytes();
-    let mut j = i + "default".len();
-    while j < b.len() && b[j] == b' ' {
-        j += 1;
-    }
-    if j < b.len() && b[j] == b'(' {
-        let (_, e) = balanced_paren(cons, j);
-        j = e;
-    } else if j < b.len() && b[j] == b'\'' {
-        j = end_of_string_literal(cons, j);
-    } else {
-        while j < b.len() && b[j] != b' ' {
-            j += 1;
-        }
-    }
-    (cons[..i].to_string() + &cons[j..]).trim().to_string()
+    let starts_constraint = |i: usize| {
+        let t = &toks[i];
+        t.depth == 0
+            && [
+                "not",
+                "null",
+                "constraint",
+                "check",
+                "unique",
+                "primary",
+                "references",
+                "collate",
+                "generated",
+                "default",
+            ]
+            .iter()
+            .any(|w| t.is_word(cons, w))
+    };
+    let end = (at + 2..toks.len())
+        .find(|&i| starts_constraint(i))
+        .map_or(cons.len(), |i| toks[i].span.start);
+    (cons[..toks[at].span.start].to_string() + &cons[end..])
+        .trim()
+        .to_string()
 }
 
 /// Finds sub in s, case-insensitively.

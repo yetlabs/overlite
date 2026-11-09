@@ -7,14 +7,155 @@ use crate::auth::grants::index_word;
 use crate::auth::rls::{balanced_paren, bare_table_name, parse_insert, text_or_empty, top_level_keyword};
 use crate::ddl::alter::{drop_default, join_def, parse_col_def, split_qualified_ref};
 use crate::ddl::assign::insert_source_for_sqlite;
-use crate::ddl::sequences::split_top_level;
+use crate::ddl::tree::{self, code_tokens};
 use crate::rewrite::strings::end_of_string_literal;
-use crate::rewrite::tokens::code_tokens;
 use crate::session::Session;
 use crate::session::utility::{first_word_upper, second_word_upper, unquote_ident};
-use overlite_core::text::{eq_fold, quote_literal, slice, split_words};
-use overlite_engine::{code_only, stored_table_name};
+use overlite_core::text::{eq_fold, quote_literal, slice};
+use overlite_engine::stored_table_name;
+use pg_query::NodeEnum;
 use std::collections::HashSet;
+use std::ops::Range;
+
+/// A CREATE TABLE's column list as its node and Postgres' scanner read it: the table
+/// as a reference, where the list's parentheses are, and each item with what the
+/// session's rewrites of a column ask of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TablePlan {
+    pub(crate) table: String,
+    /// The list's opening and closing parentheses, as byte offsets.
+    pub(crate) open: usize,
+    pub(crate) close: usize,
+    /// Each item of the list, in order: its text's extent between the commas, and
+    /// what it is when it is a column.
+    pub(crate) items: Vec<(Range<usize>, Option<ColumnPlan>)>,
+}
+
+/// A column of a CREATE TABLE, read from its ColumnDef.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnPlan {
+    pub(crate) name: String,
+    /// The last name of its type, in lower case, with no modifier or array bounds.
+    pub(crate) type_name: Option<String>,
+    /// PRIMARY KEY among its constraints.
+    pub(crate) key: bool,
+    /// GENERATED ... AS IDENTITY among its constraints.
+    pub(crate) identity: bool,
+    /// The sequence its DEFAULT nextval('seq') names, without a schema.
+    pub(crate) nextval: Option<String>,
+}
+
+/// The sequence a DEFAULT's nextval('s'[::regclass]) names, its last part.
+fn nextval_of(expr: &pg_query::protobuf::Node) -> Option<String> {
+    let Some(NodeEnum::FuncCall(f)) = &expr.node else {
+        return None;
+    };
+    if tree::strings(&f.funcname).last().map(String::as_str) != Some("nextval") {
+        return None;
+    }
+    let arg = match &f.args.first()?.node {
+        Some(NodeEnum::TypeCast(c)) => c.arg.as_deref()?,
+        _ => f.args.first()?,
+    };
+    let name = tree::arg_text(arg)?;
+    let name = name.rsplit('.').next().unwrap_or(&name);
+    let name = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')).unwrap_or(name);
+    Some(name.to_string())
+}
+
+/// sql's column plan, when it is a CREATE TABLE with a column list.
+pub(crate) fn table_plan(sql: &str) -> Option<TablePlan> {
+    use pg_query::protobuf::ConstrType;
+    let create = tree::read(sql, |n| match n {
+        NodeEnum::CreateStmt(c) => Some(c.clone()),
+        _ => None,
+    })?;
+    let table = tree::reference(create.relation.as_ref()?);
+    let toks = code_tokens(sql);
+    let open = toks.iter().position(|t| t.depth == 0 && t.is_punct(sql, "("))?;
+    let close = (open + 1..toks.len()).find(|&k| toks[k].depth == 0 && toks[k].is_punct(sql, ")"))?;
+    let mut cuts = vec![toks[open].span.end];
+    for t in &toks[open + 1..close] {
+        if t.depth == 1 && t.is_punct(sql, ",") {
+            cuts.push(t.span.start);
+            cuts.push(t.span.end);
+        }
+    }
+    cuts.push(toks[close].span.start);
+    let columns: Vec<(usize, ColumnPlan)> = create
+        .table_elts
+        .iter()
+        .filter_map(|e| match &e.node {
+            Some(NodeEnum::ColumnDef(d)) => {
+                let constraints: Vec<&pg_query::protobuf::Constraint> = d
+                    .constraints
+                    .iter()
+                    .filter_map(|c| match &c.node {
+                        Some(NodeEnum::Constraint(k)) => Some(&**k),
+                        _ => None,
+                    })
+                    .collect();
+                let is = |t: ConstrType| constraints.iter().any(|k| k.contype == t as i32);
+                let type_name = d
+                    .type_name
+                    .as_ref()
+                    .filter(|t| t.typmods.is_empty() && t.array_bounds.is_empty())
+                    .and_then(|t| tree::strings(&t.names).pop())
+                    .map(|t| t.to_ascii_lowercase());
+                Some((
+                    usize::try_from(d.location).ok()?,
+                    ColumnPlan {
+                        name: d.colname.clone(),
+                        type_name,
+                        key: is(ConstrType::ConstrPrimary),
+                        identity: is(ConstrType::ConstrIdentity),
+                        nextval: constraints
+                            .iter()
+                            .filter(|k| k.contype == ConstrType::ConstrDefault as i32)
+                            .find_map(|k| nextval_of(k.raw_expr.as_deref()?)),
+                    },
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    let items = cuts
+        .chunks(2)
+        .map(|c| {
+            let span = c[0]..c[1];
+            let column = columns.iter().find(|(at, _)| span.contains(at)).map(|(_, p)| p.clone());
+            (span, column)
+        })
+        .collect();
+    Some(TablePlan {
+        table,
+        open: toks[open].span.start,
+        close: toks[close].span.start,
+        items,
+    })
+}
+
+impl TablePlan {
+    /// sql with each item's text given by f (None keeps it).
+    pub(crate) fn rewrite(&self, sql: &str, mut f: impl FnMut(&str, &ColumnPlan) -> Option<String>) -> Option<String> {
+        let mut changed = false;
+        let items: Vec<String> = self
+            .items
+            .iter()
+            .map(|(span, column)| {
+                let text = &sql[span.clone()];
+                match column.as_ref().and_then(|c| f(text, c)) {
+                    Some(new) => {
+                        changed = true;
+                        new
+                    }
+                    None => text.to_string(),
+                }
+            })
+            .collect();
+        changed.then(|| [&sql[..=self.open], &items.join(","), &sql[self.close..]].concat())
+    }
+}
 
 impl Session {
     /// Records/strips nextval defaults on CREATE TABLE and injects them on INSERT,
@@ -49,27 +190,23 @@ impl Session {
         if !sql.to_ascii_lowercase().contains("serial") {
             return sql.to_string();
         }
-        let table = create_table_name(sql);
-        let Some(open) = sql.find('(').filter(|_| !table.is_empty()) else {
+        let Some(plan) = table_plan(sql) else {
             return sql.to_string();
         };
-        let stored = self.created_table(&table);
+        let stored = self.created_table(&plan.table);
         let (_, relation) = overlite_engine::split_stored_name(&stored);
-        let (inner, after) = balanced_paren(sql, open);
-        let mut defs = split_top_level(&inner);
-        let mut changed = false;
-        for d in &mut defs {
-            let (name, typ, cons) = parse_col_def(d);
-            let int = match typ.to_ascii_lowercase().as_str() {
+        plan.rewrite(sql, |d, column| {
+            let int = match column.type_name.as_deref()? {
                 "serial" | "serial4" => "integer",
                 "bigserial" | "serial8" => "bigint",
                 "smallserial" | "serial2" => "smallint",
-                _ => continue,
+                _ => return None,
             };
-            if name.is_empty() || cons.to_ascii_lowercase().contains("primary") {
-                continue;
+            if column.key {
+                return None;
             }
-            let seq = [relation.as_str(), "_", &unquote_ident(&name), "_seq"].concat();
+            let (name, _, cons) = parse_col_def(d);
+            let seq = [relation.as_str(), "_", &column.name, "_seq"].concat();
             let _ = self.create_sequence(&seq, true, &crate::ddl::sequences::default_seq_options());
             // The mark says the sequence is the column's own, as pg_depend and
             // pg_get_serial_sequence read it; a default on any other sequence is no serial.
@@ -80,52 +217,34 @@ impl Session {
                 ")",
             ]
             .concat();
-            *d = " ".to_string() + &join_def(&name, int, cons.trim()) + " ";
-            changed = true;
-        }
-        if !changed {
-            return sql.to_string();
-        }
-        sql[..=open].to_string() + &defs.join(",") + slice(sql, after - 1, sql.len())
+            Some(" ".to_string() + &join_def(&name, int, cons.trim()) + " ")
+        })
+        .unwrap_or_else(|| sql.to_string())
     }
 
     /// Records each column's nextval default and removes the DEFAULT clause from
     /// the CREATE TABLE.
     fn record_nextval_defaults(&mut self, sql: &str) -> String {
-        let table = create_table_name(sql);
-        let Some(open) = sql.find('(').filter(|_| !table.is_empty()) else {
+        let Some(plan) = table_plan(sql) else {
             return sql.to_string();
         };
-        let table = self.created_table(&table);
-        let (inner, after) = balanced_paren(sql, open);
-        let mut defs = split_top_level(&inner);
-        let mut changed = false;
-        for d in &mut defs {
-            let (name, typ, cons) = parse_col_def(d);
-            if name.is_empty() {
-                continue;
-            }
-            let seq = nextval_seq(&cons);
-            if seq.is_empty() {
-                continue;
-            }
+        let table = self.created_table(&plan.table);
+        plan.rewrite(sql, |d, column| {
+            let seq = column.nextval.as_ref()?;
             // Once: CREATE TABLE IF NOT EXISTS may run again and create nothing.
-            let (table, col) = (quote_literal(&table), quote_literal(&unquote_ident(&name)));
+            let (t, col) = (quote_literal(&table), quote_literal(&column.name));
             let _ = self.exec(
                 &format!(
-                    "INSERT INTO _overlite_defaults (tablename, colname, seqname) SELECT {table}, {col}, {} \
-                     WHERE NOT EXISTS (SELECT 1 FROM _overlite_defaults WHERE tablename = {table} AND colname = {col})",
-                    quote_literal(&seq)
+                    "INSERT INTO _overlite_defaults (tablename, colname, seqname) SELECT {t}, {col}, {} \
+                     WHERE NOT EXISTS (SELECT 1 FROM _overlite_defaults WHERE tablename = {t} AND colname = {col})",
+                    quote_literal(seq)
                 ),
                 &[],
             );
-            *d = " ".to_string() + &join_def(&name, &typ, &drop_default(&cons)) + " ";
-            changed = true;
-        }
-        if !changed {
-            return sql.to_string();
-        }
-        sql[..=open].to_string() + &defs.join(",") + slice(sql, after - 1, sql.len())
+            let (name, typ, cons) = parse_col_def(d);
+            Some(" ".to_string() + &join_def(&name, &typ, &drop_default(&cons)) + " ")
+        })
+        .unwrap_or_else(|| sql.to_string())
     }
 
     /// The stored name CREATE TABLE gives a reference, before the table exists to be
@@ -149,52 +268,6 @@ impl Session {
         }
         table
     }
-}
-
-/// Extracts the sequence name from a `DEFAULT nextval('seq'[::regclass])`
-/// constraint fragment, or "".
-fn nextval_seq(cons: &str) -> String {
-    let low = code_only(cons).to_ascii_lowercase();
-    let Some(n) = index_word(&low, "nextval") else {
-        return String::new();
-    };
-    let Some(op) = cons[n..].find('(') else {
-        return String::new();
-    };
-    let (inner, _) = balanced_paren(cons, n + op);
-    let mut inner: &str = inner.trim();
-    // strip a ::regclass cast
-    if let Some(c) = inner.to_ascii_lowercase().find("::") {
-        inner = inner[..c].trim();
-    }
-    let ib = inner.as_bytes();
-    if ib.len() >= 2 && (ib[0] == b'\'' || ib[0] == b'"') {
-        inner = slice(inner, 1, ib.len() - 1);
-    }
-    // a schema-qualified name keeps just the object
-    if let Some(d) = inner.rfind('.') {
-        inner = &inner[d + 1..];
-    }
-    inner.to_string()
-}
-
-/// The table of a CREATE TABLE as written (before its columns).
-pub(crate) fn create_table_name(sql: &str) -> String {
-    let low = sql.to_ascii_lowercase();
-    let Some(t) = index_word(&low, "table") else {
-        return String::new();
-    };
-    let mut seg = &sql[t + "table".len()..];
-    if let Some(op) = seg.find('(') {
-        seg = &seg[..op];
-    }
-    for w in split_words(seg) {
-        match w.to_lowercase().as_str() {
-            "if" | "not" | "exists" => {}
-            _ => return w.to_string(),
-        }
-    }
-    String::new()
 }
 
 impl Session {

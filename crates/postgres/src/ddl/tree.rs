@@ -255,3 +255,71 @@ pub(crate) fn parenthesized_after<'a>(sql: &'a str, toks: &[Token], words: &[&st
     }
     None
 }
+
+/// What a scanned token is to the handlers that cut a statement's text: a word (a
+/// name or keyword written bare, or a number), a value (a literal or a quoted name),
+/// or punctuation (an operator, a parenthesis, a comma).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodeTokKind {
+    Word,
+    Value,
+    Punct,
+}
+
+/// A token of Postgres' scanner, for the handlers that keep part of a statement as
+/// the client wrote it (an expression, a column's definition): where it is, what kind
+/// it is, and how deep in parentheses (one of its own counts as outside).
+#[derive(Debug, Clone)]
+pub(crate) struct CodeTok {
+    pub(crate) span: std::ops::Range<usize>,
+    pub(crate) kind: CodeTokKind,
+    pub(crate) depth: i32,
+}
+
+impl CodeTok {
+    pub(crate) fn is_word(&self, sql: &str, w: &str) -> bool {
+        self.kind == CodeTokKind::Word && sql[self.span.clone()].eq_ignore_ascii_case(w)
+    }
+
+    pub(crate) fn is_punct(&self, sql: &str, p: &str) -> bool {
+        self.kind == CodeTokKind::Punct && &sql[self.span.clone()] == p
+    }
+}
+
+/// sql's tokens by Postgres' scanner, comments left out; none for a text it does not
+/// scan (an unterminated literal), which no handler is given.
+pub(crate) fn code_tokens(sql: &str) -> Vec<CodeTok> {
+    // Depth counts parentheses alone, as the readers of these tokens expect.
+    let mut depth = 0i32;
+    tokens(sql)
+        .into_iter()
+        .map(|t| {
+            let text = &sql[t.start..t.end];
+            if text == ")" {
+                depth -= 1;
+            }
+            let here = depth;
+            if text == "(" {
+                depth += 1;
+            }
+            let first = text.chars().next().unwrap_or(' ');
+            let kind = if first == '"'
+                || first == '\''
+                || first == '$' && text.len() > 1 && !text[1..].starts_with(|c: char| c.is_ascii_digit())
+                || (matches!(first, 'e' | 'E' | 'b' | 'B' | 'x' | 'X' | 'n' | 'N' | 'u' | 'U')
+                    && text[1..].starts_with(['\'', '&']))
+            {
+                CodeTokKind::Value
+            } else if first.is_alphanumeric() || first == '_' || first == '$' || !first.is_ascii() {
+                CodeTokKind::Word
+            } else {
+                CodeTokKind::Punct
+            };
+            CodeTok {
+                span: t.start..t.end,
+                kind,
+                depth: here,
+            }
+        })
+        .collect()
+}

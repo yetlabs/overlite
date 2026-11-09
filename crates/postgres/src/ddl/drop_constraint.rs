@@ -18,8 +18,8 @@
 //! those tables first so that all of it happens or none of it does.
 
 use crate::auth::rls::text_or_empty;
+use crate::ddl::tree::{CodeTok, CodeTokKind, code_tokens};
 use crate::error::{Result, errf};
-use crate::rewrite::tokens::{CodeTok, CodeTokKind, code_tokens};
 use crate::session::Session;
 use crate::types::param_types::unquote;
 use overlite_core::SqlState;

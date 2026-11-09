@@ -10,8 +10,8 @@
 //! only refuse sooner than Postgres would, never let a conflict through.
 
 use crate::ddl::alter::translate_check;
+use crate::ddl::tree::{CodeTok, CodeTokKind, code_tokens};
 use crate::error::{Result, errf};
-use crate::rewrite::tokens::{CodeTok, CodeTokKind, code_tokens};
 use crate::session::Session;
 use crate::session::utility::unquote_ident;
 use overlite_core::text::{quote_ident, quote_literal};
