@@ -471,6 +471,13 @@ fn create_table_name(sql: &str) -> Option<String> {
 
 /// Whether a CREATE TABLE has an EXCLUDE constraint, which create_with_exclusions runs.
 pub(crate) fn creates_exclusions(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::creates_exclusions).unwrap_or(true)
+        && split_create_exclusions(sql).is_some()
+}
+
+/// `creates_exclusions` by the text alone.
+#[cfg(test)]
+pub(crate) fn creates_exclusions_text(sql: &str) -> bool {
     split_create_exclusions(sql).is_some()
 }
 

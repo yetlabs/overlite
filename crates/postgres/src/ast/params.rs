@@ -13,7 +13,7 @@ use pg_query::protobuf::{self as pb, SubLinkType};
 
 /// The tables and the parameter columns of a statement, None when it does not parse.
 pub(crate) fn param_columns(sql: &str) -> Option<(Vec<NamedTable>, Vec<ParamColumn>)> {
-    let parsed = crate::ast::parse::parse(sql).ok()?;
+    let parsed = crate::ast::parse::shared(sql).ok()?;
     let [raw] = parsed.stmts.as_slice() else {
         return None;
     };
@@ -46,7 +46,7 @@ pub(crate) struct Facts {
 /// The facts of a statement the AST path translates, None for any other: those keep
 /// the text readers until their stage (docs/adr/0001-sql-ast.md).
 pub(crate) fn facts(sql: &str) -> Option<Facts> {
-    let parsed = crate::ast::parse::parse(sql).ok()?;
+    let parsed = crate::ast::parse::shared(sql).ok()?;
     let [raw] = parsed.stmts.as_slice() else {
         return None;
     };

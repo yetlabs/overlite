@@ -18,6 +18,9 @@ impl Session {
     /// did not recognize the statement.
     #[must_use = "the error inside is the answer to the statement"]
     pub(crate) fn try_sql_prepare(&mut self, sql: &str) -> Option<Result<()>> {
+        if !crate::ast::classify::read(sql, crate::ast::classify::sql_prepare).unwrap_or(true) {
+            return None;
+        }
         match first_word_upper(sql).as_str() {
             "PREPARE" => Some(self.handle_prepare(sql)),
             "EXECUTE" => Some(self.handle_execute_sql(sql)),

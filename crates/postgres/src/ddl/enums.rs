@@ -25,6 +25,11 @@ lazy_regex!(RE_AS_COMPOSITE, r"(?i)\bas\s*\(");
 /// Reports whether sql is a CREATE/ALTER/DROP TYPE statement (used by the
 /// extended-query path to route it like other utility DDL).
 pub(crate) fn is_type_ddl(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::type_ddl).unwrap_or_else(|| is_type_ddl_text(sql))
+}
+
+/// `is_type_ddl` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_type_ddl_text(sql: &str) -> bool {
     if crate::ddl::objects::is_object_ddl(sql) {
         return true;
     }

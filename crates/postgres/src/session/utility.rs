@@ -117,7 +117,12 @@ impl TxControl {
     /// The statement's kind, or None for anything else. "ROLLBACK TO [SAVEPOINT] x" is
     /// a savepoint op, not a full rollback.
     pub(crate) fn of(sql: &str) -> Option<TxControl> {
-        if SavepointKind::of(sql).is_some() {
+        crate::ast::classify::read(sql, crate::ast::classify::tx_control).unwrap_or_else(|| Self::of_text(sql))
+    }
+
+    /// `of` by the text, for what Postgres' grammar does not read.
+    pub(crate) fn of_text(sql: &str) -> Option<TxControl> {
+        if SavepointKind::of_text(sql).is_some() {
             return None;
         }
         match first_word_upper(sql).as_str() {
@@ -150,6 +155,11 @@ pub(crate) enum SavepointKind {
 impl SavepointKind {
     /// The statement's kind, or None for anything else.
     pub(crate) fn of(sql: &str) -> Option<SavepointKind> {
+        crate::ast::classify::read(sql, crate::ast::classify::savepoint).unwrap_or_else(|| Self::of_text(sql))
+    }
+
+    /// `of` by the text, for what Postgres' grammar does not read.
+    pub(crate) fn of_text(sql: &str) -> Option<SavepointKind> {
         let f = split_words(sql);
         let first = f.first()?.to_uppercase();
         match first.as_str() {
@@ -172,6 +182,11 @@ impl SavepointKind {
 
 /// Whether try_schema_ddl takes this statement.
 pub(crate) fn is_schema_ddl(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::schema_ddl).unwrap_or_else(|| is_schema_ddl_text(sql))
+}
+
+/// `is_schema_ddl` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_schema_ddl_text(sql: &str) -> bool {
     let f = split_words(sql);
     f.len() >= 2
         && eq_fold(trim_end_chars(f[1], ";"), "schema")

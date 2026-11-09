@@ -6,7 +6,7 @@ pub(crate) mod copy;
 pub(crate) mod cursor;
 pub(crate) mod explain;
 mod multi_statement;
-mod notify;
+pub(crate) mod notify;
 mod prepare;
 pub(crate) mod search_path;
 pub(crate) mod time_zone;
@@ -83,6 +83,11 @@ pub(crate) struct Session {
     pub(crate) zone_tx_restore: Option<String>,
     /// The TimeZone before a SET LOCAL, which the end of the transaction restores.
     pub(crate) zone_local_restore: Option<String>,
+    /// The role and the session user before a SET ROLE or SESSION AUTHORIZATION in
+    /// the open transaction, which a rollback restores.
+    pub(crate) role_tx_restore: Option<(String, String)>,
+    /// The same before a SET LOCAL ROLE, which the end of the transaction restores.
+    pub(crate) role_local_restore: Option<(String, String)>,
 
     /// An open transaction changed which tables have RLS.
     pub(crate) rls_dirty: bool,
@@ -260,6 +265,8 @@ impl Session {
             later_action: false,
             zone_tx_restore: None,
             zone_local_restore: None,
+            role_tx_restore: None,
+            role_local_restore: None,
             seq_curr: HashMap::new(),
             seq_last: String::new(),
             canceler,
@@ -459,6 +466,7 @@ impl Session {
         if cursors {
             self.relist_cursors();
         }
+        self.end_tx_role(commit && !failed && r.is_ok());
         let zone = self.end_tx_zone(commit && !failed && r.is_ok());
         r?;
         zone

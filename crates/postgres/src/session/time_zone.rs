@@ -26,6 +26,14 @@ pub(crate) struct ZoneChange {
 /// SET [SESSION | LOCAL] TIME ZONE value, SET [SESSION | LOCAL] timezone {TO | =}
 /// value, and RESET timezone. None for any other statement.
 pub(crate) fn zone_change(sql: &str) -> Option<ZoneChange> {
+    if !crate::ast::classify::read(sql, crate::ast::classify::time_zone).unwrap_or(true) {
+        return None;
+    }
+    zone_change_text(sql)
+}
+
+/// The change of zone sql asks for, read from its text.
+pub(crate) fn zone_change_text(sql: &str) -> Option<ZoneChange> {
     let text = trim_end_chars(sql.trim(), ";");
     let f = split_words(text);
     let mut i = 1;

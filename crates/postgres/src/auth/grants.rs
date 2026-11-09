@@ -16,6 +16,11 @@ use pg_query::protobuf as pb;
 /// Whether sql is a GRANT or REVOKE statement, or an ALTER FUNCTION (ROUTINE,
 /// PROCEDURE), which changes who owns a function and as whom its body runs.
 pub(crate) fn is_grant(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::grant).unwrap_or_else(|| is_grant_text(sql))
+}
+
+/// `is_grant` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_grant_text(sql: &str) -> bool {
     let w = first_word_upper(sql);
     w == "GRANT"
         || w == "REVOKE"
@@ -336,7 +341,7 @@ impl Session {
     /// a renamed column takes them along, and a dropped one takes them away, so that
     /// a column added later by that name starts with none.
     fn follow_columns(&mut self, sql: &str) {
-        let Ok(parsed) = crate::ast::parse::parse(sql) else {
+        let Ok(parsed) = crate::ast::parse::shared(sql) else {
             return;
         };
         let stored = |s: &mut Self, r: &pb::RangeVar| {

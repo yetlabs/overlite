@@ -79,25 +79,52 @@ impl Session {
     /// Updates the session identity for a SET/RESET ROLE / SESSION AUTHORIZATION
     /// statement.
     pub(crate) fn apply_set_role(&mut self, sql: &str) -> Result<()> {
-        let done = self.switch_role(sql);
+        let change = match role_change(sql) {
+            Some(change) => change?,
+            None => return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in SET ROLE")),
+        };
+        if change.local && !self.in_tx() {
+            // As Postgres: a warning, and nothing changes.
+            return self.c.send_warning(
+                SqlState::NO_ACTIVE_SQL_TRANSACTION,
+                "SET LOCAL can only be used in transaction blocks",
+            );
+        }
+        let before = (self.current_role.clone(), self.session_user.clone());
+        let done = self.switch_role(&change);
+        if done.is_ok() && self.in_tx() {
+            // The end of the transaction undoes SET LOCAL, and a rollback any SET.
+            if change.local {
+                self.role_local_restore.get_or_insert(before);
+            } else {
+                self.role_tx_restore.get_or_insert(before);
+            }
+        }
         overlite_engine::set_session_role(&self.current_role);
         done
     }
 
-    fn switch_role(&mut self, sql: &str) -> Result<()> {
-        let f = split_words(sql);
-        let reset = eq_fold(f[0], "reset");
+    /// At the end of a transaction: SET LOCAL ROLE lapses, and a rollback undoes a SET
+    /// ROLE or SESSION AUTHORIZATION, as each is a setting of the transaction in
+    /// Postgres.
+    pub(crate) fn end_tx_role(&mut self, committed: bool) {
+        let local = self.role_local_restore.take();
+        let tx = self.role_tx_restore.take();
+        let back = if committed { local } else { tx.or(local) };
+        if let Some((role, session_user)) = back {
+            self.current_role = role;
+            self.session_user = session_user;
+            overlite_engine::set_session_role(&self.current_role);
+        }
+    }
 
-        if eq_fold(f[1], "role") {
-            if reset {
+    fn switch_role(&mut self, change: &crate::ast::classify::RoleChange) -> Result<()> {
+        if !change.session_authorization {
+            if change.reset || change.target.is_empty() || eq_fold(&change.target, "default") {
                 self.current_role = self.session_user.clone();
                 return Ok(());
             }
-            let target = role_target(sql)?;
-            if target.is_empty() || eq_fold(&target, "none") || eq_fold(&target, "default") {
-                self.current_role = self.session_user.clone();
-                return Ok(());
-            }
+            let target = change.target.clone();
             if !self.role_exists(&target) {
                 return Err(errf!(
                     SqlState::INVALID_PARAMETER_VALUE,
@@ -117,17 +144,12 @@ impl Session {
         }
 
         // SET/RESET SESSION AUTHORIZATION: only a superuser session may change it.
-        if reset {
+        if change.reset || change.target.is_empty() || eq_fold(&change.target, "default") {
             self.session_user = self.auth_user.clone();
             self.current_role = self.auth_user.clone();
             return Ok(());
         }
-        let target = role_target(sql)?;
-        if target.is_empty() || eq_fold(&target, "default") {
-            self.session_user = self.auth_user.clone();
-            self.current_role = self.auth_user.clone();
-            return Ok(());
-        }
+        let target = change.target.clone();
         let auth = self.auth_user.clone();
         if !self.role_bypasses(&auth) {
             return Err(errf!(
@@ -188,8 +210,24 @@ impl Session {
 }
 
 /// Whether sql is a SET/RESET ROLE or SET/RESET SESSION AUTHORIZATION statement
-/// (handled by the session, not passed to SQLite).
+/// (handled by the session, not passed to SQLite), of any scope: SET LOCAL ROLE and
+/// SET SESSION ROLE included.
 pub(crate) fn is_set_role(sql: &str) -> bool {
+    role_change(sql).is_some()
+}
+
+/// What a SET or RESET of the role or the session's authorization asks for, by its
+/// tree (`classify::set_role`), or by its text where Postgres' grammar does not read
+/// it; None for any other statement.
+pub(crate) fn role_change(sql: &str) -> Option<Result<crate::ast::classify::RoleChange>> {
+    if let Some(change) = crate::ast::classify::read(sql, crate::ast::classify::set_role) {
+        return change.map(Ok);
+    }
+    is_set_role_text(sql).then(|| role_change_text(sql))
+}
+
+/// `is_set_role` by the text: SET or RESET, then ROLE or SESSION AUTHORIZATION.
+pub(crate) fn is_set_role_text(sql: &str) -> bool {
     let f = split_words(sql);
     if f.len() < 2 {
         return false;
@@ -200,6 +238,20 @@ pub(crate) fn is_set_role(sql: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn role_change_text(sql: &str) -> Result<crate::ast::classify::RoleChange> {
+    let f = split_words(sql);
+    let session_authorization = !f.get(1).is_some_and(|w| eq_fold(w, "role"));
+    let reset = f.first().is_some_and(|w| eq_fold(w, "reset"));
+    let target = if reset { String::new() } else { role_target(sql)? };
+    let reset = reset || (!session_authorization && eq_fold(&target, "none"));
+    Ok(crate::ast::classify::RoleChange {
+        session_authorization,
+        reset,
+        local: false,
+        target,
+    })
 }
 
 /// Reads the role name after an optional TO / = from the tokens.

@@ -38,6 +38,7 @@ mod catalog_mirror;
 mod catalog_rls;
 mod catalog_summary;
 mod catalogbool;
+mod classify;
 mod cli;
 mod cluster;
 mod collate;

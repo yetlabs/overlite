@@ -130,6 +130,11 @@ pub(crate) fn startup_search_path(params: &HashMap<String, String>) -> Option<Ve
 /// Whether raw is a SET/SHOW/RESET search_path statement (routed specially in the
 /// extended path so it updates session state).
 pub(crate) fn is_search_path_stmt(raw: &str) -> bool {
+    crate::ast::classify::read(raw, crate::ast::classify::search_path).unwrap_or_else(|| is_search_path_stmt_text(raw))
+}
+
+/// `is_search_path_stmt` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_search_path_stmt_text(raw: &str) -> bool {
     let f = split_words(raw);
     if f.len() < 2 {
         return false;

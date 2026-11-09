@@ -40,6 +40,14 @@ impl CopyStmt {
 
 /// Parses a COPY statement, or returns None if it isn't one.
 pub(crate) fn parse_copy(sql: &str) -> Option<CopyStmt> {
+    if !crate::ast::classify::read(sql, crate::ast::classify::copy).unwrap_or(true) {
+        return None;
+    }
+    parse_copy_text(sql)
+}
+
+/// The COPY sql is, read from its text.
+pub(crate) fn parse_copy_text(sql: &str) -> Option<CopyStmt> {
     let code = blank_literals(sql);
     let m = RE_COPY.captures(&code)?;
     let mut cs = CopyStmt {

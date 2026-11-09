@@ -30,6 +30,11 @@ use std::sync::LazyLock;
 
 /// Whether sql is an RLS DDL statement handled by try_rls_ddl.
 pub(crate) fn is_rls_ddl(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::rls_ddl).unwrap_or_else(|| is_rls_ddl_text(sql))
+}
+
+/// `is_rls_ddl` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_rls_ddl_text(sql: &str) -> bool {
     if eq_fold(&first_word_upper(sql), "ALTER")
         && eq_fold(&second_word_upper(sql), "TABLE")
         && code_only(sql).to_lowercase().contains("row level security")

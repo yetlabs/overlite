@@ -323,7 +323,7 @@ impl Session {
         if !(starts("grant") || starts("revoke") || starts("alter")) {
             return None;
         }
-        let parsed = crate::ast::parse::parse(sql).ok()?;
+        let parsed = crate::ast::parse::shared(sql).ok()?;
         let [raw] = parsed.stmts.as_slice() else {
             return None;
         };

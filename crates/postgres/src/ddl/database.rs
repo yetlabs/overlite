@@ -12,6 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Whether sql is a CREATE/DROP/ALTER DATABASE.
 pub(crate) fn is_database_ddl(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::database_ddl).unwrap_or_else(|| is_database_ddl_text(sql))
+}
+
+/// `is_database_ddl` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_database_ddl_text(sql: &str) -> bool {
     let w = first_word_upper(sql);
     (w == "CREATE" || w == "DROP" || w == "ALTER") && second_word_upper(sql) == "DATABASE"
 }

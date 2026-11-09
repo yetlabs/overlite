@@ -40,6 +40,11 @@ impl Session {
 /// Reports whether sql is a CREATE/ALTER/DROP SEQUENCE statement (used by the
 /// extended-query path to route it like other utility DDL).
 pub(crate) fn is_sequence_ddl(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::sequence_ddl).unwrap_or_else(|| is_sequence_ddl_text(sql))
+}
+
+/// `is_sequence_ddl` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_sequence_ddl_text(sql: &str) -> bool {
     if is_truncate(sql) {
         return true;
     }

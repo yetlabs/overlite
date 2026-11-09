@@ -11,7 +11,10 @@
 
 use pg_query::protobuf::ParseResult;
 use prost::Message;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int};
+use std::rc::Rc;
 
 #[repr(C)]
 struct PgQueryError {
@@ -69,6 +72,43 @@ pub(crate) fn parse(sql: &str) -> Result<ParseResult, &'static str> {
     // owns its own copy of everything decoded.
     unsafe { pg_query_free_protobuf_parse_result(result) };
     out
+}
+
+/// Statements parsed, by text, on this thread: a parse is most of what reading a
+/// point lookup costs, and a tree depends on the text alone, never on the schema or
+/// the session, so a client repeating a statement parses it once, and the session's
+/// classifiers, its privilege check and the translation read one parse of it. Bounded
+/// as the translation cache is, emptied when full.
+const PARSED_ENTRIES: usize = 4096;
+const PARSED_MAX_LEN: usize = 16 * 1024;
+
+type Shared = Result<Rc<ParseResult>, &'static str>;
+
+std::thread_local! {
+    static PARSED: RefCell<HashMap<String, Shared>> = RefCell::new(HashMap::new());
+}
+
+/// `parse`, kept on the thread by text (above).
+///
+/// # Errors
+///
+/// As `parse`.
+pub(crate) fn shared(sql: &str) -> Shared {
+    if sql.len() > PARSED_MAX_LEN {
+        return parse(sql).map(Rc::new);
+    }
+    if let Some(hit) = PARSED.with(|c| c.borrow().get(sql).cloned()) {
+        return hit;
+    }
+    let tree = parse(sql).map(Rc::new);
+    PARSED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= PARSED_ENTRIES {
+            c.clear();
+        }
+        c.insert(sql.to_string(), tree.clone());
+    });
+    tree
 }
 
 #[cfg(test)]

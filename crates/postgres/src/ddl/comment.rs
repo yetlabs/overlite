@@ -16,6 +16,11 @@ use overlite_core::{Command, SqlState};
 
 /// Whether sql is a COMMENT ON statement.
 pub(crate) fn is_comment(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::comment).unwrap_or_else(|| is_comment_text(sql))
+}
+
+/// `is_comment` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_comment_text(sql: &str) -> bool {
     let f = split_words(sql);
     f.len() >= 2 && eq_fold(f[0], "comment") && eq_fold(f[1], "on")
 }

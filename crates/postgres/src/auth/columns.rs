@@ -15,8 +15,7 @@
 use overlite_core::text::eq_fold;
 use pg_query::NodeEnum;
 use pg_query::protobuf::{self as pb, OnConflictAction, SetOperation};
-use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 /// Where the tables of a statement are found.
@@ -66,33 +65,8 @@ pub(crate) fn accesses(sql: &str, rels: &mut dyn Relations) -> Option<Vec<Access
     Some(w.out)
 }
 
-/// Statements parsed, by text, on this thread: a parse is most of what reading a
-/// point lookup costs, and a tree depends on the text alone, never on the schema or
-/// the session, so a client repeating a statement parses it once. Bounded as the
-/// translation cache is, emptied when full.
-const PARSED_ENTRIES: usize = 4096;
-const PARSED_MAX_LEN: usize = 16 * 1024;
-
-std::thread_local! {
-    static PARSED: RefCell<HashMap<String, Option<Rc<pb::ParseResult>>>> = RefCell::new(HashMap::new());
-}
-
 fn parsed(sql: &str) -> Option<Rc<pb::ParseResult>> {
-    if sql.len() > PARSED_MAX_LEN {
-        return crate::ast::parse::parse(sql).ok().map(Rc::new);
-    }
-    if let Some(hit) = PARSED.with(|c| c.borrow().get(sql).cloned()) {
-        return hit;
-    }
-    let tree = crate::ast::parse::parse(sql).ok().map(Rc::new);
-    PARSED.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() >= PARSED_ENTRIES {
-            c.clear();
-        }
-        c.insert(sql.to_string(), tree.clone());
-    });
-    tree
+    crate::ast::parse::shared(sql).ok()
 }
 
 /// Not followed: the caller falls back to table-level grants.

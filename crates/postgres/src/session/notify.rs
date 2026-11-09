@@ -173,6 +173,11 @@ impl Session {
 
 /// Whether sql is a LISTEN/UNLISTEN/NOTIFY statement.
 pub(crate) fn is_listen_notify(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::listen_notify).unwrap_or_else(|| is_listen_notify_text(sql))
+}
+
+/// `is_listen_notify` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_listen_notify_text(sql: &str) -> bool {
     matches!(first_word_upper(sql).as_str(), "LISTEN" | "UNLISTEN" | "NOTIFY")
 }
 

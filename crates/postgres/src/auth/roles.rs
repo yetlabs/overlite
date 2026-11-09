@@ -12,6 +12,11 @@ use std::collections::HashMap;
 
 /// Whether try_role_ddl takes this statement.
 pub(crate) fn is_role_ddl(sql: &str) -> bool {
+    crate::ast::classify::read(sql, crate::ast::classify::role_ddl).unwrap_or_else(|| is_role_ddl_text(sql))
+}
+
+/// `is_role_ddl` by the text, for what Postgres' grammar does not read.
+pub(crate) fn is_role_ddl_text(sql: &str) -> bool {
     let f = split_words(sql);
     f.len() >= 2
         && ["CREATE", "ALTER", "DROP"].iter().any(|v| eq_fold(f[0], v))

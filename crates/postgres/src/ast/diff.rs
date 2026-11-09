@@ -724,3 +724,168 @@ fn count_what_reached_the_text_passes() {
         }
     }
 }
+
+/// The session's classifiers on the tree against their text readings, over the
+/// corpus: each statement Postgres' grammar reads is classified both ways, and every
+/// difference has to be one `CLASSIFIED` lists, with the reason the tree is right.
+#[test]
+fn classifiers_read_the_tree_as_the_text_did() {
+    use crate::ast::classify::{self as c, read};
+    type Pair = (&'static str, fn(&str) -> Option<bool>, fn(&str) -> bool);
+    let pairs: &[Pair] = &[
+        (
+            "tx_control",
+            |s| read(s, c::tx_control).map(|x| x.is_some()),
+            |s| crate::session::utility::TxControl::of_text(s).is_some(),
+        ),
+        (
+            "savepoint",
+            |s| read(s, c::savepoint).map(|x| x.is_some()),
+            |s| crate::session::utility::SavepointKind::of_text(s).is_some(),
+        ),
+        (
+            "cursor",
+            |s| read(s, c::cursor),
+            crate::session::cursor::is_cursor_statement_text,
+        ),
+        (
+            "schema_ddl",
+            |s| read(s, c::schema_ddl),
+            crate::session::utility::is_schema_ddl_text,
+        ),
+        (
+            "role_ddl",
+            |s| read(s, c::role_ddl),
+            crate::auth::roles::is_role_ddl_text,
+        ),
+        ("grant", |s| read(s, c::grant), crate::auth::grants::is_grant_text),
+        ("rls_ddl", |s| read(s, c::rls_ddl), crate::auth::rls::is_rls_ddl_text),
+        (
+            "listen_notify",
+            |s| read(s, c::listen_notify),
+            crate::session::notify::is_listen_notify_text,
+        ),
+        (
+            "sequence_ddl",
+            |s| read(s, c::sequence_ddl),
+            crate::ddl::sequences::is_sequence_ddl_text,
+        ),
+        (
+            "type_ddl",
+            |s| read(s, c::type_ddl),
+            crate::ddl::enums::is_type_ddl_text,
+        ),
+        ("comment", |s| read(s, c::comment), crate::ddl::comment::is_comment_text),
+        (
+            "set_role",
+            |s| read(s, c::set_role).map(|x| x.is_some()),
+            crate::auth::session_user::is_set_role_text,
+        ),
+        (
+            "sql_prepare",
+            |s| read(s, c::sql_prepare),
+            |s| {
+                matches!(
+                    crate::session::utility::first_word_upper(s).as_str(),
+                    "PREPARE" | "EXECUTE" | "DEALLOCATE"
+                )
+            },
+        ),
+        (
+            "copy",
+            |s| read(s, c::copy),
+            |s| crate::session::copy::parse_copy_text(s).is_some(),
+        ),
+        (
+            "time_zone",
+            |s| read(s, c::time_zone),
+            |s| crate::session::time_zone::zone_change_text(s).is_some(),
+        ),
+        (
+            "search_path",
+            |s| read(s, c::search_path),
+            crate::session::search_path::is_search_path_stmt_text,
+        ),
+        (
+            "explain",
+            |s| read(s, c::explain),
+            crate::session::explain::is_explain_text,
+        ),
+        (
+            "database_ddl",
+            |s| read(s, c::database_ddl),
+            crate::ddl::database::is_database_ddl_text,
+        ),
+        (
+            "creates_exclusions",
+            |s| read(s, c::creates_exclusions),
+            crate::ddl::exclude::creates_exclusions_text,
+        ),
+    ];
+    let mut differ: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut read_by_tree = 0;
+    let probes = CLASSIFIER_PROBES.iter().map(|s| ("probe", (*s).to_string()));
+    for (_, sql) in corpus().into_iter().chain(probes) {
+        if crate::ast::parse::shared(&sql).is_ok() {
+            read_by_tree += 1;
+        }
+        for (name, tree, text) in pairs {
+            let Some(by_tree) = tree(&sql) else { continue };
+            if by_tree != text(&sql) {
+                let why = CLASSIFIED
+                    .iter()
+                    .find(|(n, f, _)| n == name && f(&sql))
+                    .map_or("unexplained", |(_, _, why)| why);
+                differ
+                    .entry(format!("{name} (tree {by_tree}): {why}"))
+                    .or_default()
+                    .push(sql.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+    }
+    eprintln!("{read_by_tree} statements read by the tree");
+    for (k, v) in &differ {
+        eprintln!("{} {k}", v.len());
+        for s in v.iter().take(6) {
+            eprintln!("    {}", s.chars().take(200).collect::<String>());
+        }
+    }
+    let unexplained: usize = differ
+        .iter()
+        .filter(|(k, _)| k.ends_with("unexplained"))
+        .map(|(_, v)| v.len())
+        .sum();
+    assert_eq!(unexplained, 0, "classifications the tree reads otherwise, unexplained");
+}
+
+/// Where a classifier on the tree reads a statement otherwise than its text did: the
+/// classifier, a test of the statement, and why the tree is right.
+type Classified = (&'static str, fn(&str) -> bool, &'static str);
+
+const CLASSIFIED: &[Classified] = &[(
+    "set_role",
+    |s| {
+        let w: Vec<String> = s.split_whitespace().take(2).map(str::to_ascii_lowercase).collect();
+        w.first().is_some_and(|w| w == "set") && w.get(1).is_some_and(|w| w == "local" || w == "session")
+    },
+    "SET LOCAL ROLE and SET SESSION ROLE set the role, as SET ROLE does: the text read ROLE as the second \
+     word only, and SET LOCAL ROLE, with which a pool lends a connection to a role for one transaction, was a \
+     SET of nothing that left the session's role in place, its privileges and row-level security unchanged",
+)];
+
+/// Statements the corpus lacks that tell the classifiers apart, beside it.
+const CLASSIFIER_PROBES: &[&str] = &[
+    "SET LOCAL ROLE web_anon",
+    "SET SESSION ROLE alice",
+    "SET LOCAL SESSION AUTHORIZATION alice",
+    "SET ROLE NONE",
+    "RESET ROLE",
+    "CREATE TEMP SEQUENCE s",
+    "ALTER TABLE t RENAME COLUMN a TO \"ENABLE ROW LEVEL SECURITY\"",
+    "ALTER TABLE t ADD COLUMN c int, ENABLE ROW LEVEL SECURITY",
+    "COMMIT PREPARED 'x'",
+    "PREPARE TRANSACTION 'x'",
+    "SET LOCAL TIME ZONE 'UTC'",
+    "SHOW search_path",
+    "RESET ALL",
+];
