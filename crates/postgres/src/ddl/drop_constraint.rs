@@ -21,17 +21,10 @@ use crate::auth::rls::text_or_empty;
 use crate::ddl::tree::{CodeTok, CodeTokKind, code_tokens};
 use crate::error::{Result, errf};
 use crate::session::Session;
-use crate::types::param_types::unquote;
 use overlite_core::SqlState;
-use overlite_core::lazy_regex;
 use overlite_core::text::{eq_fold, quote_ident, quote_literal};
 use overlite_engine::{relation_name, split_stored_name, unquote_sql_ident};
 use std::ops::Range;
-
-lazy_regex!(
-    RE_DROP_CONSTRAINT,
-    r#"(?is)\bDROP\s+CONSTRAINT\s+(IF\s+EXISTS\s+)?("(?:[^"]|"")+"|[\w$]+)\s*(?:(CASCADE)|RESTRICT)?\s*;?\s*$"#
-);
 
 /// What an ALTER TABLE ... DROP CONSTRAINT asks for.
 #[derive(Debug)]
@@ -41,13 +34,14 @@ pub(crate) struct DropConstraint {
     cascade: bool,
 }
 
-pub(crate) fn parse_drop_constraint(sql: &str) -> Option<DropConstraint> {
-    let m = RE_DROP_CONSTRAINT.captures(sql)?;
-    Some(DropConstraint {
-        name: unquote(m.get(2).map_or("", |x| x.as_str())),
-        if_exists: m.get(1).is_some(),
-        cascade: m.get(3).is_some(),
-    })
+impl DropConstraint {
+    pub(crate) fn new(name: &str, if_exists: bool, cascade: bool) -> DropConstraint {
+        DropConstraint {
+            name: name.to_string(),
+            if_exists,
+            cascade,
+        }
+    }
 }
 
 impl Session {
@@ -540,11 +534,6 @@ fn default_constraint_name(relation: &str, kind: ConstraintKind, cols: &[String]
 // it along, a multi-column one whole, and refuses only when another table's foreign
 // key stands on it, unless CASCADE.
 
-lazy_regex!(
-    RE_DROP_COLUMN,
-    r#"(?is)^\s*ALTER\s+TABLE\s+.*?\bDROP\s+(?:COLUMN\s+)?("(?:[^"]|"")+"|[\w$]+)\s*(?:(CASCADE)|RESTRICT)?\s*;?\s*$"#
-);
-
 /// What an ALTER TABLE ... DROP [COLUMN] asks for.
 #[derive(Debug)]
 pub(crate) struct DropColumn {
@@ -552,18 +541,13 @@ pub(crate) struct DropColumn {
     cascade: bool,
 }
 
-pub(crate) fn parse_drop_column(sql: &str) -> Option<DropColumn> {
-    let m = RE_DROP_COLUMN.captures(sql)?;
-    let column = m.get(1)?.as_str();
-    // DROP CONSTRAINT x reads as a column called CONSTRAINT here, and IF EXISTS as
-    // one called IF: those are the other forms'.
-    if ["constraint", "if"].iter().any(|w| eq_fold(column, w)) {
-        return None;
+impl DropColumn {
+    pub(crate) fn new(column: &str, cascade: bool) -> DropColumn {
+        DropColumn {
+            column: column.to_string(),
+            cascade,
+        }
     }
-    Some(DropColumn {
-        column: unquote(column),
-        cascade: m.get(2).is_some(),
-    })
 }
 
 impl Session {

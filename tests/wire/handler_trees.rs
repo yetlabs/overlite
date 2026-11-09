@@ -114,3 +114,21 @@ fn a_serial_column_of_a_table_named_with_a_space() {
         [r#"public."My T_n_seq""#]
     );
 }
+
+// ALTER COLUMN of a column named with a space read its name up to the space, and a
+// column made citext by ALTER ... TYPE compared with case, as no other citext does.
+#[test]
+fn alter_column_reads_its_column_and_type() {
+    let conn = connect(&start_server());
+    must_exec(&conn, "CREATE EXTENSION IF NOT EXISTS citext");
+    must_exec(&conn, r#"CREATE TABLE t (id int, "d e" text)"#);
+    must_exec(&conn, r#"INSERT INTO t VALUES (1, 'x')"#);
+    must_exec(&conn, r#"ALTER TABLE t ALTER COLUMN "d e" SET NOT NULL"#);
+    let err = conn.exec(r#"INSERT INTO t VALUES (2, NULL)"#, &[]).unwrap_err();
+    assert_eq!(err.code(), "23502");
+    must_exec(&conn, r#"ALTER TABLE t ALTER COLUMN "d e" TYPE citext"#);
+    assert_eq!(
+        query_column(&conn, r#"SELECT id::text FROM t WHERE "d e" = 'X'"#, 0),
+        ["1"]
+    );
+}

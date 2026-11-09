@@ -4,44 +4,65 @@
 //! TABLE of its own, run in order inside the batch's transaction, so they still
 //! apply together or not at all.
 
-use crate::ddl::sequences::split_top_level;
+use crate::ddl::tree::{self, CodeTok, code_tokens};
 use crate::error::Result;
-use crate::rewrite::blank::strip_leading_comments;
 use crate::session::Session;
 use crate::session::utility::TxControl;
-use crate::session::utility::{alter_is_noop, first_word_upper, second_word_upper};
+use crate::session::utility::alter_is_noop;
 use overlite_core::Command;
-use overlite_core::lazy_regex;
-use overlite_core::text::eq_fold;
+use pg_query::NodeEnum;
 
-// Matches `ALTER TABLE [IF EXISTS] [ONLY] <table>` and what
-// follows it, the table possibly schema-qualified and quoted.
-lazy_regex!(pub(crate) RE_ALTER_TABLE_HEAD, concat!(
-    r#"(?is)^(\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"#,
-    r#"(?:"(?:[^"]|"")+"|[\w$]+)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[\w$]+))?)\s+(.*?)\s*;?\s*$"#
-));
+/// An ALTER TABLE's head and its actions, as Postgres reads them: the node says the
+/// actions and where the relation is; the scanner where the head ends (after the
+/// relation's name) and the commas between the actions are. None for any other
+/// statement.
+pub(crate) struct AlterParts<'a> {
+    /// `ALTER TABLE [IF EXISTS] [ONLY] name`, as written.
+    pub(crate) head: &'a str,
+    /// Each action, as written, trimmed.
+    pub(crate) actions: Vec<&'a str>,
+}
+
+pub(crate) fn alter_parts(sql: &str) -> Option<AlterParts<'_>> {
+    let (location, count) = tree::read(sql, |n| match n {
+        NodeEnum::AlterTableStmt(a) if tree::object(a.objtype) == pg_query::protobuf::ObjectType::ObjectTable => {
+            Some((usize::try_from(a.relation.as_ref()?.location).ok()?, a.cmds.len()))
+        }
+        _ => None,
+    })?;
+    let toks: Vec<CodeTok> = code_tokens(sql);
+    let first = toks.first()?;
+    let mut at = toks.iter().position(|t| t.span.start == location)?;
+    while toks.get(at + 1).is_some_and(|t| t.is_punct(sql, ".")) && toks.get(at + 2).is_some() {
+        at += 2;
+    }
+    let head = &sql[first.span.start..toks[at].span.end];
+    let mut actions = Vec::new();
+    let mut from = toks[at].span.end;
+    let mut end = sql.len();
+    for t in &toks[at + 1..] {
+        if t.depth == 0 && t.is_punct(sql, ",") {
+            actions.push(sql[from..t.span.start].trim());
+            from = t.span.end;
+        } else if t.depth == 0 && t.is_punct(sql, ";") {
+            end = t.span.start;
+        }
+    }
+    actions.push(sql[from..end].trim());
+    (actions.len() == count).then_some(AlterParts { head, actions })
+}
 
 /// Returns one ALTER TABLE per action of stmt, or stmt alone when it is not an
 /// ALTER TABLE with more than one action.
 pub(crate) fn split_alter_actions(stmt: &str) -> Vec<String> {
-    let body = strip_leading_comments(stmt);
-    if !eq_fold(&first_word_upper(body), "ALTER") || second_word_upper(body) != "TABLE" {
-        return vec![stmt.to_string()];
-    }
-    let Some(m) = RE_ALTER_TABLE_HEAD.captures(body) else {
+    let Some(parts) = alter_parts(stmt).filter(|p| p.actions.len() > 1) else {
         return vec![stmt.to_string()];
     };
-    let m1 = m.get(1).map_or("", |x| x.as_str());
-    let m2 = m.get(2).map_or("", |x| x.as_str());
-    let actions = split_top_level(m2);
-    if actions.len() < 2 {
-        return vec![stmt.to_string()];
-    }
-    let mut out = Vec::with_capacity(actions.len());
-    for a in &actions {
-        out.push([m1.trim(), " ", a.trim()].concat());
-    }
-    out
+    parts
+        .actions
+        .iter()
+        .map(|a| [parts.head.trim(), " ", a].concat())
+        .collect()
 }
 
 impl Session {
