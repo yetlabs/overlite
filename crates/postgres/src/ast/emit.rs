@@ -1625,19 +1625,24 @@ impl Emitter<'_> {
                     name,
                     "pg_partition_ancestors" | "pg_partition_tree" | "pg_partition_root" | "pg_options_to_table"
                 )
-                && !r.ordinality
                 && r.coldeflist.is_empty()
             {
                 // No partitions and no foreign data: an empty relation with the
                 // function's columns, as rewrite_partition_srf and
-                // rewrite_pg_options_to_table write it.
+                // rewrite_pg_options_to_table write it, WITH ORDINALITY too (psql's `\d`
+                // of a table with a trigger reads pg_partition_ancestors so, which the
+                // text pass left to SQLite).
                 let names: Vec<String> = match &r.alias {
                     Some(a) if !a.colnames.is_empty() => a
                         .colnames
                         .iter()
                         .map(|c| string(c).map(ident))
                         .collect::<Result<_, _>>()?,
-                    _ if name == "pg_options_to_table" => Vec::new(),
+                    _ if name == "pg_options_to_table" && !r.ordinality => Vec::new(),
+                    _ if name == "pg_options_to_table" => {
+                        vec!["option_name".into(), "option_value".into(), "ordinality".into()]
+                    }
+                    _ if r.ordinality => vec![name.to_string(), "ordinality".into()],
                     _ => vec![name.to_string()],
                 };
                 if names.is_empty() {

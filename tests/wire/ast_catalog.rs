@@ -113,3 +113,26 @@ fn bitwise_operators_answer_at_their_operands_width() {
     let types: Vec<u32> = r[0].fields.iter().map(|f| f.data_type_oid).collect();
     assert_eq!(types, [23, 20]);
 }
+
+// psql's `\d` of a table reads its triggers with pg_partition_ancestors(...) WITH
+// ORDINALITY, which the text pass left to SQLite, a syntax error that failed `\d` of
+// every table with a foreign key. overlite has no partitions: no ancestors, no rows.
+#[test]
+fn psql_reads_the_triggers_of_a_table_with_a_foreign_key() {
+    let conn = connect(&start_server());
+    must_exec(&conn, "CREATE TABLE ta2 (id int PRIMARY KEY)");
+    must_exec(&conn, "CREATE TABLE tq (a int REFERENCES ta2(id))");
+    let sql = "SELECT t.tgname, pg_catalog.pg_get_triggerdef(t.oid, true), t.tgenabled, t.tgisinternal,
+  CASE WHEN t.tgparentid != 0 THEN
+    (SELECT u.tgrelid::pg_catalog.regclass
+     FROM pg_catalog.pg_trigger AS u,
+          pg_catalog.pg_partition_ancestors(t.tgrelid) WITH ORDINALITY AS a(relid, depth)
+     WHERE u.tgname = t.tgname AND u.tgrelid = a.relid
+           AND u.tgparentid = 0
+     ORDER BY a.depth LIMIT 1)
+  END AS parent
+FROM pg_catalog.pg_trigger t
+WHERE t.tgrelid = 'tq'::regclass AND (NOT t.tgisinternal OR (t.tgisinternal AND t.tgenabled = 'D'))
+ORDER BY 1";
+    assert_eq!(rows(&conn, sql), Vec::<String>::new());
+}
