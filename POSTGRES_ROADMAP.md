@@ -220,7 +220,7 @@ collation; without one, "Ávila" sorts after "zeta".
 | `GRANT` / `REVOKE` on tables, checked before a statement runs | yes |
 | Row-level security policies | yes, `COPY` included |
 | `pg_hba.conf` / `pg_hba.yaml`, TLS, scram-sha-256 / md5 / password / trust / reject | yes |
-| Column-level `GRANT` | no: accepted, and grants the whole table |
+| Column-level `GRANT` (SELECT, INSERT, UPDATE) | yes; REFERENCES is recorded, not enforced |
 | Role names | partial: compared without case |
 
 Privileges and RLS are enforced, not decorative. The column-level gap widens

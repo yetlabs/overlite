@@ -95,6 +95,33 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
 - `_overlite_owners` and `_overlite_grants` are keyed by stored name: bare in public,
   `<schema>.<table>` elsewhere. SET SCHEMA, RENAME TO and ALTER SCHEMA RENAME move the
   rows, DROP TABLE and DROP SCHEMA remove them.
+- Column privileges: `GRANT`/`REVOKE priv (col, ...) ON t` for SELECT, INSERT, UPDATE
+  and REFERENCES (and ALL, which is those four) are rows of `_overlite_column_grants`,
+  keyed like the table grants by stored name, and by the column's name as the table
+  spells it. A role holding only column privileges uses exactly those columns, as in
+  Postgres 17, checked with a `postgres:17-alpine`: a SELECT of any other column,
+  `*`, a whole row, a WHERE, ORDER BY, RETURNING, subquery, join or COPY reading one is
+  42501 `permission denied for table t`; an INSERT may name only its columns (the rest
+  take their defaults, and DEFAULT VALUES needs any one); an UPDATE may set only its
+  columns, and what it reads, in SET, WHERE or RETURNING, needs SELECT on those. A table
+  privilege still covers every column. REVOKE on the table takes the column grants of
+  that privilege too; REVOKE on a column leaves a table grant alone. Column grants move
+  with RENAME COLUMN, RENAME TO, SET SCHEMA, ALTER SCHEMA RENAME and ALTER ROLE RENAME,
+  and go with DROP COLUMN (so a column added again by that name has none) and DROP
+  TABLE. `DELETE (a)` and `TRUNCATE (a)` are 0LP01, an unknown column 42703.
+- What a SELECT, INSERT, UPDATE or DELETE reads and writes is read from its parse tree
+  (`auth/columns.rs`), table by table and column by column, as Postgres collects it. A
+  statement that reader does not follow (another kind, one Postgres' grammar refuses, or
+  one holding a node it does not walk) is held to the tables its text names and to
+  table-level grants only, so a role with only column privileges on such a table is
+  refused rather than let through. Being Postgres' rules, these now hold for table
+  grants too, where the text reader was looser: an UPDATE or DELETE whose WHERE or
+  RETURNING reads a column, and an INSERT whose RETURNING does, needs SELECT on it
+  besides UPDATE, DELETE or INSERT (a role granted only UPDATE can no longer filter on
+  a column it cannot read), and the tables an
+  INSERT ... SELECT, an UPDATE ... FROM or SET subquery, or a DELETE ... USING reads need
+  SELECT, which the text reader did not ask for. A CTE is no longer taken for a table of
+  its name.
 - `_overlite_rls` and `_overlite_policies` hold stored names too, and move and go with
   the table like its owner. COPY TO reads through the policies and COPY FROM is 0A000
   for a role under RLS, as in Postgres. An older server looked RLS up by bare name, so
@@ -523,6 +550,25 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
   `UPDATE _overlite_owners SET tablename = 's1.t' WHERE tablename = 't'`. If a public
   table of that name exists, or is later created by `CREATE TABLE IF NOT EXISTS`, the
   old row applies to it, since nothing in the row tells the two apart.
+- A server before column privileges stored `GRANT SELECT (a) ON t TO carol` as a grant
+  of SELECT on all of t, and carol can read every column of it still. Those rows are
+  kept as they are: a row in `_overlite_grants` holds a grantee, a table and a
+  privilege, and one written for a column GRANT is the same row a table GRANT writes,
+  so narrowing them would take away grants made on purpose. An admin reviews them with
+  `SELECT grantee, tablename, privilege FROM _overlite_grants ORDER BY 2, 1` (or
+  information_schema.column_privileges, where they show on every column), and turns
+  one meant for columns into what was meant with `REVOKE SELECT ON t FROM carol;
+  GRANT SELECT (a) ON t TO carol`. One trace may help: the old reader split the column
+  list at its commas, so `SELECT (a, b)` also left a row whose privilege is `B)`; a
+  privilege ending in `)` marks a table whose SELECT (or other) row for that grantee
+  came from a column GRANT. Such a row grants nothing. The other way round, a server
+  from before column privileges reading a newer database finds no column grants at all
+  (it never reads `_overlite_column_grants`), so those roles lose access rather than
+  gain it.
+- REFERENCES, as a column or a table privilege, is recorded and reported but not
+  enforced: no privilege is checked when a foreign key is created. WITH GRANT OPTION is
+  not kept, on columns as on tables. DROP ROLE leaves the role's grants in place, where
+  Postgres refuses it while they exist, so a role created again by that name has them.
 - On a filesystem that does not tell case apart (macOS's default APFS), two databases
   whose names differ only in case cannot both exist: each is the file `<name>.db`, so
   creating or renaming to the second is 42P04, where Postgres takes both. A name is
@@ -540,6 +586,12 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 - pg_get_serial_sequence takes literals, and setval reads its arguments from rows only in
   `SELECT setval(...) FROM ...` with no other item and no parameter.
 - EXPLAIN's costs and estimated rows are 0: SQLite estimates none.
+- pg_attribute.attacl, information_schema.column_privileges, has_table_privilege,
+  has_column_privilege and has_any_column_privilege answer from the grants, so psql's
+  `\dp` lists column privileges as Postgres prints them. pg_class.relacl is still NULL:
+  `\dp` shows no table privileges, and column_privileges shows them only through their
+  columns. A table named in has_*_privilege without its schema is the public one, not
+  the search_path's.
 
 ### Messages
 

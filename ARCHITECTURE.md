@@ -196,7 +196,9 @@ one run inside an implicit transaction. Each statement takes this route through
    then, unless the transaction is aborted, schema DDL, role DDL, GRANT, ALTER TABLE,
    RLS DDL, LISTEN/NOTIFY, sequences, types, COMMENT, SET ROLE, PREPARE/EXECUTE, COPY,
    search_path and the utility statements clients expect to succeed.
-3. `check_privileges` holds what is left to the role's grants.
+3. `check_privileges` holds what is left to the role's grants: a SELECT, INSERT, UPDATE
+   or DELETE column by column, from its parse tree (`auth/columns.rs`), anything else,
+   or one that reader does not follow, to table grants alone.
 4. `apply_column_defaults` strips or injects nextval defaults and fits what a write
    stores to its columns' modifiers, and an INSERT into a table under RLS is checked by
    `try_rls_insert`.
@@ -282,11 +284,16 @@ skipped changes under `rewrite_full`.
 
 ### RLS and ownership keys
 
-`_overlite_owners`, `_overlite_grants`, `_overlite_rls`, `_overlite_policies` and
-`_overlite_defaults` are keyed by stored name: bare in public, `<schema>.<table>` elsewhere, which is the table's
+`_overlite_owners`, `_overlite_grants`, `_overlite_column_grants`, `_overlite_rls`,
+`_overlite_policies` and `_overlite_defaults` are keyed by stored name: bare in public, `<schema>.<table>` elsewhere, which is the table's
 real name in SQLite, as `stored_table_name` builds it. SET SCHEMA,
 RENAME TO and ALTER SCHEMA RENAME move the rows with `move_table_rows_sql`; DROP TABLE
-and DROP SCHEMA remove them with `forget_table_rows_sql`.
+and DROP SCHEMA remove them with `forget_table_rows_sql`. A column grant is keyed by its
+column's name as well: RENAME COLUMN moves it and DROP COLUMN removes it
+(`follow_columns` after the engine runs the ALTER, `forget_column_default` on the
+rebuild route), so a column added again by that name starts with none. Column grants
+are a table of their own, not rows of `_overlite_grants`, whose every row covers the
+whole table: a server that knows nothing of them reads none.
 
 A bare name means the public table and no other. A database from before stored names
 gets `RLS_STORED_NAMES_UPGRADE` once on its first open, marked by the empty table
