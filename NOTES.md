@@ -464,6 +464,30 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   whose ELSE is a cast or a call is labelled by it, as Postgres' FigureColname does
   (psql's `\d` reads its columns by position). A Parse holding several statements is
   translated statement by statement, as before.
+- Since stage 5b (docs/adr/0001-sql-ast.md), DDL is translated from the tree (CREATE
+  TABLE, CREATE INDEX, ALTER TABLE, DROP, views) and the session's statements are
+  routed by their node; a table's stored DDL stays as the client wrote it but where
+  SQLite needs it otherwise. Answers that were wrong or refused and are Postgres' now
+  (tests/wire/ast_ddl.rs, tests/wire/classify.rs): `SET LOCAL ROLE r` and `SET
+  SESSION ROLE r` set the role (they were a SET of nothing: what followed ran as the
+  session's role, past grants and row-level security), LOCAL until the transaction
+  ends, and a rollback undoes a SET ROLE or SESSION AUTHORIZATION; SET LOCAL ROLE
+  outside a transaction warns (25P01) and changes nothing; `id serial NOT NULL
+  PRIMARY KEY` (Django's and Wagtail's first migrations) is the rowid with
+  AUTOINCREMENT and its own sequence, as `serial PRIMARY KEY` was (an INSERT without
+  the id was 23502); a DEFAULT that is an expression but no call (`1 + 2`, `'x' ||
+  'y'`) is taken (a syntax error); a column called tablespace; a TEMP table's
+  numeric keeps its scale and a citext compares without case; CREATE UNLOGGED TABLE
+  makes a table (a syntax error); a numeric column added by ALTER TABLE through a
+  rebuild keeps its scale.
+- Client-visible since stage 5b: a DEFAULT, a CHECK, a generated column's expression
+  and an index's key or WHERE are stored as the printer writes them where that is not
+  the client's SQL token for token (`CAST(x AS integer)` where the text passes kept
+  `CAST(x AS int)`, a name's needless quotes dropped); pg_get_constraintdef, column
+  defaults and pg_get_indexdef show that text. A CHECK holding a cast to numeric is
+  a CAST to numeric (the text passes wrote the column type DECIMALTEXT into it). A
+  function's DDL is stored as written (the text passes added NULLS LAST after a body
+  ending in ORDER BY).
 
 ## Limits
 
@@ -475,8 +499,10 @@ Since stage 3 of the AST migration (docs/adr/0001-sql-ast.md), a statement the A
 path translates is typed from its tree and the catalog, and the limits below that
 come from a type the translation cannot see hold for the others only: a statement the
 fast path runs as written (since stage 4 only one over columns whose types it reads
-the same), one left to the text passes (since stage 5a, DDL and the utility
-statements, and statements Postgres itself refuses), and the server's own probes. In a typed
+the same), one left to the text passes (since stage 5b, what Postgres' grammar
+does not read: SQLite's own dialect and what Postgres refuses, and a statement whose
+typing depends on what the catalog cannot tell, such as a boolean column holding
+text), and the server's own probes. In a typed
 statement what is still not known is a column of a table the catalog does not have,
 a function the environment does not type; a json, range, array or `%` operator over
 such a value is read as the text passes read it.
@@ -586,6 +612,9 @@ such a value is read as the text passes read it.
   VALUE is 0A000, and an UPDATE of a GENERATED ALWAYS column is not refused.
 - TRUNCATE is a DELETE, so a table's ON DELETE triggers fire, and RESTART IDENTITY
   restarts the sequence of every nextval default of the table, owned or not.
+- ROLLBACK TO a savepoint does not undo a SET ROLE or SET LOCAL ROLE made after it;
+  the end of the transaction does (a SET ROLE is undone by a rollback, SET LOCAL at
+  either end, as in Postgres). `set_config('role', ...)` changes no role.
 - A role's name compares without case, as `_overlite_roles.rolname` was created NOCASE
   and existing databases keep the table: `"Mixed"` and `mixed` are one role, where
   Postgres has two. Rebuilding the table at startup would rewrite stored data.

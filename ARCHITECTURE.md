@@ -1,12 +1,14 @@
 # Architecture
 
 overlite speaks the PostgreSQL wire protocol on the front and stores everything in
-SQLite files on the back. There is no planner. A statement is classified by looking at its
-text and run by SQLite; a statement that reads or writes rows, the catalog's included,
-is translated from Postgres' parse tree (`ast`, docs/adr/0001-sql-ast.md), with its
-labels, parameter types and the types of its expressions read from that tree and the
-catalog, and DDL and the utility statements by text rewrites, until stage 5b moves
-them too.
+SQLite files on the back. There is no planner. A statement is parsed by Postgres' own
+grammar (`ast`, docs/adr/0001-sql-ast.md), classified by its node and run by SQLite: a
+statement that reads or writes rows, the catalog's included, is translated from the
+tree, with its labels, parameter types and the types of its expressions read from it
+and the catalog, and so is DDL (CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP, views).
+What Postgres' grammar does not read (SQLite's own dialect, which is served as it was,
+and what Postgres refuses) is classified by its words and goes through the text
+rewrites, which stage 5c deletes.
 
 ## Crates
 
@@ -133,16 +135,35 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   `assign`, which fits written values to a column's modifier. `words` reads the names
   of the role, database, RLS and COMMENT statements: whole when quoted, folded when
   not. Other readers of names remain (`session::utility::unquote_ident` the most used);
-  they are to be folded into it.
+  they are to be folded into it, and then into the tree (stage 5c). Which handler takes
+  a statement is `ast::classify`'s; how each reads its statement is still its text.
 - `rewrite`: `rewrite_full`, 66 passes in a fixed order, each its own function,
   grouped by theme: `casts`, `datetime`, `json`, `arrays`, `operators`, `catalog`...
   The order matters, and comments in `rewrite_full` say why where it does. `tokens`
   is the crate's shared tokenizer (`code_tokens`): words, literals and quoted names,
   punctuation, each with its depth, comments left out.
-- `ast` (docs/adr/0001-sql-ast.md, stage 5a): a statement parsed by Postgres' grammar
-  (libpg_query, called directly by `parse`, without the pg_query crate's summary walk)
-  and printed as SQLite SQL (`emit`), for SELECT, INSERT, UPDATE and DELETE, several
-  of them in one Parse included. The catalog's relations are the engine's views under
+- `ast` (docs/adr/0001-sql-ast.md, stage 5b): a statement parsed by Postgres' grammar
+  (libpg_query, called directly by `parse`, without the pg_query crate's summary walk;
+  `parse::shared` keeps a thread's parses by text, so that the classifiers, the
+  privilege check and the translation read one parse of a statement) and printed as
+  SQLite SQL (`emit`), for SELECT, INSERT, UPDATE and DELETE, several of them in one
+  Parse included, and DDL (`ddl`, below). `classify` reads the session's routes from
+  the node: transaction control, savepoints, cursors, the DDL of schemas, roles,
+  sequences, types and databases, GRANT, RLS, COMMENT, SET ROLE, PREPARE, COPY,
+  TimeZone, search_path, EXPLAIN; each classifier of the session asks it, and reads the
+  words only where the grammar does not read the statement; a statement that reads or
+  writes rows is none of these and is not parsed for them. `ddl` translates CREATE
+  TABLE, CREATE INDEX, ALTER TABLE, DROP, RENAME, CREATE VIEW and CREATE TABLE AS:
+  the tree says what each part of the statement is and Postgres' scanner where it
+  ends, and only what SQLite does not take is written anew (a column's type: serial,
+  numeric, citext, arrays; COLLATE; a DEFAULT, a CHECK, a generated column's, an
+  index's keys and WHERE through the printer, as the text passes wrote them in DDL:
+  SQLite's CAST and clock, a cast of a literal folded; a key's deferral and an index's
+  method, INCLUDE and NULLS NOT DISTINCT in the comments the catalog reads; what
+  SQLite has no use for dropped), so that a table's stored DDL stays as the client
+  wrote it wherever SQLite takes it (What a table's DDL keeps, below). A function's
+  DDL, SET CONSTRAINTS and VACUUM are the engine's or SQLite's as written.
+  For the rows: the catalog's relations are the engine's views under
   the names it gives them (pg_catalog's bare, information_schema's as the dotted name
   of a temp view, `catalog_relation`), their oid, tableoid and xmin columns as written,
   a reg* cast a lookup in the view its type names (`reg_cast`), the functions the text
@@ -164,7 +185,9 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   name, written as it came (`REWRITTEN` lists those it does, which a test holds to the
   passes);
   `rewrite` takes it when it covers the statement and runs `rewrite_full` otherwise,
-  which over the corpus is DDL, the utility statements and what Postgres refuses.
+  which in a running server is what Postgres' grammar does not read and the
+  statements whose typing depends on the catalog (`TYPE_REFUSAL_*`), counted by
+  `make text-passes` (OVERLITE_RECORD_TEXT_PASSES).
   For a statement it covers, its output is final: it writes the labels, every cast,
   each sort key's NULLS and every LIKE itself, and Describe types the parameters from
   its tree (`params::facts`) alone. The text readers of each (`rewrite::labels`,
@@ -257,7 +280,8 @@ one run inside an implicit transaction. Each statement takes this route through
    every other comment to spaces, and `normalize_literals` turns E'', U&'' and a string
    continued on another line into plain literals, so that nothing after it knows
    comments or more than one kind of literal.
-2. The session's own statements are tried in turn: transaction control, savepoints,
+2. The session's own statements are tried in turn, each recognized by its node
+   (`ast::classify`, its words where Postgres' grammar does not read it): transaction control, savepoints,
    then, unless the transaction is aborted, schema DDL, role DDL, GRANT, ALTER TABLE,
    RLS DDL, LISTEN/NOTIFY, sequences, types, COMMENT, SET ROLE, PREPARE/EXECUTE, COPY,
    search_path and the utility statements clients expect to succeed.
@@ -313,6 +337,13 @@ btree it makes: `/*overlite include "a", b*/` (a covering index's columns),
 `/*overlite nulls not distinct*/` (its key columns are then `ifnull(col, <blob>)`,
 which the catalog reads back as the columns) and `/*overlite using gin*/` (the access
 method pg_class.relam reports). index_where stops at the first of them.
+
+`ast::ddl` writes these from the tree, and leaves the rest of the statement as the
+client wrote it: a column's type, a constraint's name, a name's quotes and a key
+written the client's way are what the catalog reads back, and what existing databases
+hold. An expression it prints (a DEFAULT, a CHECK, an index's key or WHERE) is kept as
+written where it is the same SQL token for token. The differential test compares this
+text, which is what SQLite stores, with the text passes' (`ddl::takes`).
 
 A materialized view `v` is a table `v` and a view `_overlite_mv_v` holding its query;
 the prefix keeps the view out of every catalog. `_overlite_extensions` and

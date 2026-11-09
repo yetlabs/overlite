@@ -1,6 +1,6 @@
 # 0001: Translate SQL from a parse tree, not from text
 
-Status: accepted; stages 0 to 4 and 5a landed on main (below), stage 1's week of the owner's apps pending
+Status: accepted; stages 0 to 4, 5a and 5b landed on main (below), stage 1's week of the owner's apps pending
 Date: 2026-11-08
 
 ## Context
@@ -962,6 +962,175 @@ not deleted: it serves the utility statements (5b).
    (`blank.rs`, `resolve/names.rs`) where nothing reads raw text, and OVERLITE_AST,
    OVERLITE_AST_SHADOW and the differential test with them: the corpus stays, as a
    snapshot of the printer's output reviewed on change.
+
+## Stage 5b result
+
+DDL is translated from the tree, and the session routes every statement by its node;
+what still reaches `rewrite_full` in a running server is what Postgres' grammar does not
+read and nine statements whose typing depends on the catalog.
+
+**Measured first** (`make text-passes`: OVERLITE_RECORD_TEXT_PASSES records what
+`rewrite` hands to `rewrite_full`, `count_what_reached_the_text_passes` counts it by
+node kind), over the wire suite less its panics test, statements and distinct ones:
+
+| node kind | 6491d37 | stage 5b |
+|---|---|---|
+| CreateStmt | 759 / 471 | 0 |
+| AlterTableStmt (ADD COLUMN) | 145 / 108 | 0 |
+| IndexStmt | 73 / 67 | 0 |
+| DropStmt (table 36, index 3, trigger 2, function 2, view 1) | 59 / 44 | 0 |
+| CreateFunctionStmt | 34 / 30 | 0 |
+| ViewStmt | 17 / 13 | 0 |
+| RenameStmt (column) | 18 / 12 | 0 |
+| ConstraintsSetStmt, VacuumStmt, CreateTableAsStmt | 13 / 6 | 0 |
+| SelectStmt | 17 / 11 | 17 / 11 |
+| parse error | 86 / 43 | 22 / 15 |
+| total | 1221 / 805 | 39 / 26 |
+
+The corpus overstated it as expected: of its 3307 utility statements only these kinds
+reached the text passes; the rest are the session's before `rewrite`. 28 of the 43
+"parse errors" were the server's own texts: the identity key the session wrote as
+`INTEGER ... AUTOINCREMENT` before translating, a column's definition a rebuild
+translated alone, and COPY's bare table name.
+
+**What moved.**
+
+- `ast/ddl.rs`: CREATE TABLE, CREATE INDEX, ALTER TABLE (ADD COLUMN, ALTER COLUMN TYPE
+  ... USING, SET DEFAULT, ADD CONSTRAINT CHECK; the rest as written), DROP of tables,
+  views, indexes and triggers, RENAME, CREATE VIEW, CREATE TABLE AS; a function's DDL,
+  SET CONSTRAINTS and VACUUM as written. Not a printer of the whole statement: the
+  stored DDL is a contract with the catalog and with existing databases, so the
+  statement is kept as the client wrote it and only what SQLite does not take is
+  rewritten, placed by the tree, its extent read by Postgres' scanner
+  (`pg_query::scan_tokens`, comments, literals and quoted names its own): a column's
+  type (serial, numeric as DECIMALTEXT with its collation, citext, an array's sizes, a
+  modified element type quoted, `pg_catalog.`), COLLATE, a DEFAULT (a literal bare,
+  anything else in parentheses, a cast of a literal folded, a timestamptz's offset
+  literal in UTC), CHECK, a generated column's, an index's keys and WHERE through the
+  printer (`emit::expression`: untyped, SQLite's CAST and `datetime('now')` in a
+  table's DDL as the text passes wrote them; an expression that prints as the same
+  SQL token for token is kept as written), a key's deferral and an index's method,
+  INCLUDE and NULLS NOT DISTINCT in the comments the catalog reads, TABLESPACE,
+  CONCURRENTLY, WITH (...), UNLOGGED and ALTER TABLE's IF EXISTS / ONLY dropped. The
+  session's identity key is written `serial ... PRIMARY KEY`, which the grammar reads;
+  a column a rebuild adds is translated inside a CREATE TABLE.
+- `ast/classify.rs`: the session's classifiers (transaction control, savepoints,
+  cursors, the DDL of schemas, roles, sequences, types and objects, databases, GRANT,
+  RLS, COMMENT, SET ROLE, PREPARE, COPY, TimeZone, search_path, EXPLAIN, EXCLUDE) read
+  the node, their words only where the grammar does not read the statement (SQLite's
+  dialect, which is still served). A statement that reads or writes rows is none of
+  them and is not parsed for them. `parse::shared` (the privilege check's per-thread
+  cache of trees, moved) gives the classifiers and the privilege check one parse; the
+  translation reads one they kept and keeps none of its own (`kept_or_new`: keeping
+  each pgbench text cost lookup2 simple 5%). The handlers still read their statement's
+  text (`ddl::words`, `unquote_ident`, `split_alter_actions`): stage 5c's.
+
+**Differential.** DDL is compared as the text SQLite stores, before the engine's type
+passes on both sides (`diff::is_ddl`). On the corpus grown by 34 statements (16340),
+6491d37 against stage 5b:
+
+| | fast path | text passes | AST path |
+|---|---|---|---|
+| 6491d37 | 4175 | 3442 | 8723 |
+| stage 5b | 4175 | 997 | 11168 |
+
+Of the 11168: identical 8489, identical but parentheses 1994, intended 685, unexplained
+0. The new intended differences (compare.rs): 2 a TEMP or UNLOGGED table typed as any
+table; 1 a column called tablespace; 1 a function's DDL without the NULLS LAST the
+text pass wrote after its dollar-quoted body; 1 a cast to tsvector of a column in an
+index key is its operand, as in every statement. `CAST(x AS int)` and `CAST(x AS
+integer)` now compare equal (`cast_type_names`). The 997 left: 846 the session's
+statement kinds (they never reach `rewrite`), 112 parse errors, 24 ALTER TABLE ... ADD
+CONSTRAINT EXCLUDE and 6 materialized views (ddl/exclude.rs and ddl/objects.rs read
+their text), 1 a partition, and the 8 that read rows as in stage 5a.
+
+The classifiers have a differential of their own (`classifiers_read_the_tree_as_the_
+text_did`): over the 16228 corpus statements the grammar reads, and 13 probes, each of
+19 classifiers by the tree against its text. They agree on every corpus statement; the
+probes find the one intended difference, SET LOCAL ROLE and SET SESSION ROLE.
+
+**Bugs fixed**, each a test that fails on 6491d37 and is held to Postgres 17:
+tests/wire/classify.rs: `SET LOCAL ROLE r` and `SET SESSION ROLE r` were a SET of
+nothing, and what followed ran as the session's role (a superuser for most
+connections) past grants and row-level security; they set the role now, LOCAL until
+the transaction ends, a rollback undoes a SET ROLE, and SET LOCAL outside a
+transaction warns (25P01), over both protocols. tests/wire/ast_ddl.rs: `id serial NOT
+NULL PRIMARY KEY` (Django's and Wagtail's first migrations) was no rowid with a
+sequence and refused every INSERT without its id (23502); `DEFAULT 1 + 2` and
+`DEFAULT 'x' || 'y'` were syntax errors; a column called tablespace was cut out of its
+table; a TEMP table's numeric lost its scale and its citext its case-insensitivity;
+CREATE UNLOGGED TABLE was a syntax error; a numeric column added through a rebuild
+lost its scale.
+
+**Client-visible changes** (NOTES.md): the fixes; an expression of a table's DDL is
+stored as printed where it is not the client's SQL token for token
+(pg_get_constraintdef, column defaults, pg_get_indexdef show it); a function's DDL is
+stored as written.
+
+**Performance.** pgbench as before (4 clients, 4 threads, 8 s, each binary on its own
+copy of the 100,000-row `kv`, the order swapped in round 2), 6491d37 against stage 5b
+at 700e3d0, tps per round:
+
+| script, mode | 6491d37 | stage 5b | means |
+|---|---|---|---|
+| lookup (fast path), simple | 111862 / 112746 / 112366 | 107393 / 115662 / 115768 | +0.5% |
+| lookup (fast path), prepared | 93086 / 95785 / 96365 | 96105 / 96568 / 96319 | +1.3% |
+| lookup2 (AST), simple | 80464 / 79258 / 79375 | 81941 / 81854 / 81897 | +2.8% |
+| lookup2 (AST), prepared | 84944 / 86027 / 86268 | 86113 / 86493 / 86366 | +0.7% |
+| mix, simple | 14021 / 13945 / 13899 | 14369 / 14370 / 14288 | +2.8% |
+| mix, prepared | 14330 / 14230 / 14379 | 14323 / 14302 / 14307 | −0.0% |
+| lookup3, simple | 78743 / 78890 / 79324 | 81555 / 81743 / 81714 | +3.4% |
+| lookup3, prepared | 84459 / 84462 / 82792 | 85023 / 84194 / 83261 | +0.3% |
+
+The first run, with the translation keeping its parses, had lookup2 simple at −5.4%
+(78780 / 78500 / 78242 against 75141 / 71740 / 75835), mix simple −2.6%, lookup3
+simple −2.4%; `kept_or_new` removed it. DDL: 1,000 statements (100 times CREATE TABLE
+with serial, numeric, a defaulted timestamptz, an array and a CHECK, two CREATE INDEX
+with an operator class, an expression and a WHERE, two ADD COLUMN, a RENAME COLUMN,
+CREATE VIEW, and three DROPs) through psql over one connection, a fresh database each,
+in turn, seconds: 6491d37 2.230 / 2.201 / 2.184, stage 5b 2.220 / 2.177 / 2.237: level.
+
+**Exit criterion.** Over the wire suite's recorded statements, `rewrite_full` receives
+39 (26 distinct), not met in full:
+
+- Postgres refuses, 15 distinct: SQLite's own dialect the session serves (`CREATE
+  TRIGGER ... BEGIN ... END` 3, `integer primary key autoincrement` 2, `EXPLAIN QUERY
+  PLAN`, `LIMIT 0, 1`), syntax errors (`SELEC 1`, an unterminated literal or
+  parenthesis, `SELECT 1 +`, `-> 1 ->`, `(SELECT 1; SELECT 2)`, a broken JSON_OBJECT,
+  `"a\"b"`), and two derived column lists longer than their columns (42P10).
+- The typed translation refuses by the catalog, 9 distinct: a boolean column holding
+  text (`TYPE_REFUSAL_BOOLEAN`: `SELECT b FROM t ORDER BY id`, `SELECT i, f, b ...`,
+  and two over storageformat.rs's `"Flag"`), a json operator over what is not known to
+  be json (`TYPE_REFUSAL_JSON`: hstore's `?` twice and `->>`, `->` of an int[]), and
+  `d AT TIME ZONE 'UTC'` of a date ("AT TIME ZONE of a time").
+
+**Stage 5c, deleting the text route.**
+
+1. The nine typed refusals: a boolean column holding text read by the printer as
+   resolve/booleans.rs reads it (both forms); hstore's `?`, `?|`, `?&`, `->`, `->>` as
+   the engine's hstore functions when the column is hstore, a json operator over an
+   array as an array subscript or a refusal Postgres gives (42883); AT TIME ZONE of a
+   date as of the timestamp at its midnight. A wire test each.
+2. What Postgres refuses: answer a parse error from the tree with Postgres' message,
+   position and 42601, and `derived column aliases` with 42P10, without SQLite. SQLite's
+   own dialect (triggers with a body, AUTOINCREMENT, EXPLAIN QUERY PLAN, `LIMIT a, b`)
+   is a decision: keep a minimal pass-through for what Postgres' grammar refuses (no
+   translation: SQLite runs it as written, which is what every pass left of it), or
+   refuse it as Postgres does and list the break in NOTES.md. The pass-through keeps
+   behavior; the wire tests that send it (privilege_routes, triggers) say which.
+3. The handlers' readers on the node: `ddl::words`, `unquote_ident`,
+   `split_alter_actions`/`alter_actions` (from AlterTableStmt's cmds), `parse_copy`,
+   `zone_change`, `role_target`, the schema, role, sequence, type, database, COMMENT,
+   GRANT and RLS parsers, `create_serial_columns`, `create_identity_columns` and
+   `record_nextval_defaults` (the column plan of a CREATE TABLE read from its
+   ColumnDefs), ddl/exclude.rs and ddl/objects.rs (EXCLUDE, materialized views,
+   partitions). Each against the corpus as classify's differential does, then the
+   `*_text` classifiers go.
+4. Deep trees, the untyped probes and the deletions as stage 5a's plan lists them
+   (items 2 to 4 there): `rewrite_full` and its passes, `holding_literals`,
+   `rewrite::labels`, `param_types`' regexes, `text_tail` (measure the fast path),
+   the engine's type passes, `rewrite/tokens.rs`, `blank.rs`, `resolve/names.rs`,
+   OVERLITE_AST and the shadow.
 
 ## Risks
 
