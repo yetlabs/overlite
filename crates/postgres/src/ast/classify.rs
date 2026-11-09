@@ -37,9 +37,8 @@ fn transaction(n: &NodeEnum) -> Option<TransactionStmtKind> {
     }
 }
 
-/// BEGIN, COMMIT, ROLLBACK and their other spellings. PREPARE TRANSACTION is read as
-/// the text read it, by its first word, with PREPARE (`sql_prepare`); COMMIT
-/// PREPARED and ROLLBACK PREPARED end the transaction as COMMIT and ROLLBACK do.
+/// BEGIN, COMMIT, ROLLBACK and their other spellings. COMMIT PREPARED and ROLLBACK
+/// PREPARED end the transaction as COMMIT and ROLLBACK do; PREPARE TRANSACTION is none.
 pub(crate) fn tx_control(n: &NodeEnum) -> Option<TxControl> {
     use TransactionStmtKind as K;
     match transaction(n)? {
@@ -251,15 +250,6 @@ pub(crate) fn set_role(n: &NodeEnum) -> Option<RoleChange> {
         local: v.is_local,
         target,
     })
-}
-
-/// PREPARE, EXECUTE and DEALLOCATE (and PREPARE TRANSACTION, by its first word, as
-/// the text read it).
-pub(crate) fn sql_prepare(n: &NodeEnum) -> bool {
-    matches!(
-        n,
-        NodeEnum::PrepareStmt(_) | NodeEnum::ExecuteStmt(_) | NodeEnum::DeallocateStmt(_)
-    ) || transaction(n) == Some(TransactionStmtKind::TransStmtPrepare)
 }
 
 /// COPY.

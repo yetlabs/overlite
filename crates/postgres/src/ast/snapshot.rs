@@ -371,16 +371,6 @@ fn classifiers_read_the_tree_as_the_text_did() {
             crate::auth::session_user::is_set_role_text,
         ),
         (
-            "sql_prepare",
-            |s| read(s, c::sql_prepare),
-            |s| {
-                matches!(
-                    crate::session::utility::first_word_upper(s).as_str(),
-                    "PREPARE" | "EXECUTE" | "DEALLOCATE"
-                )
-            },
-        ),
-        (
             "copy",
             |s| read(s, c::copy),
             |s| crate::session::copy::parse_copy_text(s).is_some(),

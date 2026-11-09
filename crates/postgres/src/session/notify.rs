@@ -2,14 +2,12 @@
 //! session's writes and a NOTIFY's never overlap: a NOTIFY writes
 //! to the socket only while the session is idle, under `NotifyState::mu`.
 
-use crate::auth::grants::index_word;
-use crate::rewrite::strings::end_of_string_literal;
 use crate::session::Session;
-use crate::session::utility::{first_word_upper, unquote_ident};
+use crate::session::utility::first_word_upper;
 use crate::wire::{MSG_NOTIFICATION, NetStream, append_cstring, i32_be};
 use overlite_core::Command;
 use overlite_core::sync::MutexExt;
-use overlite_core::text::{split_words, trim_end_chars};
+use pg_query::NodeEnum;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -129,46 +127,51 @@ impl Session {
         self.notify.deliver_locked(&mut g);
     }
 
-    /// Handles LISTEN / UNLISTEN / NOTIFY, None for anything else.
+    /// Handles LISTEN / UNLISTEN / NOTIFY, read from the statement's tree (the
+    /// channel's name as the grammar folds it, the payload as the literal means it);
+    /// None for anything else.
     pub(crate) fn try_listen_notify(&mut self, sql: &str) -> Option<Command> {
-        let f = split_words(sql);
-        if f.is_empty() {
-            return None;
-        }
-        match trim_end_chars(f[0], ";").to_uppercase().as_str() {
-            "LISTEN" => {
-                let ch = notify_channel(&f, 1);
+        let stmt = crate::ast::classify::read(sql, |n| match n {
+            NodeEnum::ListenStmt(l) => Some(Notice::Listen(l.conditionname.clone())),
+            NodeEnum::UnlistenStmt(u) => Some(Notice::Unlisten(u.conditionname.clone())),
+            NodeEnum::NotifyStmt(n) => Some(Notice::Notify(n.conditionname.clone(), n.payload.clone())),
+            _ => None,
+        })??;
+        Some(match stmt {
+            Notice::Listen(ch) => {
                 if !ch.is_empty() {
                     self.listens.insert(ch.clone());
                     register_listen(&ch, &self.notify);
                 }
-                Some(Command::from("LISTEN"))
+                Command::from("LISTEN")
             }
-            "UNLISTEN" => {
-                let arg = if f.len() > 1 { trim_end_chars(f[1], ";") } else { "" };
-                if arg == "*" {
-                    for ch in self.listens.drain() {
-                        unregister_listen(&ch, &self.notify);
-                    }
-                } else {
-                    let ch = notify_channel(&f, 1);
-                    if !ch.is_empty() {
-                        self.listens.remove(&ch);
-                        unregister_listen(&ch, &self.notify);
-                    }
+            Notice::Unlisten(ch) if ch.is_empty() => {
+                // UNLISTEN *, which the grammar reads as no channel.
+                for ch in self.listens.drain() {
+                    unregister_listen(&ch, &self.notify);
                 }
-                Some(Command::from("UNLISTEN"))
+                Command::from("UNLISTEN")
             }
-            "NOTIFY" => {
-                let (ch, payload) = parse_notify(sql);
+            Notice::Unlisten(ch) => {
+                self.listens.remove(&ch);
+                unregister_listen(&ch, &self.notify);
+                Command::from("UNLISTEN")
+            }
+            Notice::Notify(ch, payload) => {
                 if !ch.is_empty() {
                     publish_notify(&ch, &payload, self.pid);
                 }
-                Some(Command::from("NOTIFY"))
+                Command::from("NOTIFY")
             }
-            _ => None,
-        }
+        })
     }
+}
+
+/// LISTEN, UNLISTEN (of no channel: all) or NOTIFY, with its payload.
+enum Notice {
+    Listen(String),
+    Unlisten(String),
+    Notify(String, String),
 }
 
 /// Whether sql is a LISTEN/UNLISTEN/NOTIFY statement.
@@ -179,48 +182,4 @@ pub(crate) fn is_listen_notify(sql: &str) -> bool {
 /// `is_listen_notify` by the text, for what Postgres' grammar does not read.
 pub(crate) fn is_listen_notify_text(sql: &str) -> bool {
     matches!(first_word_upper(sql).as_str(), "LISTEN" | "UNLISTEN" | "NOTIFY")
-}
-
-/// The (unquoted) channel identifier at position i.
-fn notify_channel(f: &[&str], i: usize) -> String {
-    if i >= f.len() {
-        return String::new();
-    }
-    unquote_ident(trim_end_chars(f[i], ",;"))
-}
-
-/// Extracts the channel and optional 'payload' from a NOTIFY.
-fn parse_notify(sql: &str) -> (String, String) {
-    let low = sql.to_ascii_lowercase();
-    let at = index_word(&low, "notify").unwrap_or(0) + "notify".len();
-    let rest = sql[at..].trim();
-    let b = rest.as_bytes();
-    let mut comma: Option<usize> = None;
-    let mut depth = 0;
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\'' {
-            i = end_of_string_literal(rest, i);
-            continue;
-        }
-        if b[i] == b'(' {
-            depth += 1;
-        } else if b[i] == b')' {
-            depth -= 1;
-        } else if b[i] == b',' && depth == 0 {
-            comma = Some(i);
-            break;
-        }
-        i += 1;
-    }
-    let Some(comma) = comma else {
-        return (unquote_ident(trim_end_chars(rest.trim(), ";")), String::new());
-    };
-    let channel = unquote_ident(rest[..comma].trim());
-    let p = trim_end_chars(&rest[comma + 1..], ";").trim();
-    let mut payload = String::new();
-    if p.len() >= 2 && p.as_bytes()[0] == b'\'' {
-        payload = p[1..p.len() - 1].replace("''", "'");
-    }
-    (channel, payload)
 }

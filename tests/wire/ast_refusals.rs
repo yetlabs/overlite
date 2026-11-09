@@ -307,3 +307,32 @@ fn a_boolean_column_holding_text() {
         assert_eq!(texts(&conn, sql), want, "{sql}");
     }
 }
+
+// LISTEN, NOTIFY and PREPARE/EXECUTE are read from their trees: a channel's name as
+// the grammar folds it, a payload as its literal means it (E'' and a quote inside),
+// a prepared query after AS whatever its argument types hold, EXECUTE's arguments by
+// the scanner's commas (a comma or a parenthesis in a literal is the literal's).
+#[test]
+fn notify_and_prepare_by_their_trees() {
+    let addr = start_server();
+    let listener = connect(&addr);
+    let notifier = connect(&addr);
+    listener.exec("LISTEN \"Chan\"", &[]).unwrap();
+    notifier.exec("NOTIFY \"Chan\", E'it''s\\tx, (y)'", &[]).unwrap();
+    let n = listener
+        .wait_for_notification(std::time::Duration::from_secs(3))
+        .unwrap();
+    assert_eq!((n.channel.as_str(), n.payload.as_str()), ("Chan", "it's\tx, (y)"));
+    listener.exec("UNLISTEN *", &[]).unwrap();
+
+    let conn = connect(&addr);
+    must_exec(&conn, "CREATE TABLE t (a text, b int)");
+    must_exec(&conn, "PREPARE \"Ins\" (text, int) AS INSERT INTO t VALUES ($1, $2)");
+    must_exec(&conn, "EXECUTE \"Ins\" ('a, (b)', 2)");
+    must_exec(&conn, "PREPARE q AS SELECT b FROM t WHERE a = $1 -- $2");
+    assert_eq!(texts(&conn, "EXECUTE q ('a, (b)')"), ["2"]);
+    must_exec(&conn, "DEALLOCATE q");
+    assert_sqlstate(&conn.exec("EXECUTE q ('x')", &[]).unwrap_err(), "26000");
+    assert_sqlstate(&conn.exec("DEALLOCATE q", &[]).unwrap_err(), "26000");
+    must_exec(&conn, "DEALLOCATE ALL");
+}

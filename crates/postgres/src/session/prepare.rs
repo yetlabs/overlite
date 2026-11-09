@@ -3,82 +3,138 @@
 //! pg_dump prepares a per-enum label query and executes it for each enum type).
 //! This is separate from the wire Extended-Query prepared statements.
 
-use crate::ddl::sequences::{is_ident_part, read_paren_args, split_top_level};
 use crate::error::Error;
 use crate::error::Result;
-use crate::rewrite::distinct_on::index_top_level_word;
-use crate::rewrite::strings::end_of_string_literal;
-use crate::session::utility::{first_word_upper, log_query_error, unquote_ident};
+use crate::session::utility::log_query_error;
 use crate::session::{Session, quote_name};
 use overlite_core::SqlState;
-use overlite_core::text::{split_words, trim_start_chars};
+use pg_query::NodeEnum;
+use pg_query::protobuf::Token;
+
+/// PREPARE, EXECUTE or DEALLOCATE (of a name, or of all), by the name the grammar reads.
+enum SqlPrepare {
+    Prepare(String),
+    Execute(String),
+    Deallocate(Option<String>),
+}
+
+/// The tokens of sql as Postgres' scanner reads them: each one's kind, start and end.
+fn tokens(sql: &str) -> Vec<(Token, usize, usize)> {
+    pg_query::scan(sql).map_or_else(
+        |_| Vec::new(),
+        |r| {
+            r.tokens
+                .iter()
+                .map(|t| {
+                    (
+                        Token::try_from(t.token).unwrap_or(Token::Nul),
+                        usize::try_from(t.start).unwrap_or(0),
+                        usize::try_from(t.end).unwrap_or(0),
+                    )
+                })
+                .collect()
+        },
+    )
+}
+
+/// The text of the query `PREPARE name [(types)] AS query` prepares: what follows the
+/// first AS outside parentheses.
+fn prepared_query(sql: &str) -> Option<&str> {
+    let mut depth = 0;
+    for (t, _, end) in tokens(sql) {
+        match t {
+            Token::Ascii40 => depth += 1,
+            Token::Ascii41 => depth -= 1,
+            Token::As if depth == 0 => return sql.get(end..).map(str::trim),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The text of each argument of `EXECUTE name (a, b, ...)`, as written.
+fn execute_args(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut start = None;
+    for (t, at, end) in tokens(sql) {
+        match t {
+            Token::Ascii40 => {
+                depth += 1;
+                if depth == 1 {
+                    start = Some(end);
+                }
+            }
+            Token::Ascii41 => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(s) = start.take()
+                {
+                    out.push(sql[s..at].trim().to_string());
+                }
+            }
+            Token::Ascii44 if depth == 1 => {
+                if let Some(s) = start {
+                    out.push(sql[s..at].trim().to_string());
+                }
+                start = Some(end);
+            }
+            _ => {}
+        }
+    }
+    out.retain(|a| !a.is_empty());
+    out
+}
 
 impl Session {
-    /// Handles PREPARE/EXECUTE/DEALLOCATE in the simple-query path; None when it
-    /// did not recognize the statement.
+    /// Handles PREPARE/EXECUTE/DEALLOCATE in the simple-query path, read from the
+    /// statement's tree; None when it is none of them.
     #[must_use = "the error inside is the answer to the statement"]
     pub(crate) fn try_sql_prepare(&mut self, sql: &str) -> Option<Result<()>> {
-        if !crate::ast::classify::read(sql, crate::ast::classify::sql_prepare).unwrap_or(true) {
-            return None;
-        }
-        match first_word_upper(sql).as_str() {
-            "PREPARE" => Some(self.handle_prepare(sql)),
-            "EXECUTE" => Some(self.handle_execute_sql(sql)),
-            "DEALLOCATE" => {
-                let f = split_words(sql);
-                if let Some(word) = f.iter().skip(1).find(|w| !w.eq_ignore_ascii_case("prepare"))
-                    && !word.eq_ignore_ascii_case("all")
-                    && self.sql_prepared.remove(&unquote_ident(word)).is_none()
+        // A statement that reads or writes rows is none of them, and not parsed here.
+        let stmt = crate::ast::classify::read(sql, |n| match n {
+            NodeEnum::PrepareStmt(p) => Some(SqlPrepare::Prepare(p.name.clone())),
+            NodeEnum::ExecuteStmt(e) => Some(SqlPrepare::Execute(e.name.clone())),
+            NodeEnum::DeallocateStmt(d) => Some(SqlPrepare::Deallocate((!d.isall).then(|| d.name.clone()))),
+            _ => None,
+        })??;
+        match stmt {
+            SqlPrepare::Prepare(name) => Some(self.handle_prepare(&name, sql)),
+            SqlPrepare::Execute(name) => Some(self.handle_execute_sql(&name, sql)),
+            SqlPrepare::Deallocate(name) => {
+                if let Some(name) = name
+                    && self.sql_prepared.remove(&name).is_none()
                 {
-                    let message = format!("prepared statement {} does not exist", quote_name(&unquote_ident(word)));
+                    let message = format!("prepared statement {} does not exist", quote_name(&name));
                     return Some(self.fail_send(&Error::with_state(SqlState::INVALID_SQL_STATEMENT_NAME, message)));
                 }
                 Some(self.c.send_command_complete("DEALLOCATE"))
             }
-            _ => None,
         }
     }
 
     /// Stores "PREPARE name [(types)] AS <query>".
-    fn handle_prepare(&mut self, sql: &str) -> Result<()> {
-        let rest = sql["prepare".len()..].trim();
-        let name = read_ident(rest);
-        if name.is_empty() {
-            return self.c.send_error(SqlState::SYNTAX_ERROR, "syntax error in PREPARE");
-        }
-        // The query begins after the top-level " AS " (any argument-type list is in
-        // parens, so the first depth-0 AS is the separator).
-        let Some(as_) = index_top_level_word(sql, "prepare".len(), "as") else {
+    fn handle_prepare(&mut self, name: &str, sql: &str) -> Result<()> {
+        let Some(query) = prepared_query(sql) else {
             return self.c.send_error(SqlState::SYNTAX_ERROR, "PREPARE requires AS <query>");
         };
-        self.sql_prepared
-            .insert(name, sql[as_ + "as".len()..].trim().to_string());
+        self.sql_prepared.insert(name.to_string(), query.to_string());
         self.c.send_command_complete("PREPARE")
     }
 
     /// Runs a prepared statement, substituting its $N parameters with the EXECUTE
     /// arguments.
-    fn handle_execute_sql(&mut self, sql: &str) -> Result<()> {
-        let rest = sql["execute".len()..].trim();
-        let name = read_ident(rest);
-        let query = match self.sql_prepared.get(&name) {
+    fn handle_execute_sql(&mut self, name: &str, sql: &str) -> Result<()> {
+        let query = match self.sql_prepared.get(name) {
             Some(q) => q.clone(),
             None => {
                 return self.c.send_error(
                     SqlState::INVALID_SQL_STATEMENT_NAME,
-                    &("prepared statement ".to_string() + &quote_name(&name) + " does not exist"),
+                    &("prepared statement ".to_string() + &quote_name(name) + " does not exist"),
                 );
             }
         };
-        let mut args: Vec<String> = Vec::new();
-        if let Some(i) = rest.find('(')
-            && let Some((inner, _)) = read_paren_args(rest, i)
-        {
-            for a in split_top_level(&inner) {
-                args.push(a.trim().to_string());
-            }
-        }
-        let final_ = substitute_params(&query, &args);
+        let final_ = substitute_params(&query, &execute_args(sql));
 
         if let Err(e) = self.check_privileges(&final_) {
             self.mark_tx_failed();
@@ -100,55 +156,26 @@ impl Session {
     }
 }
 
-/// Replaces $1, $2, ... in query with the given args (already SQL literals),
-/// skipping placeholders inside string literals.
+/// Replaces $1, $2, ... in query with the given args (already SQL literals), each a
+/// parameter token of Postgres' scanner, so none in a literal or a comment.
 fn substitute_params(query: &str, args: &[String]) -> String {
-    let q = query.as_bytes();
-    let mut b = String::with_capacity(query.len());
-    let mut i = 0;
-    while i < q.len() {
-        if q[i] == b'\'' {
-            let j = end_of_string_literal(query, i);
-            b.push_str(&query[i..j]);
-            i = j;
+    let mut out = String::with_capacity(query.len());
+    let mut at = 0;
+    for (t, start, end) in tokens(query) {
+        if t != Token::Param {
             continue;
         }
-        if q[i] == b'$' && i + 1 < q.len() && q[i + 1] >= b'1' && q[i + 1] <= b'9' {
-            let mut j = i + 1;
-            let mut n: i64 = 0;
-            while j < q.len() && q[j] >= b'0' && q[j] <= b'9' {
-                n = n.wrapping_mul(10).wrapping_add((q[j] - b'0') as i64);
-                j += 1;
-            }
-            if n >= 1 && n as usize <= args.len() {
-                b.push_str(&args[(n - 1) as usize]);
-                i = j;
-                continue;
-            }
-        }
-        let Some(ch) = query[i..].chars().next() else { break };
-        b.push(ch);
-        i += ch.len_utf8();
+        let Some(arg) = query[start + 1..end]
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| args.get(n.checked_sub(1)?))
+        else {
+            continue;
+        };
+        out.push_str(&query[at..start]);
+        out.push_str(arg);
+        at = end;
     }
-    b
-}
-
-/// Reads a leading (optionally "quoted") identifier from s.
-fn read_ident(s: &str) -> String {
-    let s = trim_start_chars(s, " \t\r\n");
-    if s.is_empty() {
-        return String::new();
-    }
-    let b = s.as_bytes();
-    if b[0] == b'"' {
-        if let Some(j) = s[1..].find('"') {
-            return s[1..=j].to_string();
-        }
-        return String::new();
-    }
-    let mut j = 0;
-    while j < b.len() && is_ident_part(b[j]) {
-        j += 1;
-    }
-    s[..j].to_string()
+    out.push_str(&query[at..]);
+    out
 }
