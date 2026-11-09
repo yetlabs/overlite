@@ -3,18 +3,20 @@
 //! and the tables whose foreign keys point at them emptied too under CASCADE.
 
 use crate::auth::rls::text_or_empty;
+use crate::ddl::tree;
 use crate::error::{Result, errf};
-use crate::rewrite::tokens::{CodeTokKind, code_tokens};
 use crate::session::Session;
 use crate::session::utility::{first_word_upper, log_query};
 use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted};
 use overlite_core::{Command, SqlState};
+use pg_query::NodeEnum;
 
 /// What a TRUNCATE says.
 #[derive(Debug, Default, PartialEq)]
 struct Truncate {
-    /// The tables as written, qualified or not.
-    tables: Vec<String>,
+    /// The tables as references (`split_qualified_ref`'s), and as a message names
+    /// each: `s.t` or `t`.
+    tables: Vec<(String, String)>,
     restart: bool,
     cascade: bool,
 }
@@ -23,57 +25,31 @@ pub(crate) fn is_truncate(sql: &str) -> bool {
     first_word_upper(sql).eq_ignore_ascii_case("TRUNCATE")
 }
 
-/// Reads `TRUNCATE [TABLE] [ONLY] t [*] [, ...] [RESTART | CONTINUE IDENTITY]
-/// [CASCADE | RESTRICT]`; None when it is something else.
-fn parse_truncate(sql: &str) -> Option<Truncate> {
-    let toks = code_tokens(sql);
-    let word = |i: usize, w: &str| toks.get(i).is_some_and(|t| t.is_word(sql, w));
-    let punct = |i: usize, p: &str| toks.get(i).is_some_and(|t| t.is_punct(sql, p));
-    if !word(0, "truncate") {
+/// A TRUNCATE's node, read; None for anything else.
+fn truncate_plan(n: &NodeEnum) -> Option<Truncate> {
+    let NodeEnum::TruncateStmt(t) = n else {
         return None;
-    }
-    let mut i = 1;
-    if word(i, "table") {
-        i += 1;
-    }
-    let mut out = Truncate::default();
-    loop {
-        if word(i, "only") {
-            i += 1;
-        }
-        let first = toks.get(i)?;
-        if first.kind == CodeTokKind::Punct {
-            return None;
-        }
-        let mut end = first.span.end;
-        i += 1;
-        if punct(i, ".") && toks.get(i + 1).is_some_and(|t| t.kind != CodeTokKind::Punct) {
-            end = toks[i + 1].span.end;
-            i += 2;
-        }
-        out.tables.push(sql[first.span.start..end].to_string());
-        if punct(i, "*") {
-            i += 1;
-        }
-        if !punct(i, ",") {
-            break;
-        }
-        i += 1;
-    }
-    while i < toks.len() {
-        if (word(i, "restart") || word(i, "continue")) && word(i + 1, "identity") {
-            out.restart = word(i, "restart");
-            i += 2;
-        } else if word(i, "cascade") || word(i, "restrict") {
-            out.cascade = word(i, "cascade");
-            i += 1;
-        } else if punct(i, ";") {
-            i += 1;
-        } else {
-            return None;
-        }
-    }
-    Some(out)
+    };
+    let tables = t
+        .relations
+        .iter()
+        .filter_map(|r| match &r.node {
+            Some(NodeEnum::RangeVar(r)) => {
+                let shown = if r.schemaname.is_empty() {
+                    r.relname.clone()
+                } else {
+                    [r.schemaname.as_str(), ".", &r.relname].concat()
+                };
+                Some((tree::reference(r), shown))
+            }
+            _ => None,
+        })
+        .collect();
+    Some(Truncate {
+        tables,
+        restart: t.restart_seqs,
+        cascade: t.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32,
+    })
 }
 
 impl Session {
@@ -83,8 +59,9 @@ impl Session {
         if !is_truncate(sql) {
             return None;
         }
-        let Some(t) = parse_truncate(sql) else {
-            return Some(Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in TRUNCATE")));
+        let t = match tree::statement(sql, |n| truncate_plan(n).ok_or_else(|| tree::parse_failure(sql))) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
         };
         Some(
             self.check_privileges(sql)
@@ -96,7 +73,7 @@ impl Session {
     fn truncate(&mut self, t: &Truncate) -> Result<()> {
         // (as written, stored name) of each table.
         let mut tables: Vec<(String, String)> = Vec::new();
-        for reference in &t.tables {
+        for (reference, shown) in &t.tables {
             let stored = self.stored_name(reference);
             let q = "SELECT name FROM main.sqlite_master WHERE type = 'table' AND lower(name) = lower(".to_string()
                 + &quote_literal(&stored)
@@ -105,7 +82,7 @@ impl Session {
                 return Err(errf!(
                     SqlState::UNDEFINED_TABLE,
                     "relation {:?} does not exist",
-                    quoted(&crate::session::utility::unquote_ident(reference))
+                    quoted(shown)
                 ));
             };
             let name = text_or_empty(&row[0]);
@@ -194,15 +171,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_truncate_forms() {
-        let p = |s: &str| parse_truncate(s).unwrap();
-        assert_eq!(p("TRUNCATE t").tables, ["t"]);
-        let t = p(r#"TRUNCATE TABLE ONLY "a", s."b" *, c RESTART IDENTITY CASCADE;"#);
-        assert_eq!(t.tables, [r#""a""#, r#"s."b""#, "c"]);
+    fn truncate_forms() {
+        let p = |s: &str| tree::read(s, truncate_plan).unwrap();
+        let t = p(r#"TRUNCATE TABLE ONLY "a", s."B" *, c RESTART IDENTITY CASCADE;"#);
+        let names: Vec<&str> = t.tables.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(names, [r#""a""#, r#""s"."B""#, r#""c""#]);
+        assert_eq!(t.tables[1].1, "s.B");
         assert!(t.restart && t.cascade);
         let t = p("truncate a continue identity restrict");
         assert!(!t.restart && !t.cascade);
-        assert_eq!(parse_truncate("TRUNCATE a b"), None);
-        assert_eq!(parse_truncate("TRUNCATE"), None);
     }
 }
