@@ -421,8 +421,8 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   bigint (or a star over a table with one), leaves the fast path for the typed
   translation: `SELECT id FROM t WHERE tz > '2024-01-02'` reads the literal as a
   timestamptz where it compared texts, and `SELECT * FROM t` sends an int column as
-  int4, so Django's inspectdb reads an IntegerField as one (a serial key, SQLite's
-  rowid, stays int8 and a BigAutoField). A lookup over other columns keeps the fast
+  int4, the type Django's inspectdb reads for an IntegerField (a serial key, SQLite's
+  rowid, stays int8). A lookup over other columns keeps the fast
   path.
 - Answers that were wrong or refused and are Postgres' now, in statements the AST path
   translates since stage 4 (tests/wire/ast_shapes.rs): a subscript of an expression
@@ -703,8 +703,7 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 
 - An integer column goes out as int8 whatever its width, as its values are sampled, in
   a statement the text passes run. A statement the AST path types sends the width, but
-  for a rowid key, int8 there too, so Django's inspectdb reads an AutoField as a
-  BigAutoField. The catalogs have the declared width.
+  for a rowid key, int8 there too, which Django's inspectdb reads as a BigAutoField. The catalogs have the declared width.
 - Postgres' sum of a bigint and avg of integers are numerics; in a statement the text
   passes run they are an int8 and a double, as SQLite computes them.
 - A real is kept as a double: `r * 1.5` of a real 0.1 is 0.15000000000000002, where

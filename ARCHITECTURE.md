@@ -41,7 +41,9 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
 - `column_types`: the type of a computed result column, read from the select list.
 - `table_types`: `TableTypes`, the columns of every table and view of a database with
   their declared types, which booleans may hold text and which column is the rowid:
-  what the AST path's type environment knows of the catalog. Kept in `DbState`, read
+  what the AST path's type environment knows of the catalog; and the names of the
+  columns whose type the typed translation reads, which take a statement off the fast
+  path (`typed_differs`). Kept in `DbState`, read
   once by the first connection that asks, dropped by every CREATE, ALTER or DROP this
   server runs and by a rollback; one read across another connection's change is used
   for its statement and not kept.
@@ -70,7 +72,8 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   `current_database()`, `to_regclass()` (`resolve_names`, run on every statement), and
   the type passes (`resolve_types`), which run on every statement but one the AST path
   typed, which ends in `TYPED_MARK` (`split_typed` takes the mark off, and with it
-  the integer widths of the result columns it may carry): `time_zone`, which prepares a probe over a
+  the result columns' types it may carry: integer widths, booleans, arrays' element
+  types): `time_zone`, which prepares a probe over a
   statement's FROM to read a column's declared type: which way an AT TIME ZONE goes, and
   whether a timestamp with an offset is a time or a text. `names` reads the tables of a
   statement with their aliases, at any depth, and the column each parameter meets;
@@ -135,9 +138,19 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   The order matters, and comments in `rewrite_full` say why where it does. `tokens`
   is the crate's shared tokenizer (`code_tokens`): words, literals and quoted names,
   punctuation, each with its depth, comments left out.
-- `ast` (docs/adr/0001-sql-ast.md, stage 3): a statement parsed by Postgres' grammar
+- `ast` (docs/adr/0001-sql-ast.md, stage 4): a statement parsed by Postgres' grammar
   (libpg_query, called directly by `parse`, without the pg_query crate's summary walk)
-  and printed as SQLite SQL (`emit`), for a slice of SELECT, INSERT, UPDATE and DELETE;
+  and printed as SQLite SQL (`emit`), for SELECT, INSERT, UPDATE and DELETE but the
+  catalog's relations and functions (stage 5): set operations whatever their members,
+  DISTINCT ON (ROW_NUMBER() over the ON keys), window functions and frames, FILTER and
+  an aggregate's ORDER BY, set-returning functions in FROM (the engine's walkers of a
+  JSON array, `srf_from`, in a subquery or in place, their columns renamed where they
+  read a table on their left), derived column lists, ON CONFLICT, UPDATE ... FROM,
+  DELETE ... USING (by rowid), a write's WITH and its target's alias, row locks
+  (dropped: the session takes them), ctid as rowid, arrays (literals, `= ANY` and `<>
+  ALL`, subscripts and slices, ARRAY(subquery), array_agg as a JSON array, `@>`, `<@`,
+  `&&`, `||`, casts), and any function a text pass does not rewrite by name, written as
+  it came (`REWRITTEN` lists those it does, which a test holds to the passes);
   `rewrite` takes it when it covers the statement and runs `rewrite_full` otherwise.
   For a statement it covers, its output is final: it writes the labels, every cast,
   each sort key's NULLS and every LIKE itself, and Describe types the parameters from
@@ -145,15 +158,19 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   `rewrite_like`, `rewrite_null_order`, the regexes of `types::param_types`) run only
   for the statements left to the text passes and on the fast path.
   `types` is the type environment: the type of each expression, a column's by the
-  table of its own scope (through aliases, joins, subqueries in FROM and CTEs, from
-  the catalog the session's context gives, `env`), an expression's by Postgres'
-  result types for the operators and functions of the slice. With a context the
+  table of its own scope (through aliases, joins, subqueries in FROM, derived column
+  lists, set-returning functions and CTEs, from the catalog the session's context
+  gives, `env`), an expression's by Postgres' result types for the operators and the
+  signatures of the functions overlite provides; what the catalog does not know is
+  read as the text passes read it (a json, array or range operator over such a
+  column). With a context the
   printer writes from it what depends on a type (numeric exactness and the numeric
   form, date and time arithmetic and comparison, the session's TimeZone read when the
   statement runs, AT TIME ZONE, booleans met by a string, tsvector, `%`, json and range
-  operators, array comparison, the select-list casts, integer widths) and ends the
-  statement in the engine's mark: its output is final, and the engine's type passes
-  do not read it. Without one (the session's own probes) it prints the untyped
+  operators, array comparison, the select-list casts, avg of integers at Postgres'
+  scale) and ends the statement in the engine's mark, which carries the result
+  columns' integer widths, booleans and arrays' element types: its output is final,
+  and the engine's type passes do not read it. Without one (the session's own probes) it prints the untyped
   translation, which those passes finish. `env` holds the context of the translation
   running on the thread, set by the session (`type_context`): the connection's
   `TableTypes` and the search_path, and the stamp the cache keeps the translation under.
@@ -303,11 +320,20 @@ long as a transaction that only reads stays open.
 ### The fast path contract
 
 `needs_no_rewrite` answers true only if `rewrite_full` would return the statement
-unchanged. It does not ask the type environment: a statement on the fast path reaches
-the engine untyped, and its type passes run on it as they do for the text passes'
-output (docs/adr/0001-sql-ast.md, stage 3, on what that leaves). It recognizes a narrow shape in one allocation-free pass; anything else
+unchanged. It recognizes a narrow shape in one allocation-free pass; anything else
 answers false, so it can only be wrong by being slow. `rewrite` trusts it, so a false
 true silently skips a translation.
+
+A statement on the fast path reaches the engine untyped, and its type passes run on
+it as they do for the text passes' output; it must also be one the AST path's typed
+translation would leave as it is. `rewrite::fast_path` asks the type environment
+that too: `TableTypes::typed_differs` scans the statement's words against the names
+of the database's columns whose type the typed translation reads (a date, time,
+timestamp, interval, array or range, an integer narrower than a bigint, which goes out
+at its width) and, for a star, the tables with a narrow integer. A hit, even a word
+that only shares the name, sends the statement to the AST path, which costs a
+translation, never an answer; a lookup over other columns stays on the fast path at
+the cost of a hash per word, and nothing when the database has no such column.
 
 Two passes run after the text passes and on the fast path, so a plain lookup gets
 them too, and are not in `rewrite_full`: `rewrite_null_order` gives each sort key

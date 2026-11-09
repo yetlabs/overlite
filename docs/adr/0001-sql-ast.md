@@ -1,6 +1,6 @@
 # 0001: Translate SQL from a parse tree, not from text
 
-Status: accepted; stages 0 to 3 landed on main (below), stage 1's week of the owner's apps pending
+Status: accepted; stages 0 to 4 landed on main (below), stage 1's week of the owner's apps pending
 Date: 2026-11-08
 
 ## Context
@@ -622,6 +622,154 @@ time, timestamptz, boolean, array or range column should leave the fast path whe
 environment would print it differently (a per-table flag in `TableTypes` keeps `kv`
 lookups where they are). Then the planned query shapes, with arrays (ARRAY[...],
 `= ANY`, ARRAY_AGG and its typing) among them.
+
+## Stage 4 result
+
+Every statement that reads or writes rows is the AST path's now, but for the
+catalog's (stage 5) and a short list below; and a plain statement leaves the fast path
+where the typed translation would say something else of it.
+
+- **The fast path, typed.** `TableTypes` keeps the names of the columns whose type the
+  typed translation reads (a date, time, timestamp, interval, array or range, an
+  integer narrower than a bigint, which goes out at its width) and the tables with a
+  narrow integer; `rewrite::fast_path` sends a statement naming one (or a star over
+  such a table) to the AST path. Word lengths and first bytes are masked before a
+  word is hashed, so a lookup over other columns pays almost nothing: `kv`'s `SELECT
+  id, v ... WHERE id = :id` stays on the fast path though `kv` has a timestamptz.
+- **Arrays.** ARRAY[...] (json_array), casts to an array type (the engine's
+  overlite_assign, whatever the operand), `= ANY` and `<> ALL` over a list, an array
+  or a subquery, subscripts of any expression and slices of a column, ARRAY(subquery),
+  array_agg as the JSON array arrays are stored as (with DISTINCT, ORDER BY, FILTER,
+  OVER; NULL over no rows; a boolean as JSON's true or false), unnest and the other
+  set-returning functions in FROM, array_length and cardinality typed, `@>`, `<@`, `&&`
+  (json_contains, overlite_overlaps) and `||` (overlite_array_cat, new). The mark
+  carries an array's element type, a boolean and an integer width, so a computed
+  column goes out typed (an int[] as int4[], 1007).
+- **Query shapes.** Set members with their own ORDER BY, LIMIT or WITH and a set
+  operation on the right (read from a subquery); DISTINCT ON (ROW_NUMBER() over the ON
+  keys, LIMIT after it); window functions, named windows and every frame; FILTER and
+  an aggregate's ORDER BY; set-returning functions in FROM, in a subquery naming their
+  columns, or in place where they read a table on their left, their columns renamed
+  (`u.x` is `u.value`); derived column lists (`_aliasN` CTEs); ON CONFLICT (a SELECT
+  before it gets `WHERE true`); UPDATE ... FROM; DELETE ... USING (by rowid); a write's
+  WITH and alias, RETURNING by the table's name; row locks (dropped: the session takes
+  them); ctid as a table's rowid; the SQL/JSON constructors, COLLATE, TRIM, the
+  niladic user and schema functions, `@@`, X'..'.
+- **Functions.** Any function a text pass does not rewrite by name is written as it
+  came (`emit::REWRITTEN` lists those it does; `the_printer_knows_every_function_the_
+  text_passes_rewrite` runs every word of the sources as a call through `rewrite_full`
+  and fails on one missing). The environment types the functions overlite provides
+  by Postgres' signatures: window functions, string, json, fts, range, array and
+  sequence functions; avg of integers and sum of a bigint are numerics (avg exact,
+  `sum / count` at Postgres' scale), a real beside a numeric a double.
+- **What the catalog does not know** is read as the text passes read it: a json
+  operator over a column of an unknown table, `&&`, `%` and the range operators.
+
+**The corpus** (`make ast-corpus` added 211 statements: 16241). The differential test
+now reads a statement that wraps a query (EXPLAIN, DECLARE, `COPY (query) TO`) by that
+query, which is what the session translates. Main 8a056a5 against stage 4, both on
+this corpus:
+
+| | fast path | text passes | AST path |
+|---|---|---|---|
+| before stage 4 | 4068 | 5379 | 6794 |
+| stage 4 | 4115 | 3973 | 8153 |
+
+Of the 8153: identical 5664, identical but parentheses 1934, intended 555, unexplained
+0. The new intended differences, by reason (compare.rs, `TYPED` and `INTENDED`): 47
+Postgres' syntax the text passes left (a subscript of an expression, a slice,
+ARRAY((subquery)), `<> ALL (subquery)`, `@>` of arrays); 36 a row lock on lines of its
+own; 26 a cast to an array type; 19 `WHERE true` before ON CONFLICT; 19 array_agg; 6
+ctid through a subquery or a quoted `"ctid"`; 5 avg of integers; 3 DISTINCT ON before
+LIMIT; 2 each a window's NULLS and EXCLUDE NO OTHERS, a jsonb aggregate's FILTER, a
+path operator over a cast, a subscript's label; 1 a set operation on the right; and
+the numeric rule now also undoes exact arithmetic beside a float.
+
+**What the text passes still translate**, 3973 statements, by the first node the
+printer refuses: 3302 utility statements (CREATE TABLE 816, ALTER TABLE 815, CREATE
+INDEX 571, DROP 136, GRANT 106, SET 92, COMMENT 65, RENAME 60, CREATE SCHEMA 52,
+CREATE DATABASE 50, FETCH 48, the rest under 47 each), 310 catalog relations, 112 parse
+errors (statements Postgres rejects too), 81 system columns, 75 functions, 29
+operators, 21 cast types, 9 multi-statement strings, the rest under 9 each. Of the 558
+that read or write rows, 461 read the catalog (its relations, pg_get_*def,
+obj_description, oid, xmin, reg* casts): stage 5's. The other 97 (Django 36, the
+rewrite corpus 16, the wire suite 45): a set-returning function in a select list
+(`SELECT unnest(a)`, most of the 29 functions), the bitwise and math operators (`#`,
+`^`, `&`, `|`, `<<`, `>>`, `|/`) and pg_trgm's `<%` and `<->` (29), a range operator
+over an element or with no side known to be a range, and json containment of an
+unknown column by a scalar (12), multi-statement strings (9), a slice of an expression
+(3), a stored name with a dot (3), OVERRIDING, RETURNING beside FROM or USING, a
+partial derived column list, `SET (a, b) =`, a join's alias (1-2 each).
+
+**Bugs fixed**, each a test in tests/wire/ast_shapes.rs that fails on 8a056a5 and is
+held to Postgres 17: a plain lookup comparing a timestamptz or date column with a
+literal compared texts, and sent an int column as int8 (the fast path); subscripts of
+expressions, slices, `||` of arrays, `<> ALL (subquery)`, ARRAY((subquery)); array_agg
+read by array_length and a subscript, its elements quoted; avg of integers and sum of
+a bigint; DISTINCT ON before LIMIT; `1 UNION 2 INTERSECT 3`; a jsonb aggregate's
+FILTER; a row lock on its own lines; `"ctid"`. Found on the way: exact arithmetic beside
+a real (stage 3's printer made `r * 1.5` a numeric, Postgres a double).
+
+**Client-visible changes** (NOTES.md, Behavior): avg of integers a numeric at
+Postgres' scale, sum of a bigint a numeric; an int[] goes out as int4[] with four-byte
+elements in binary; array_agg, slices, `||` of arrays, akeys and avals as arrays of
+their element type; a comparison or test in a select list as a boolean (isempty too);
+a subscript labelled by its array; a statement that names a typed column leaves the
+fast path (`SELECT * FROM t`, which Django's inspectdb reads, sends an int column as
+int4; a serial key, the rowid, stays int8); `CAST('["a"]' AS TEXT[])` reads the array (tests/wire/
+parity_diff.rs counts those 30 outcomes apart from the old server's).
+
+**Performance.** pgbench as before (4 clients, 4 threads, 8 s, each binary on its own
+copy of the 100,000-row `kv`, the order swapped in round 2), main 8a056a5 against
+stage 4, tps per round:
+
+| script, mode | main | stage 4 | means |
+|---|---|---|---|
+| lookup (fast path), simple | 114204 / 115306 / 113949 | 114428 / 114759 / 114781 | +0.1% |
+| lookup (fast path), prepared | 98474 / 97491 / 97543 | 97604 / 98261 / 97649 | +0.0% |
+| lookup2 (AST slice), simple | 81647 / 81538 / 82065 | 80647 / 80815 / 80744 | −1.2% |
+| lookup2 (AST slice), prepared | 88116 / 88195 / 88105 | 87522 / 87876 / 87522 | −0.6% |
+| mix, simple | 13586 / 13668 / 13649 | 14199 / 14164 / 14126 | +3.9% |
+| mix, prepared | 14168 / 14014 / 14066 | 14534 / 14457 / 14571 | +3.1% |
+| lookup3, simple | 80661 / 80589 / 80807 | 80574 / 80047 / 80124 | −0.5% |
+| lookup3, prepared | 86246 / 86435 / 86156 | 86354 / 85730 / 86234 | −0.2% |
+
+The mix gains: its `= ANY(ARRAY[...])`, string_agg and json_build_object are the AST
+path's now. The fast path, with the typed check, is level; a first measurement
+without the masks was −1.1% on it. lookup2 simple, which parses and prints every
+statement (pgbench writes the value into the text), loses about 1%, consistent over
+the rounds and over a rerun after the printer stopped allocating per column
+(80913 / 80771 / 80489 against 81707 / 81718 / 81848): the printer does more per
+statement now (scopes for ctid and the set-returning functions' renames). The
+statement mix in-process (`time_the_statement_mix`, µs per statement, three rounds,
+main's test binary then this one's, both on the grown corpus):
+
+| mix | text passes | AST path, no cache | `rewrite()`, cache warm |
+|---|---|---|---|
+| all 16241, main | 16.6 / 16.4 / 16.4 | 14.6 / 14.6 / 14.6 | 5.01 / 5.01 / 5.06 |
+| all 16241, stage 4 | 16.3 / 16.2 / 16.3 | 11.5 / 11.6 / 11.6 | 4.24 / 4.16 / 4.05 |
+| the 12686 that read or write rows, main | 16.2 / 16.0 / 15.3 | 11.8 / 11.5 / 11.6 | 0.22 / 0.20 / 0.21 |
+| the 12686 that read or write rows, stage 4 | 16.4 / 15.8 / 15.7 | 9.3 / 9.3 / 9.3 | 0.21 / 0.20 / 0.20 |
+
+The release binary grew from 15.16 MB to 16.25 MB.
+
+**Exit criteria.** `make check` green, the differential at zero unexplained: met.
+"Every DML statement of the corpus translated": not met in full. 461 of the 558 DML
+statements left read the catalog and are stage 5's by this plan; 97 are the shapes
+listed above, of which the applications' corpora hold 36, all Django's (its tests of
+the bitwise operators, pg_trgm, range lookups); Wagtail, Gitea and the owner's apps
+leave none outside the catalog. The
+passes are not deleted: they serve those statements and the utility statements until
+stage 5.
+
+**Stage 5 should start with** the catalog's statements, which are now most of what
+reads rows on the text passes: pg_catalog and information_schema relations and their
+columns (oid, xmin, the reg* casts), pg_get_*def, obj_description and
+col_description, as nodes of the printer with the catalog views the engine already
+has. Then the utility statements on the tree (`route_of` and the session's
+classifiers), CREATE TABLE/INDEX/ALTER with `ddl_syntax` and `default_expr`, and
+`rewrite_full` deleted with the scanners. The leftover row shapes above (select-list
+set-returning functions, the math operators) are small and could go first.
 
 ## Risks
 
