@@ -28,6 +28,7 @@ pub(crate) type Unsupported = &'static str;
 pub(crate) const TYPE_REFUSAL_OPERANDS: Unsupported = "% of operands of unknown type";
 pub(crate) const TYPE_REFUSAL_BOOLEAN: Unsupported = "boolean column holding text";
 pub(crate) const TYPE_REFUSAL_JSON: Unsupported = "json operator on what is not known to be json";
+pub(crate) const TYPE_REFUSAL_RANGE: Unsupported = "range operator with a side that is no range";
 
 type Out = Result<(), Unsupported>;
 
@@ -1736,7 +1737,7 @@ impl Emitter<'_> {
         let (tl, tr) = (self.ty(l), self.ty(r));
         let ok = |me: &mut Self, n: &NodeEnum, t: Ty| me.is_range(n) || t.base == Base::Unknown;
         if !(ok(self, l, tl) && ok(self, r, tr)) {
-            return Err("range operator with a side that is no range");
+            return Err(TYPE_REFUSAL_RANGE);
         }
         self.note_param(l, tr);
         self.note_param(r, tl);

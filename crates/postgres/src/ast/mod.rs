@@ -94,7 +94,7 @@ fn outside(shape: u64) -> bool {
 fn remember_outside(shape: u64, why: &'static str) {
     if !matches!(
         why,
-        emit::TYPE_REFUSAL_OPERANDS | emit::TYPE_REFUSAL_BOOLEAN | emit::TYPE_REFUSAL_JSON
+        emit::TYPE_REFUSAL_OPERANDS | emit::TYPE_REFUSAL_BOOLEAN | emit::TYPE_REFUSAL_JSON | emit::TYPE_REFUSAL_RANGE
     ) {
         shape::OUTSIDE.insert(shape ^ mode());
     }

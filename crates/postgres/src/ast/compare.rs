@@ -194,6 +194,17 @@ const TYPED: &[Typed] = &[
         },
     ),
     (
+        "an interval compares by its span wherever a side reads as one, an untyped literal such as `23 hours` \
+         included: the engine's pass compared it so only in a statement that said `interval`, `date` or ORDER BY",
+        |o, n| {
+            let count = |t: &[String]| t.iter().filter(|x| *x == "overlite_interval_cmp").count();
+            if count(n) <= count(o) {
+                return (o.to_vec(), n.to_vec());
+            }
+            (unwrap_interval_cmp(o), unwrap_interval_cmp(n))
+        },
+    ),
+    (
         "pg_trgm's % is a call around its two operands: the text path took the WHERE before it into the left one",
         |o, n| {
             let broken = o
