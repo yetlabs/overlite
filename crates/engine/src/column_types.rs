@@ -43,6 +43,7 @@ fn cast_decl(name: &str) -> TypeHint {
         Some(CastType::Bytea) => "BYTEA",
         Some(CastType::Varchar(_)) => "VARCHAR",
         Some(CastType::Char(_)) => "CHAR",
+        Some(CastType::Range(kind)) => kind.name(),
         _ => return TypeHint::None,
     })
 }
@@ -96,6 +97,19 @@ fn item_type(item: &str) -> TypeHint {
     // collation, in parentheses of its own or around its chain.
     if item.ends_with("COLLATE JSONB)") || item.ends_with(") COLLATE JSONB") {
         return TypeHint::Strong("JSONB");
+    }
+    // A range's constructor makes one of its type.
+    for range in [
+        "int4range(",
+        "int8range(",
+        "numrange(",
+        "daterange(",
+        "tsrange(",
+        "tstzrange(",
+    ] {
+        if closed(range) {
+            return TypeHint::Strong(&range[..range.len() - 1]);
+        }
     }
     if closed("overlite_now(") || closed("overlite_clock_timestamp(") {
         return TypeHint::Strong("TIMESTAMPTZ");

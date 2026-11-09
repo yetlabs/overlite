@@ -7,6 +7,7 @@ pub(crate) mod hstore;
 pub(crate) mod numeric;
 pub(crate) mod param_decode;
 pub(crate) mod param_types;
+pub(crate) mod range;
 pub(crate) mod timestamptz;
 
 use crate::auth::rls::text_or_empty;
@@ -51,17 +52,17 @@ const OID_BOOL: Oid = Oid::new(16);
 pub(crate) const OID_BYTEA: Oid = Oid::new(17);
 pub(crate) const OID_INT8: Oid = Oid::new(20);
 const OID_INT2: Oid = Oid::new(21);
-const OID_INT4: Oid = Oid::new(23);
+pub(crate) const OID_INT4: Oid = Oid::new(23);
 pub(crate) const OID_TEXT: Oid = Oid::new(25);
 const OID_JSON: Oid = Oid::new(114);
 const OID_FLOAT8: Oid = Oid::new(701);
 const OID_BPCHAR: Oid = Oid::new(1042);
 const OID_VARCHAR: Oid = Oid::new(1043);
-const OID_DATE: Oid = Oid::new(1082);
-const OID_TIME: Oid = Oid::new(1083);
-const OID_NUMERIC: Oid = Oid::new(1700);
-const OID_TIMESTAMP: Oid = Oid::new(1114);
-const OID_TIMESTAMPTZ: Oid = Oid::new(1184);
+pub(crate) const OID_DATE: Oid = Oid::new(1082);
+pub(crate) const OID_TIME: Oid = Oid::new(1083);
+pub(crate) const OID_NUMERIC: Oid = Oid::new(1700);
+pub(crate) const OID_TIMESTAMP: Oid = Oid::new(1114);
+pub(crate) const OID_TIMESTAMPTZ: Oid = Oid::new(1184);
 const OID_INTERVAL: Oid = Oid::new(1186);
 const OID_UUID: Oid = Oid::new(2950);
 const OID_JSONB: Oid = Oid::new(3802);
@@ -293,6 +294,10 @@ pub(crate) fn oid_for_column(col: &Column, rows: &[Vec<Value>], idx: usize) -> O
     if matches!(col.name.as_str(), "conkey" | "confkey") {
         return OID_INT2_ARR;
     }
+    // A range, under its own type.
+    if let Some(oid) = crate::types::range::range_oid_for_decl(&col.decl_type) {
+        return oid;
+    }
     // An array whose element type its values say: array_agg, ARRAY(subquery).
     if col.decl_type.eq_ignore_ascii_case("ANYARRAY") {
         return sampled_array_oid(rows, idx);
@@ -433,7 +438,7 @@ fn encode_text(oid: Oid, v: &Value) -> Option<Vec<u8>> {
     }
     // Array columns hold a JSON array in a TEXT cell; render Postgres' `{...}`.
     if is_array_oid(oid) {
-        return Some(json_array_to_pg_text(v));
+        return Some(json_array_to_pg_text(oid, v));
     }
     // A time value is rendered the way Postgres renders it, whatever shape it
     // was stored in.
@@ -441,6 +446,10 @@ fn encode_text(oid: Oid, v: &Value) -> Option<Vec<u8>> {
         && let Value::Text(s) = v
     {
         return Some(unescape_vec(canonical_time_text(oid, s).into_bytes()));
+    }
+    // A range as range_out writes it, a tstzrange's bounds in the session's zone.
+    if crate::types::range::is_range_oid(oid) {
+        return Some(text_to_bytes(&crate::types::range::range_text(oid, &text_or_empty(v))).into_owned());
     }
     // hstore is stored as a JSON object; render it as hstore text.
     if oid == OID_HSTORE {
@@ -553,6 +562,7 @@ pub(crate) fn encode_binary(oid: Oid, v: &Value) -> Option<Vec<u8>> {
         OID_UUID => uuid_bytes(v)?,
         OID_NUMERIC => numeric_binary(&String::from_utf8_lossy(&text(v)))?,
         OID_HSTORE => hstore_binary(v)?,
+        o if crate::types::range::is_range_oid(o) => crate::types::range::range_binary(o, v)?,
         OID_TIMESTAMP | OID_TIMESTAMPTZ => match parse_stored_time(v) {
             Some(tm) => encode_binary_timestamp(&tm),
             None => match infinity(v)? {

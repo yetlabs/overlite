@@ -47,6 +47,7 @@ pub use builtins::collation::{
 pub use builtins::dates::{session_offset_at, session_zone, session_zone_is_utc, set_session_zone, take_zone_change};
 pub use builtins::hstore::hstore_in;
 pub use builtins::json::{Json, json_decode_first, json_marshal, json_unmarshal};
+pub use builtins::ranges::{Range, range_parts, tstzrange_session_text};
 pub use builtins::temporal::mark_transaction_start;
 pub use catalog::constraints::{Identity, NOT_VALID_MARK, identity_columns, relation_name, unquote_sql_ident};
 pub use catalog::declared_typmod;

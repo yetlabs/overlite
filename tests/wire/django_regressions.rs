@@ -388,3 +388,82 @@ fn the_bounds_of_the_empty_range_are_null() {
         ["t|3|abc"]
     );
 }
+
+// A range went out as text (OID 25) and an array of them as an int8[], so psycopg
+// handed Django a string, or failed to read the array. A tstzrange's bounds without
+// an offset were read as UTC, and went out in UTC whatever the session's zone.
+#[test]
+fn a_range_is_a_range_type() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(
+        &conn,
+        "CREATE TABLE rt (r int4range, b int8range, n numrange, d daterange, s tsrange, t tstzrange, ra int4range[], tz timestamptz[])",
+    );
+    must_exec(
+        &conn,
+        r#"INSERT INTO rt VALUES ('[1,5)', '(,10]', '[1.5,2.25)', '[2020-01-01,)', '(2020-01-01 10:00,2020-01-02)', '["2020-01-01 00:00+00","2020-01-02 00:00+00")', '{"[1,2)",empty}', '{"2020-01-01 00:00+00"}')"#,
+    );
+    must_exec(&conn, "SET TIME ZONE 'America/Chicago'");
+    let (oids, cells) = texts(&conn, "SELECT * FROM rt");
+    assert_eq!(oids, [3904, 3926, 3906, 3912, 3908, 3910, 3905, 1185]);
+    assert_eq!(
+        cells,
+        [[
+            "[1,5)",
+            "(,11)",
+            "[1.5,2.25)",
+            "[2020-01-01,)",
+            r#"("2020-01-01 10:00:00","2020-01-02 00:00:00")"#,
+            r#"["2019-12-31 18:00:00-06","2020-01-01 18:00:00-06")"#,
+            r#"{"[1,2)",empty}"#,
+            r#"{"2019-12-31 18:00:00-06"}"#,
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT t::text, int4range(1, 5), tstzrange('2020-01-01', '2020-01-02')::text FROM rt"
+        ),
+        [
+            r#"["2019-12-31 18:00:00-06","2020-01-01 18:00:00-06")|[1,5)|["2020-01-01 00:00:00-06","2020-01-02 00:00:00-06")"#
+        ]
+    );
+    assert_eq!(
+        texts(&conn, "SELECT int4range(1, 5), 'empty'::daterange").0,
+        [3904, 3912]
+    );
+    // A bound without an offset is a wall clock in the session's zone.
+    must_exec(
+        &conn,
+        r#"INSERT INTO rt (t) VALUES ('["2016-01-01 00:00:00","2016-01-04 00:00:00")')"#,
+    );
+    assert_eq!(
+        rows(&conn, "SELECT lower(t)::text FROM rt WHERE r IS NULL"),
+        ["2016-01-01 00:00:00-06"]
+    );
+
+    // range_send: flags, then each finite bound's length and binary form.
+    let r = conn
+        .exec_params::<&[u8]>("SELECT r, b, t FROM rt WHERE r IS NOT NULL", &[], &[], &[], &[1])
+        .unwrap();
+    assert_eq!(
+        r.rows[0][0].as_deref().unwrap(),
+        [2, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5]
+    );
+    assert_eq!(
+        r.rows[0][1].as_deref().unwrap(),
+        [0x08, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 11]
+    );
+    let t = r.rows[0][2].as_deref().unwrap();
+    assert_eq!(t[0], 0x02);
+    // 2020-01-01 00:00 UTC is 631152000 seconds after 2000-01-01.
+    assert_eq!(
+        &t[1..13],
+        [0, 0, 0, 8]
+            .iter()
+            .chain(&(631_152_000_000_000i64).to_be_bytes())
+            .copied()
+            .collect::<Vec<u8>>()
+    );
+}

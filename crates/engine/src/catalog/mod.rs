@@ -1312,6 +1312,13 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     range_acc(conn, "upper_inc", |r| Value::Int(bool_int(!r.empty && r.hi_inc)))?;
     range_acc(conn, "lower_inf", |r| Value::Int(bool_int(!r.empty && r.lo.is_none())))?;
     range_acc(conn, "upper_inf", |r| Value::Int(bool_int(!r.empty && r.hi.is_none())))?;
+    // A tstzrange's text in the session's zone, as a cast to text writes it.
+    scalar(conn, "overlite_tstzrange_text", 1, |a| {
+        Ok(match &a[0] {
+            Value::Null => Value::Null,
+            v => crate::builtins::ranges::tstzrange_session_text(&v.to_string()).map_or_else(|| v.clone(), Value::Text),
+        })
+    })?;
     // A range's lower (0) or upper (1) bound, as the AST path writes lower and upper of
     // a range: NULL for the empty range and an infinite bound.
     scalar(conn, "overlite_range_bound", 2, |a| {

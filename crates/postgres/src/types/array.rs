@@ -3,9 +3,10 @@
 //! advertise the proper array OID and render the JSON as Postgres' `{…}` text;
 //! on input, ARRAY[…] and '{…}'::type[] become JSON.
 
+use crate::types::range::{OID_TSTZRANGE, range_array_oid_for_decl, range_of_array};
 use crate::types::{
     OID_BOOL, OID_BYTEA, OID_DATE, OID_FLOAT8, OID_INT2, OID_INT4, OID_INT8, OID_JSON, OID_JSONB, OID_NUMERIC,
-    OID_TEXT, OID_TIMESTAMP, OID_UUID, OID_VARCHAR, encode_binary, oid_from_decl_type,
+    OID_TEXT, OID_TIME, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID, OID_VARCHAR, encode_binary, oid_from_decl_type,
 };
 use overlite_core::text::{eq_fold, text_from_bytes, text_to_bytes};
 use overlite_core::{Oid, Value, format_float};
@@ -28,6 +29,17 @@ const OID_NUMERIC_ARR: Oid = Oid::new(1231);
 pub(crate) const OID_UUID_ARR: Oid = Oid::new(2951);
 const OID_JSON_ARR: Oid = Oid::new(199);
 const OID_JSONB_ARR: Oid = Oid::new(3807);
+const OID_TIME_ARR: Oid = Oid::new(1183);
+const OID_TIMESTAMPTZ_ARR: Oid = Oid::new(1185);
+/// The arrays of the range types (types::range).
+const RANGE_ARRAYS: [Oid; 6] = [
+    Oid::new(3905),
+    Oid::new(3927),
+    Oid::new(3907),
+    Oid::new(3909),
+    Oid::new(3911),
+    Oid::new(3913),
+];
 
 static ARRAY_OIDS: LazyLock<HashMap<Oid, bool>> = LazyLock::new(|| {
     HashMap::from([
@@ -45,6 +57,14 @@ static ARRAY_OIDS: LazyLock<HashMap<Oid, bool>> = LazyLock::new(|| {
         (OID_UUID_ARR, true),
         (OID_JSON_ARR, true),
         (OID_JSONB_ARR, true),
+        (OID_TIME_ARR, true),
+        (OID_TIMESTAMPTZ_ARR, true),
+        (RANGE_ARRAYS[0], true),
+        (RANGE_ARRAYS[1], true),
+        (RANGE_ARRAYS[2], true),
+        (RANGE_ARRAYS[3], true),
+        (RANGE_ARRAYS[4], true),
+        (RANGE_ARRAYS[5], true),
     ])
 });
 
@@ -62,8 +82,15 @@ pub(crate) fn is_array_decl(decl: &str) -> bool {
 pub(crate) fn array_oid_for_decl(decl: &str) -> Oid {
     let d = decl.trim();
     let elem = d.strip_suffix("[]").unwrap_or(d).trim();
+    if let Some(oid) = range_array_oid_for_decl(elem) {
+        return oid;
+    }
     let oid = oid_from_decl_type(elem);
-    if oid == OID_INT8 {
+    if oid == OID_TIMESTAMPTZ {
+        OID_TIMESTAMPTZ_ARR
+    } else if oid == OID_TIME {
+        OID_TIME_ARR
+    } else if oid == OID_INT8 {
         OID_INT8_ARR
     } else if oid == OID_BOOL {
         OID_BOOL_ARR
@@ -89,7 +116,7 @@ pub(crate) fn array_oid_for_decl(decl: &str) -> Oid {
 /// Renders a stored JSON array as Postgres' `{…}` array text. A value that isn't
 /// a JSON array is passed through unchanged. Only the first JSON value of the
 /// text is read, and a JSON null decodes to no elements.
-pub(crate) fn json_array_to_pg_text(v: &Value) -> Vec<u8> {
+pub(crate) fn json_array_to_pg_text(oid: Oid, v: &Value) -> Vec<u8> {
     // Text and bytes as they are, anything else empty.
     let s = match v {
         Value::Text(x) => std::borrow::Cow::Borrowed(x.as_str()),
@@ -97,10 +124,31 @@ pub(crate) fn json_array_to_pg_text(v: &Value) -> Vec<u8> {
         _ => std::borrow::Cow::Borrowed(""),
     };
     match json_decode_first(&s) {
+        // A timestamptz's elements, and a tstzrange's bounds, in the session's zone.
+        Some(Json::Arr(arr)) if matches!(array_elem_oid(oid), OID_TIMESTAMPTZ | OID_TSTZRANGE) => {
+            let elem = array_elem_oid(oid);
+            pg_array_text(&in_session_zone(arr, elem)).into_bytes()
+        }
         Some(Json::Arr(arr)) => pg_array_text(&arr).into_bytes(),
         Some(Json::Null) => b"{}".to_vec(),
         _ => text_to_bytes(&s).into_owned(),
     }
+}
+
+/// The elements of a timestamptz or tstzrange array as their text in the session's
+/// zone, at any depth.
+fn in_session_zone(arr: Vec<Json>, elem: Oid) -> Vec<Json> {
+    arr.into_iter()
+        .map(|j| match j {
+            Json::Arr(inner) => Json::Arr(in_session_zone(inner, elem)),
+            Json::Str(s) => Json::Str(if elem == OID_TSTZRANGE {
+                crate::types::range::range_text(elem, &s)
+            } else {
+                crate::types::binary_time::canonical_time_text(elem, &s)
+            }),
+            other => other,
+        })
+        .collect()
 }
 
 /// The element type of an array type.
@@ -119,7 +167,9 @@ fn array_elem_oid(oid: Oid) -> Oid {
         OID_UUID_ARR => OID_UUID,
         OID_JSON_ARR => OID_JSON,
         OID_JSONB_ARR => OID_JSONB,
-        _ => OID_TEXT,
+        OID_TIME_ARR => OID_TIME,
+        OID_TIMESTAMPTZ_ARR => OID_TIMESTAMPTZ,
+        o => range_of_array(o).unwrap_or(OID_TEXT),
     }
 }
 

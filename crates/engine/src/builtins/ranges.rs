@@ -91,12 +91,19 @@ impl RangeKind {
 
 /// A range read from its text. A bound that is None is infinite.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Range {
-    pub(crate) empty: bool,
-    pub(crate) lo: Option<String>,
-    pub(crate) hi: Option<String>,
-    pub(crate) lo_inc: bool,
-    pub(crate) hi_inc: bool,
+pub struct Range {
+    pub empty: bool,
+    /// A bound's text, None for an infinite one.
+    pub lo: Option<String>,
+    pub hi: Option<String>,
+    pub lo_inc: bool,
+    pub hi_inc: bool,
+}
+
+/// A range's parts as range_send lays them out, None for what is no range.
+#[must_use]
+pub fn range_parts(s: &str) -> Option<Range> {
+    parse_range(s)
 }
 
 /// Whether s reads as a range: `empty`, or a bracket, two bounds and a bracket.
@@ -205,9 +212,21 @@ fn malformed(text: &str) -> Error {
 /// 22P02 for text that is no range, what the element type's input answers for a
 /// bound, and 22000 for a lower bound past the upper.
 pub fn range_input(kind: RangeKind, text: &str) -> Result<String> {
-    let r = parse_range(text).ok_or_else(|| malformed(text))?;
+    let mut r = parse_range(text).ok_or_else(|| malformed(text))?;
     if r.empty {
         return Ok("empty".to_string());
+    }
+    if kind == RangeKind::Tstz {
+        // A bound without an offset of its own is a wall clock in the session's zone,
+        // as timestamptz_in reads it; a stored range's bounds carry their +00.
+        for b in [&mut r.lo, &mut r.hi] {
+            if let Some(s) = b.as_ref()
+                && !is_special(s)
+            {
+                let utc = crate::builtins::casts::timestamptz_in_session(&Value::Text(s.clone()), None)?;
+                *b = Some(utc.to_string() + "+00");
+            }
+        }
     }
     build(kind, r)
 }
@@ -324,6 +343,25 @@ fn render(kind: RangeKind, r: &Range) -> String {
         if r.hi_inc { "]" } else { ")" },
     ]
     .concat()
+}
+
+/// A stored tstzrange as range_out writes it in the session's TimeZone: each bound's
+/// wall clock there with its offset. None for what is no range.
+#[must_use]
+pub fn tstzrange_session_text(stored: &str) -> Option<String> {
+    let mut r = parse_range(stored)?;
+    if r.empty {
+        return Some("empty".to_string());
+    }
+    for b in [&mut r.lo, &mut r.hi] {
+        if let Some(s) = b.as_ref()
+            && !is_special(s)
+        {
+            *b = Some(crate::builtins::dates::session_tz_text(s)?);
+        }
+    }
+    // The bounds carry their offsets now: rendered as any range's.
+    Some(render(RangeKind::Num, &r))
 }
 
 fn is_special(s: &str) -> bool {

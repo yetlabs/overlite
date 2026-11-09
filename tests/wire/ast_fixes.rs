@@ -48,7 +48,7 @@ fn a_range_cast_twice_is_written() {
         "INSERT INTO r (id, big, ints) VALUES (2, NULL::int8range, '[1,5]'::int4range::int4range)",
     );
     assert_eq!(
-        query_column(&conn, "SELECT ints FROM r ORDER BY id", 0),
+        query_column(&conn, "SELECT ints::text FROM r ORDER BY id", 0),
         ["[0,10)", "[1,6)"]
     );
 }

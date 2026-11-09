@@ -3032,6 +3032,13 @@ impl<'a> Emitter<'a> {
             let target = types::of_type_name(ty);
             self.note_param(arg, target);
             let from = self.ty(arg);
+            if from.is(Base::TstzRange) && matches!(target.base, Base::Text | Base::Varchar) && !target.array {
+                // Its bounds in the session's zone, as range_out writes them.
+                self.push("overlite_tstzrange_text(");
+                self.expr(arg, Prec::Or)?;
+                self.push(")");
+                return Ok(());
+            }
             if from.is(Base::Timestamptz) {
                 match target.base {
                     Base::Text | Base::Varchar if !target.array => {
@@ -4293,6 +4300,24 @@ impl<'a> Emitter<'a> {
             [schema, n] if string(schema)? == "pg_catalog" => string(n)?,
             _ => return Err("qualified function"),
         };
+        // tstzrange(a, b): a bound that is not a timestamptz (a literal, a timestamp) is
+        // one in the session's zone, as Postgres converts it.
+        if self.typed() && name == "tstzrange" && (2..=3).contains(&f.args.len()) && f.over.is_none() {
+            self.push("tstzrange(");
+            for (i, a) in f.args.iter().enumerate() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                let a = node(a)?;
+                if i < 2 {
+                    self.value(a, Ty::of(Base::Timestamptz), Prec::Or)?;
+                } else {
+                    self.expr(a, Prec::Or)?;
+                }
+            }
+            self.push(")");
+            return Ok(());
+        }
         // lower and upper of what the environment knows is a range: its bound, NULL for
         // the empty range, where the overloaded lower would read `empty` as text.
         if self.typed()
