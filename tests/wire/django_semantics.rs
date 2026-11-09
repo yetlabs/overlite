@@ -357,7 +357,7 @@ fn jsonb_operators_compare_as_jsonb() {
         );
         assert_eq!(oids, [3802, 3802]);
         assert_eq!(rows[0][0].as_deref(), Some(r#"["Ivan",["iivanov",30],[]]"#));
-        assert_eq!(rows[0][1].as_deref(), Some(r#"{"k":{"a": 1}}"#));
+        assert_eq!(rows[0][1].as_deref(), Some(r#"{"k":{"a":1}}"#));
         let (oids, _) = texts(&conn, &format!("SELECT v -> 'k', v ->> 'k', v #> '{{d}}' FROM {t}"));
         assert_eq!(oids, [3802, 25, 3802]);
     }

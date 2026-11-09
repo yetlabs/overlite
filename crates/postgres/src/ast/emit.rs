@@ -1418,6 +1418,10 @@ impl<'a> Emitter<'a> {
             return None;
         }
         let ty = self.ty(val);
+        // A jsonb a COALESCE, MIN or a subquery gives, typed as one.
+        if ty.is(Base::Jsonb) && !matches!(val, NodeEnum::FuncCall(_)) {
+            return Some((ty, "jsonb"));
+        }
         if let NodeEnum::FuncCall(f) = val
             && matches!(func_name(f), Some("sum" | "avg"))
             && ty.is(Base::Float8)
@@ -4558,8 +4562,31 @@ impl<'a> Emitter<'a> {
             None if name == "string_agg" => ("group_concat", false),
             None => (name, false),
         };
+        // A json or jsonb value built into one is JSON, not a string of its text; json
+        // and jsonb aggregates over no rows are NULL, where SQLite's are `[]` and `{}`.
+        let renamed = self.typed() && name != call;
+        let builds = renamed
+            && matches!(
+                call,
+                "json_object" | "json_array" | "json_group_array" | "json_group_object"
+            );
+        let empty = match call {
+            "json_group_array" if renamed => Some("'[]'"),
+            "json_group_object" if renamed => Some("'{}'"),
+            _ => None,
+        };
+        let json_typed = renamed
+            && matches!(
+                name,
+                "json_build_object" | "json_build_array" | "json_object_agg" | "json_agg"
+            );
         if jsonb {
             self.push("(overlite_cast(");
+        } else if json_typed {
+            self.push("overlite_cast(");
+        }
+        if empty.is_some() {
+            self.push("nullif(");
         }
         if call.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric()) {
             self.push(call);
@@ -4573,7 +4600,16 @@ impl<'a> Emitter<'a> {
             if f.agg_distinct && call != "overlite_string_agg_distinct" {
                 self.push("DISTINCT ");
             }
-            self.list(&f.args, Self::expr_node)?;
+            if builds {
+                for (i, a) in f.args.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.json_value(node(a)?)?;
+                }
+            } else {
+                self.list(&f.args, Self::expr_node)?;
+            }
             if !f.agg_order.is_empty() {
                 self.push(" ORDER BY ");
                 self.sort_keys(&f.agg_order)?;
@@ -4581,10 +4617,30 @@ impl<'a> Emitter<'a> {
         }
         self.push(")");
         self.call_clauses(f)?;
+        if let Some(e) = empty {
+            self.push(", ");
+            self.push(e);
+            self.push(")");
+        }
         if jsonb {
             self.push(", 'jsonb') COLLATE JSONB)");
+        } else if json_typed {
+            self.push(", 'json')");
         }
         Ok(())
+    }
+
+    /// x as SQLite's json functions take a value into what they build: a json or jsonb
+    /// as JSON (json()), a boolean as true or false, anything else as it is.
+    fn json_value(&mut self, x: &NodeEnum) -> Out {
+        let ty = self.ty(x);
+        if !ty.array && matches!(ty.base, Base::Json | Base::Jsonb) {
+            self.push("json(");
+            self.expr(x, Prec::Or)?;
+            self.push(")");
+            return Ok(());
+        }
+        self.json_element(x, ty)
     }
 
     /// obj_description, shobj_description and col_description: the comment

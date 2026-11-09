@@ -467,3 +467,51 @@ fn a_range_is_a_range_type() {
             .collect::<Vec<u8>>()
     );
 }
+
+// jsonb_agg of a jsonb column held each element as a string of its text, so `#>` into
+// it found nothing; over no rows it was `[]` where Postgres' is NULL, so COALESCE's
+// default never applied, and the COALESCE went out as text.
+#[test]
+fn jsonb_agg_aggregates_json() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE TABLE ja (g int, s int, j jsonb, b boolean, i int)");
+    must_exec(
+        &conn,
+        r#"INSERT INTO ja VALUES (1, 1, '{"sea_view": false}', true, 1), (2, 1, '{"a": true}', NULL, NULL), (2, 2, '{"sea_view": true}', false, 3)"#,
+    );
+    // Compared as jsonb: a jsonb's text is not spaced as Postgres spaces it.
+    assert_eq!(
+        rows(
+            &conn,
+            r#"SELECT g, jsonb_agg(j ORDER BY s DESC) = CASE g WHEN 1 THEN '[{"sea_view": false}]'::jsonb
+               ELSE '[{"sea_view": true}, {"a": true}]'::jsonb END FROM ja GROUP BY g ORDER BY g"#
+        ),
+        ["1|t", "2|t"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT g FROM ja GROUP BY g HAVING (jsonb_agg(j ORDER BY s DESC) #> '{0,sea_view}') = 'true'::jsonb"
+        ),
+        ["2"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT jsonb_agg(b ORDER BY s, g) = '[true, null, false]'::jsonb, jsonb_agg(i) FILTER (WHERE i > 5) FROM ja"
+        ),
+        ["t|NULL"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            r#"SELECT jsonb_build_object('k', j) = '{"k": {"sea_view": false}}'::jsonb FROM ja WHERE g = 1"#
+        ),
+        ["t"]
+    );
+    must_exec(&conn, "CREATE TABLE je (x int)");
+    let q = r#"SELECT jsonb_agg(x), coalesce(jsonb_agg(x), '["<empty>"]'::jsonb), json_agg(x) FROM je"#;
+    assert_eq!(texts(&conn, q).0, [3802, 3802, 114]);
+    assert_eq!(rows(&conn, q), [r#"NULL|["<empty>"]|NULL"#]);
+}
