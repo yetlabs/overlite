@@ -361,12 +361,18 @@ fn column_def(
         _ => None,
     });
     let serial = column_type(src, ts, te, tn, creating, edits)?;
-    let int4_serial = serial
-        && tn
-            .names
-            .last()
-            .and_then(|n| string(n).ok())
-            .is_some_and(|n| n.eq_ignore_ascii_case("serial") || n.eq_ignore_ascii_case("serial4"));
+    // A serial's and a smallserial's key is narrower than the rowid's INTEGER says: the
+    // comment after its AUTOINCREMENT says so (`key_width`).
+    let width_mark = match tn
+        .names
+        .last()
+        .and_then(|n| string(n).ok())
+        .map(str::to_ascii_lowercase)
+    {
+        Some(n) if serial && (n == "serial" || n == "serial4") => " AUTOINCREMENT /*overlite int4*/",
+        Some(n) if serial && (n == "smallserial" || n == "serial2") => " AUTOINCREMENT /*overlite int2*/",
+        _ => " AUTOINCREMENT",
+    };
     let col_type = src.span(ts, te);
     let mut owner = ConstrType::Undefined;
     let mut i = 0;
@@ -419,17 +425,7 @@ fn column_def(
                         } else {
                             k
                         };
-                        // A serial's key is an int4, which the rowid's INTEGER does not
-                        // say: the comment does (`int4_key`).
-                        edits.after(
-                            src,
-                            at,
-                            if int4_serial {
-                                " AUTOINCREMENT /*overlite int4*/"
-                            } else {
-                                " AUTOINCREMENT"
-                            },
-                        );
+                        edits.after(src, at, width_mark);
                     }
                 }
             },

@@ -492,19 +492,30 @@ pub fn identity_columns(ddl: &str) -> Vec<Identity> {
     out
 }
 
-/// Whether col of a CREATE TABLE is a key that is the rowid declared an int4: a serial's
-/// (`/*overlite int4*/`, which ast::ddl writes after its AUTOINCREMENT) or an integer
-/// identity's. SQLite declares any rowid INTEGER, which says nothing of its width.
-pub(crate) fn int4_key(ddl: &str, col: &str) -> bool {
-    if !ddl.contains("/*overlite int4*/") && !ddl.contains("integer*/") {
-        return false;
+/// The narrow integer col of a CREATE TABLE is declared, where it is a key that is the
+/// rowid: `integer` for a serial's (`/*overlite int4*/`, which ast::ddl writes after its
+/// AUTOINCREMENT) or an integer identity's, `smallint` for a smallserial's
+/// (`/*overlite int2*/`) or a smallint identity's. SQLite declares any rowid INTEGER,
+/// which says nothing of its width.
+pub(crate) fn key_width(ddl: &str, col: &str) -> Option<&'static str> {
+    if !ddl.contains("/*overlite int") && !ddl.contains("int*/") && !ddl.contains("integer*/") {
+        return None;
     }
-    if identity_of(ddl, col).is_some_and(|i| i.type_name == "integer") {
-        return true;
+    if let Some(i) = identity_of(ddl, col) {
+        return match i.type_name.as_str() {
+            "integer" => Some("integer"),
+            "smallint" => Some("smallint"),
+            _ => None,
+        };
     }
-    column_items(ddl)
-        .into_iter()
-        .any(|(column, text)| eq_fold(&column, col) && text.contains("/*overlite int4*/"))
+    let (_, text) = column_items(ddl).into_iter().find(|(column, _)| eq_fold(column, col))?;
+    if text.contains("/*overlite int4*/") {
+        Some("integer")
+    } else if text.contains("/*overlite int2*/") {
+        Some("smallint")
+    } else {
+        None
+    }
 }
 
 fn identity_of(ddl: &str, col: &str) -> Option<Identity> {

@@ -11,7 +11,7 @@
 //! rollback; a file changed by another process is not seen until then, as for the
 //! probes' cache (`resolve/time_zone.rs`).
 
-use crate::catalog::constraints::int4_key;
+use crate::catalog::constraints::key_width;
 use crate::db_state::DbState;
 use overlite_core::sync::RwLockExt;
 use rusqlite::Connection;
@@ -32,7 +32,8 @@ pub struct ColumnType {
     pub mixed_bool: bool,
     /// The table's rowid under its own name (`INTEGER PRIMARY KEY`), whose width is not
     /// known: SQLite declares a serial and a bigserial key both INTEGER. A key whose
-    /// DDL says it is an int4 (`int4_key`) is not counted: it is a narrow integer.
+    /// DDL says it is narrower (`key_width`) is not counted: it is that narrow integer,
+    /// and declared so here.
     pub rowid: bool,
 }
 
@@ -262,18 +263,22 @@ impl TableTypes {
                 *keys.entry(table.to_lowercase()).or_default() += 1;
             }
         }
-        // The keys a serial's or an integer identity's comment says are int4s, read
-        // from the DDL of the tables that have one.
-        let mut int4_keys: HashSet<(String, String)> = HashSet::new();
+        // The keys a serial's or an identity's comment says are narrow integers, read
+        // from the DDL of the tables that have one: each is that type, not the rowid.
+        let mut narrow_keys: HashMap<(String, String), &'static str> = HashMap::new();
         if let Ok(mut st) = q.prepare(
             "SELECT name, sql FROM sqlite_master WHERE type = 'table' \
-             AND (sql LIKE '%/*overlite int4*/%' OR sql LIKE '%/*overlite identity % integer*/%')",
+             AND (sql LIKE '%/*overlite int%' OR sql LIKE '%/*overlite identity %int%*/%')",
         ) && let Ok(it) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         {
             for (table, sql) in it.filter_map(std::result::Result::ok) {
                 for (t, col, decl, pk, _) in &rows {
-                    if *pk == 1 && t == &table && decl.eq_ignore_ascii_case("integer") && int4_key(&sql, col) {
-                        int4_keys.insert((table.to_lowercase(), col.to_lowercase()));
+                    if *pk == 1
+                        && t == &table
+                        && decl.eq_ignore_ascii_case("integer")
+                        && let Some(width) = key_width(&sql, col)
+                    {
+                        narrow_keys.insert((table.to_lowercase(), col.to_lowercase()), width);
                     }
                 }
             }
@@ -284,13 +289,12 @@ impl TableTypes {
             let is_bool = matches!(decl.trim().to_ascii_lowercase().as_str(), "boolean" | "bool");
             let listed = mixed.contains(&(lower.clone(), col.to_lowercase()));
             let mixed_bool = is_bool && (!formatted || listed || (view && !mixed.is_empty()));
-            let rowid = pk == 1
-                && keys.get(&lower) == Some(&1)
-                && decl.eq_ignore_ascii_case("integer")
-                && !int4_keys.contains(&(lower.clone(), col.to_lowercase()));
+            let narrow = narrow_keys.get(&(lower.clone(), col.to_lowercase())).copied();
+            let rowid =
+                pk == 1 && keys.get(&lower) == Some(&1) && decl.eq_ignore_ascii_case("integer") && narrow.is_none();
             all.entry(lower).or_default().push(ColumnType {
                 name: col,
-                decl,
+                decl: narrow.map_or(decl, str::to_string),
                 mixed_bool,
                 rowid,
             });

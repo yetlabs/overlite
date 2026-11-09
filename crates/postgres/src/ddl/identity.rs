@@ -182,7 +182,11 @@ impl Session {
                 // the translation writes as INTEGER ... AUTOINCREMENT.
                 // An int4 a serial, another a bigserial, so that the translation marks
                 // only the int4 (ast::ddl): the identity's mark says which besides.
-                let serial = if type_name == "integer" { "serial" } else { "bigserial" };
+                let serial = match type_name.as_str() {
+                    "integer" => "serial",
+                    "smallint" => "smallserial",
+                    _ => "bigserial",
+                };
                 join_def(&name, serial, &(rest + " " + &mark(clause.always, &type_name)))
             } else {
                 if self.identity_sequence(&stored, &column, &clause.options, None).is_err() {
@@ -442,6 +446,32 @@ pub(crate) fn retype_identity(typ: &str, cons: &str, new_type: &str) -> Option<(
         new_type.to_string()
     };
     Some((typ, cons))
+}
+
+/// For ALTER COLUMN TYPE: a serial key's definition (the rowid, INTEGER ... AUTOINCREMENT)
+/// retyped. To an integer it stays the rowid, its comment saying the new width; to
+/// anything else it is a column of that type, no longer AUTOINCREMENT, which SQLite
+/// takes only on the rowid. None for a column that is not a serial key.
+pub(crate) fn retype_serial_key(typ: &str, cons: &str, new_type: &str) -> Option<(String, String)> {
+    if !eq_fold(typ, "integer") || !cons.to_ascii_lowercase().contains("autoincrement") {
+        return None;
+    }
+    let bare = without_width(cons);
+    match integer_type(new_type) {
+        Some("integer") => Some(("INTEGER".to_string(), bare + " /*overlite int4*/")),
+        Some("smallint") => Some(("INTEGER".to_string(), bare + " /*overlite int2*/")),
+        Some(_) => Some(("INTEGER".to_string(), bare)),
+        None => Some((new_type.to_string(), without_autoincrement(&bare))),
+    }
+}
+
+/// The constraints without a serial key's width comment.
+fn without_width(cons: &str) -> String {
+    let mut out = cons.to_string();
+    for m in ["/*overlite int4*/", "/*overlite int2*/"] {
+        out = out.replace(m, "");
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn not_identity(col: &str, relation: &str) -> crate::error::Error {

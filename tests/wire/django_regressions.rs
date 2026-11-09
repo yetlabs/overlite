@@ -632,3 +632,31 @@ fn an_hstore_array_is_one() {
     // The first element: its length, then hstore_send's pair count.
     assert_eq!(&b[20..28], [0, 0, 0, 0x18, 0, 0, 0, 2]);
 }
+
+// ALTER COLUMN TYPE of a serial key wrote the new type into the rowid's definition,
+// beside its AUTOINCREMENT, and SQLite refused the rebuilt table ("AUTOINCREMENT is
+// only allowed on an INTEGER PRIMARY KEY"): Django's SmallAutoField to BigAutoField.
+// A smallserial key went out as an int8.
+#[test]
+fn a_serial_key_takes_another_type() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, r#"CREATE TABLE sk ("id" smallserial NOT NULL PRIMARY KEY)"#);
+    must_exec(&conn, "INSERT INTO sk DEFAULT VALUES");
+    assert_eq!(texts(&conn, "SELECT * FROM sk").0, [21]);
+    must_exec(
+        &conn,
+        r#"ALTER TABLE sk ALTER COLUMN "id" TYPE bigint USING "id"::bigint"#,
+    );
+    must_exec(&conn, "INSERT INTO sk DEFAULT VALUES");
+    assert_eq!(
+        texts(&conn, "SELECT * FROM sk ORDER BY 1"),
+        (vec![20], vec![vec!["1".to_string()], vec!["2".to_string()]])
+    );
+    must_exec(&conn, "ALTER TABLE sk ALTER COLUMN id TYPE integer");
+    must_exec(&conn, "INSERT INTO sk DEFAULT VALUES");
+    assert_eq!(texts(&conn, "SELECT max(id), count(*) FROM sk").1, [["3", "3"]]);
+    assert_eq!(texts(&conn, "SELECT id FROM sk WHERE id = 3").0, [23]);
+    must_exec(&conn, "ALTER TABLE sk ALTER COLUMN id TYPE text");
+    assert_eq!(texts(&conn, "SELECT id FROM sk ORDER BY id").0, [25]);
+}

@@ -11,7 +11,7 @@ use crate::ddl::alter_actions::split_alter_actions;
 use crate::ddl::column_if_exists::has_column_if_exists;
 use crate::ddl::drop_constraint::{DropColumn, DropConstraint};
 use crate::ddl::exclude::parse_exclusion;
-use crate::ddl::identity::retype_identity;
+use crate::ddl::identity::{retype_identity, retype_serial_key};
 use crate::ddl::sequences::{is_ident_part, is_ident_start, split_top_level};
 use crate::ddl::tree::{self, code_tokens};
 use crate::error::{Error, Result, errf};
@@ -425,9 +425,11 @@ impl Session {
                 .find(" collate ")
                 .map_or(new_type.as_str(), |c| &new_type[..c]);
             fit = assignment_type(&bare.replace(", ", ","));
-            Box::new(move |name, typ, cons| match retype_identity(typ, cons, &new_type) {
-                Some((typ, cons)) => join_def(name, &typ, &drop_collate(&cons)),
-                None => join_def(name, &new_type, &drop_collate(cons)),
+            Box::new(move |name, typ, cons| {
+                match retype_identity(typ, cons, &new_type).or_else(|| retype_serial_key(typ, cons, &new_type)) {
+                    Some((typ, cons)) => join_def(name, &typ, &drop_collate(&cons)),
+                    None => join_def(name, &new_type, &drop_collate(cons)),
+                }
             })
         } else if matches!(cmd, ColumnCmd::SetNotNull) {
             Box::new(|name, typ, cons| join_def(name, typ, &add_not_null(cons)))

@@ -328,9 +328,11 @@ server leaves there itself. An index column's operator class that is not its typ
 default follows the column, `name /*varchar_pattern_ops*/`, and an identity column's
 definition ends in `/*overlite identity by default bigint*/`, its kind and the type it
 was declared with, since a key that is SQLite's rowid is INTEGER whatever it was. A
-serial key's ends in `/*overlite int4*/` after its AUTOINCREMENT for the same reason:
-`TableTypes` reads it (and an integer identity's mark) so that the key goes out as an
-int4, where a bigserial's, and a serial's from before the comment, goes out as an int8.
+serial key's ends in `/*overlite int4*/` after its AUTOINCREMENT for the same reason, a
+smallserial's in `/*overlite int2*/`: `TableTypes` reads either (and an identity's mark)
+so that the key goes out at its width, where a bigserial's, and a serial's from before
+the comment, goes out as an int8. ALTER COLUMN TYPE of such a key rewrites the comment,
+or drops it with the AUTOINCREMENT when the new type is no integer.
 Whatever rewrites a column's definition keeps the comment, or rewrites it.
 
 The same holds for what SQLite takes no clause for. A UNIQUE or PRIMARY KEY's deferral
