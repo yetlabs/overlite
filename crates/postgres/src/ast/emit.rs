@@ -4799,10 +4799,8 @@ impl<'a> Emitter<'a> {
 
     fn in_subquery(&mut self, s: &pb::SubLink, not: bool) -> Out {
         let test = boxed(s.testexpr.as_deref())?;
-        if matches!(test, NodeEnum::RowExpr(_)) {
-            return Err("row IN");
-        }
-        self.expr(test, Prec::Compare)?;
+        // A row is SQLite's row value, which IN a subquery of as many columns takes.
+        self.row_or_expr(test)?;
         self.push(if not { " NOT IN " } else { " IN " });
         self.subquery(s)
     }

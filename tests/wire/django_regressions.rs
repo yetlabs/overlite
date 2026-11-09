@@ -107,3 +107,33 @@ fn rows_compare_as_postgres_compares_them() {
         ["1", "3"]
     );
 }
+
+// `(a, b) IN (SELECT ...)` was refused as a row IN.
+#[test]
+fn a_row_is_in_a_subquery() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE TABLE r2 (a int, b int)");
+    must_exec(&conn, "INSERT INTO r2 VALUES (1, 2), (1, 3), (2, 2)");
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT a, b FROM r2 WHERE (a, b) IN (SELECT a, b FROM r2 WHERE b = 3)"
+        ),
+        ["1|3"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT a, b FROM r2 WHERE (a, b) NOT IN (SELECT a, b FROM r2 WHERE b = 3) ORDER BY 1, 2"
+        ),
+        ["1|2", "2|2"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT a, b FROM r2 x WHERE (b, a) = ANY (SELECT a + 1, b - 1 FROM r2) ORDER BY 1, 2"
+        ),
+        ["1|2", "1|3", "2|2"]
+    );
+}
