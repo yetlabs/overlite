@@ -55,6 +55,30 @@ pub(crate) struct Tally {
     pub per_source: BTreeMap<&'static str, [usize; 3]>,
 }
 
+/// A context with no tables: the corpus' statements are of applications whose schemas
+/// are not here, so both routes type them with an empty catalog, the AST path from its
+/// environment and the text passes' output through the engine's type passes.
+pub(crate) fn empty_context() -> Option<crate::ast::env::Context> {
+    thread_local! {
+        static EMPTY: std::sync::Arc<overlite_engine::TableTypes> =
+            std::sync::Arc::new(overlite_engine::TableTypes::of(&[]));
+    }
+    Some(crate::ast::env::Context::new(EMPTY.with(Clone::clone), None))
+}
+
+/// The AST path's typed translation without the engine's mark.
+pub(crate) fn typed(sql: &str) -> Result<String, &'static str> {
+    let out = crate::ast::env::with(empty_context(), || try_translate(sql))?;
+    let mark = [" ", overlite_engine::TYPED_MARK, "*/"].concat();
+    Ok(out.strip_suffix(&mark).map_or(out.clone(), str::to_string))
+}
+
+/// The text route as `rewrite` runs it, then the engine's type passes, which finish
+/// what the text passes translated.
+pub(crate) fn text_route(sql: &str) -> String {
+    overlite_engine::type_passes_without_tables(&text_tail(&rewrite_full(sql)))
+}
+
 /// Runs both paths over the corpus.
 pub(crate) fn run() -> Tally {
     let mut t = Tally::default();
@@ -65,7 +89,7 @@ pub(crate) fn run() -> Tally {
             slot[0] += 1;
             continue;
         }
-        let ast = match try_translate(&sql) {
+        let ast = match typed(&sql) {
             Ok(a) => a,
             Err(why) => {
                 *t.unsupported.entry(why).or_default() += 1;
@@ -74,8 +98,8 @@ pub(crate) fn run() -> Tally {
             }
         };
         slot[2] += 1;
-        // The text route as rewrite runs it; the AST path's output is final.
-        let (old, new) = (text_tail(&rewrite_full(&sql)), ast);
+        // The text route as rewrite and the engine run it; the AST path's output is final.
+        let (old, new) = (text_route(&sql), ast);
         match compare(&old, &new) {
             Verdict::Identical => t.identical += 1,
             Verdict::IdenticalButParentheses => t.identical_but_parens += 1,
@@ -105,7 +129,8 @@ fn ast_path_matches_the_text_passes_over_the_corpus() {
     why.sort_by(|a, b| b.1.cmp(a.1));
     eprintln!("unsupported by first node: {why:?}");
     for (sql, old, new) in t.unexplained.iter().take(40) {
-        eprintln!("SQL  {sql}\nTEXT {old}\nAST  {new}\n");
+        let one = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        eprintln!("SQL  {}\nTEXT {}\nAST  {}\n", one(sql), one(old), one(new));
     }
     assert!(
         t.unexplained.is_empty(),
@@ -312,13 +337,14 @@ fn time_the_statement_mix() {
         if needs_no_rewrite(s) {
             return text_tail(s);
         }
-        crate::ast::translate(s).unwrap_or_else(|| text_tail(&rewrite_full(s)))
+        crate::ast::env::with(empty_context(), || crate::ast::translate(s))
+            .unwrap_or_else(|| text_tail(&rewrite_full(s)))
     };
     // Warm the cache, as a client's third round would find it: a statement is kept
     // the second time it is translated.
     for _ in 0..2 {
         for s in &stmts {
-            black_box(crate::rewrite::rewrite(s));
+            crate::ast::env::with(empty_context(), || black_box(crate::rewrite::rewrite(s)));
         }
     }
     let time = |f: &dyn Fn(&str) -> String| {
@@ -331,7 +357,7 @@ fn time_the_statement_mix() {
     for round in 1..=3 {
         let a = time(&text);
         let b = time(&ast);
-        let c = time(&|s| crate::rewrite::rewrite(s));
+        let c = time(&|s| crate::ast::env::with(empty_context(), || crate::rewrite::rewrite(s)));
         eprintln!(
             "round {round}: {} statements, us per statement: text passes {a:.1}, AST path without the cache {b:.1}, \
              rewrite() with cache warm {c:.2}",
@@ -384,5 +410,96 @@ fn grow_the_corpus() {
         "{} statements recorded, {} new to the corpus",
         recorded.lines().count(),
         added.len()
+    );
+}
+
+#[test]
+fn the_typed_printer_writes_from_the_catalog() {
+    let types = std::sync::Arc::new(overlite_engine::TableTypes::of(&[
+        (
+            "t",
+            &[
+                ("id", "INTEGER"),
+                ("n", "DECIMALTEXT(10,2)"),
+                ("ts", "timestamp"),
+                ("tz", "TIMESTAMPTZ"),
+                ("d", "DATE"),
+                ("b", "BOOLEAN"),
+                ("v", "TSVECTOR"),
+                ("s", "TEXT"),
+            ],
+        ),
+        ("s1.u", &[("ts", "timestamptz")]),
+    ]));
+    let t = |sql: &str, sp: Option<&[String]>| {
+        let ctx = crate::ast::env::Context::new(types.clone(), sp);
+        let out = crate::ast::env::with(Some(ctx), || try_translate(sql)).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let mark = [" ", overlite_engine::TYPED_MARK, "*/"].concat();
+        assert!(out.ends_with(&mark), "{out}");
+        out[..out.len() - mark.len()].to_string()
+    };
+    for (sql, want) in [
+        // Exact arithmetic beside a numeric column, in the form a numeric column has.
+        (
+            "SELECT id FROM t WHERE n * 2 > 1.5",
+            "SELECT id FROM t WHERE (CAST(overlite_numeric(overlite_cast(overlite_numeric_op(n, 2, '*'), \
+             'numeric')) AS DECIMALTEXT) COLLATE DECIMAL) > 1.5",
+        ),
+        // Dates and times by their columns' types, a literal read as the column's type.
+        (
+            "SELECT ts + interval '1 day' FROM t WHERE d < tz AND ts >= '2024-01-01'",
+            "SELECT overlite_tadd(ts, overlite_cast('1 day', 'interval'), 'TIMESTAMP', 'INTERVAL') AS \"?column?\" \
+             FROM t WHERE overlite_cast(overlite_tz_in(d), 'timestamptz') < tz AND ts >= \
+             overlite_cast('2024-01-01', 'timestamp')",
+        ),
+        // A boolean column met by a string, a tsvector's length, `%` on text.
+        (
+            "SELECT length(v), s % 'x' FROM t WHERE b = 'f'",
+            "SELECT ts_length(v) AS \"length\", overlite_trgm_match(s, 'x', '%') AS \"?column?\" FROM t WHERE b = 0",
+        ),
+        // `%` on integers is a remainder.
+        ("SELECT id % 2 FROM t", "SELECT id % 2 AS \"?column?\" FROM t"),
+        // The session's zone where Postgres reads one.
+        (
+            "SELECT tz::date, EXTRACT(hour FROM tz), tz AT TIME ZONE 'UTC' FROM t",
+            "SELECT overlite_cast(overlite_tz_wall(tz), 'date') AS \"tz\", overlite_extract('hour', \
+             overlite_tz_wall(tz)) AS \"extract\", overlite_instant_at_time_zone(tz, 'UTC') AS \"timezone\" FROM t",
+        ),
+        // A select-list item whose type only Postgres knows is cast to it.
+        (
+            "SELECT max(ts), sum(n) FROM t",
+            "SELECT overlite_cast(max(ts), 'timestamp') AS \"max\", (CAST(overlite_numeric(overlite_cast(sum(n), \
+             'numeric')) AS DECIMALTEXT) COLLATE DECIMAL) AS \"sum\" FROM t",
+        ),
+        // Through a subquery's and a CTE's columns.
+        (
+            "WITH c AS (SELECT ts AS k FROM t) SELECT x.k FROM (SELECT k FROM c) AS x WHERE x.k > '2024-01-01'",
+            "WITH c AS (SELECT ts AS \"k\" FROM t) SELECT x.k FROM (SELECT k FROM c) AS x WHERE x.k > \
+             overlite_cast('2024-01-01', 'timestamp')",
+        ),
+    ] {
+        assert_eq!(t(sql, None), want, "{sql}");
+    }
+    // An unqualified table is the search_path's.
+    let sp = ["s1".to_string()];
+    assert_eq!(
+        t("SELECT 1 FROM u WHERE ts > '2024-01-01'", Some(&sp)),
+        "SELECT 1 AS \"?column?\" FROM u WHERE ts > overlite_tz_in('2024-01-01')"
+    );
+    // A parameter takes the type of what it meets.
+    let ctx = crate::ast::env::Context::new(types.clone(), None);
+    let p = crate::ast::env::with(Some(ctx), || {
+        crate::ast::param_types("SELECT 1 FROM t WHERE ts > $1 AND n = $2 + 1 AND d::text = $3 LIMIT $4")
+    })
+    .unwrap_or_default();
+    use crate::ast::types::{Base, Ty};
+    assert_eq!(
+        p,
+        [
+            Ty::of(Base::Timestamp),
+            Ty::of(Base::Int4),
+            Ty::TEXT,
+            Ty::of(Base::Int8)
+        ]
     );
 }

@@ -24,13 +24,19 @@ static TRANSLATED: AtomicU64 = AtomicU64::new(0);
 static COMPARED: AtomicU64 = AtomicU64::new(0);
 static UNEXPLAINED: AtomicU64 = AtomicU64::new(0);
 
-/// Compares ast, the AST path's output for sql after the passes `rewrite` runs on
-/// either route, with what text gives, when sql falls in the sample.
-pub(crate) fn check(sql: &str, ast: &str, text: impl FnOnce() -> String) {
+/// Compares the AST path's output for sql after the passes `rewrite` runs on either
+/// route, with what text gives, when sql falls in the sample. The AST path's is its
+/// untyped translation, which the text passes' is comparable with before the engine's
+/// type passes (`env::without`).
+pub(crate) fn check(sql: &str, text: impl FnOnce() -> String) {
     let every = *EVERY;
     if every == 0 || !TRANSLATED.fetch_add(1, Ordering::Relaxed).is_multiple_of(every) {
         return;
     }
+    let Ok(ast) = crate::ast::env::without(|| crate::ast::try_translate(sql)) else {
+        return;
+    };
+    let ast = &ast;
     let old = text();
     let compared = COMPARED.fetch_add(1, Ordering::Relaxed) + 1;
     if compare(&old, ast) == Verdict::Unexplained {

@@ -148,10 +148,18 @@ impl Session {
         if n == 0 {
             return oids;
         }
-        // A statement the AST path translates is typed from its tree alone.
+        // A statement the AST path translates is typed from its tree alone: by the
+        // type environment where it knows what a parameter meets (a column through any
+        // scope, an expression, a cast), then by the tree's facts.
         if *crate::ast::ENABLED
             && let Some(facts) = crate::ast::params::facts(sql)
         {
+            let ctx = self.type_context(sql);
+            if let Some(tys) = crate::ast::env::with(ctx, || crate::ast::param_types(sql)) {
+                for (o, t) in oids.iter_mut().zip(tys) {
+                    *o = param_oid(t.decl());
+                }
+            }
             self.type_by_tree(facts, &mut oids);
         } else {
             self.type_by_text(sql, &mut oids);

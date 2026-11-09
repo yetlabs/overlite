@@ -102,7 +102,7 @@ pub fn rewrite(sql: &str) -> String {
     cache::cached(sql, || {
         match crate::ast::ENABLED.then(|| crate::ast::translate(sql)).flatten() {
             Some(ast) => {
-                crate::ast::shadow::check(sql, &ast, || text_tail(&rewrite_full(sql)));
+                crate::ast::shadow::check(sql, || text_tail(&rewrite_full(sql)));
                 ast
             }
             None => text_tail(&rewrite_full(sql)),

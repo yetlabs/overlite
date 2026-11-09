@@ -23,9 +23,16 @@
 //!   made, as Postgres folds `DEFAULT 'today'::date`. Only statements that read or
 //!   write rows are kept (`cacheable`), so DDL is translated every time.
 //!
+//! - the catalog's columns and the search_path, for a statement the AST path types
+//!   (ast/env.rs): the session's context gives a stamp, which goes into the entry's
+//!   hash and generation, so a translation is answered only under the snapshot of
+//!   the tables and the search_path it was made under.
+//!
 //! What it does not depend on, because it is applied after `rewrite`, on every
-//! execution: search_path and schema qualification, the session's TimeZone, the
-//! catalog's tables, columns and types (the engine's `resolve` passes).
+//! execution: schema qualification and search_path's table names, the session's
+//! TimeZone (the typed translation reads it when it runs, through overlite_tz_in and
+//! overlite_tz_wall), and for the text passes' translations the catalog's types (the
+//! engine's `resolve` passes).
 //! tests/wire/translation_cache.rs runs one text across each change.
 
 use overlite_core::sync::MutexExt;
@@ -56,9 +63,11 @@ const SEEN_BITS: usize = 4096;
 /// DDL is translated once and may fold the clock into a DEFAULT; the session's own
 /// statements never reach `rewrite`.
 pub(crate) fn cacheable(sql: &str) -> bool {
-    if sql.len() > MAX_STATEMENT_LEN {
-        return false;
-    }
+    sql.len() <= MAX_STATEMENT_LEN && reads_or_writes_rows(sql)
+}
+
+/// Whether sql is a statement that reads or writes rows, by its first word.
+pub(crate) fn reads_or_writes_rows(sql: &str) -> bool {
     let word = sql
         .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '(')
         .split(|c: char| !c.is_ascii_alphabetic())
@@ -351,8 +360,11 @@ pub(crate) fn cached(sql: &str, f: impl FnOnce() -> String) -> String {
     }
     // Read before translating: a collation made meanwhile leaves this entry stale,
     // never a stale entry under the new generation.
-    let generation = overlite_engine::collations_generation();
-    let h = CACHE.hash(sql);
+    // A translation typed from the catalog is kept under its context's stamp
+    // (ast::env): another database, schema or search_path is another entry.
+    let stamp = crate::ast::env::stamp();
+    let generation = overlite_engine::collations_generation() ^ stamp;
+    let h = CACHE.hash(sql) ^ stamp.rotate_left(29);
     match CACHE.lookup(sql, h, generation) {
         Lookup::Hit(hit) => hit,
         Lookup::Miss { admit } => {

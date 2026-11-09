@@ -296,17 +296,32 @@ impl Session {
         let x = self.expand_sequences(&x)?;
         let x = self.expand_advisory_locks(&x, params)?;
         let x = self.expand_enums(&x)?;
-        let sql = if x == raw {
-            rewrite(&x)
-        } else {
-            crate::rewrite::rewrite_expanded(raw, &x)
-        };
+        let sql = crate::ast::env::with(self.type_context(&x), || {
+            if x == raw {
+                rewrite(&x)
+            } else {
+                crate::rewrite::rewrite_expanded(raw, &x)
+            }
+        });
         if skip_all {
             // SKIP LOCKED while another transaction holds the write lock: every row is
             // locked, so none is returned.
-            return Ok(["SELECT * FROM (", &sql, ") WHERE 0"].concat());
+            return Ok(crate::ast::wrap_typed(&sql, "SELECT * FROM (", ") WHERE 0"));
         }
         Ok(sql)
+    }
+
+    /// The type environment's context for a translation of sql (ast/env.rs): the
+    /// catalog as this connection last read it and the search_path, for a statement
+    /// that reads or writes rows. None for anything else, and with the AST path off.
+    pub(crate) fn type_context(&self, sql: &str) -> Option<crate::ast::env::Context> {
+        if !*crate::ast::ENABLED || !crate::rewrite::cache::reads_or_writes_rows(sql) {
+            return None;
+        }
+        Some(crate::ast::env::Context::new(
+            self.db.table_types(),
+            self.search_path.as_deref(),
+        ))
     }
 
     /// Runs a statement that reaches the engine as a statement does once its
@@ -563,11 +578,13 @@ impl Session {
             return self.put_prepared(name, Prepared::routed(route));
         }
         let described = self.described_text(&raw);
-        let sql = if described == raw {
-            rewrite(&raw)
-        } else {
-            crate::rewrite::rewrite_expanded(&raw, &described)
-        };
+        let sql = crate::ast::env::with(self.type_context(&raw), || {
+            if described == raw {
+                rewrite(&raw)
+            } else {
+                crate::rewrite::rewrite_expanded(&raw, &described)
+            }
+        });
         let num_params = count_params(&sql);
         self.put_prepared(
             name,
@@ -811,8 +828,10 @@ impl Session {
             // Describe must parse for column types but never advance a sequence
             // or take a lock; neutralize the calls to a constant, then rewrite.
             let described = self.described_text(&raw);
-            desc_sql =
-                crate::rewrite::rewrite_expanded(&raw, &neutralize_advisory_locks(&neutralize_sequences(&described)));
+            let neutral = neutralize_advisory_locks(&neutralize_sequences(&described));
+            desc_sql = crate::ast::env::with(self.type_context(&raw), || {
+                crate::rewrite::rewrite_expanded(&raw, &neutral)
+            });
         }
         let cols = match self.describe_sql(&desc_sql, &args) {
             Ok(c) => c,
