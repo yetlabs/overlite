@@ -68,15 +68,22 @@ pub(crate) fn resolve_types<'a>(st: &DbState, q: &Connection, query: &'a str, ar
 }
 
 /// The result types a mark carries, as the declared types the protocol reads
-/// (`pg_int4`): only an integer's width, which nothing else tells.
+/// (`pg_int4`, `pg_int4[]`, `text[]`): an integer's width and an array's element type,
+/// which nothing else tells of a computed column.
 pub(crate) fn apply_result_types(columns: &mut [overlite_core::Column], types: Option<&[&str]>) {
     let Some(types) = types else { return };
     if types.len() != columns.len() {
         return;
     }
     for (c, t) in columns.iter_mut().zip(types) {
-        if matches!(*t, "int2" | "int4" | "int8") {
-            c.decl_type = ["PG_", &t.to_ascii_uppercase()].concat();
+        match t.strip_suffix("[]") {
+            Some(w @ ("int2" | "int4" | "int8")) => c.decl_type = ["PG_", &w.to_ascii_uppercase(), "[]"].concat(),
+            Some(_) => c.decl_type = (*t).to_string(),
+            None if matches!(*t, "int2" | "int4" | "int8") => {
+                c.decl_type = ["PG_", &t.to_ascii_uppercase()].concat();
+            }
+            None if *t == "bool" => c.decl_type = "BOOL".to_string(),
+            None => {}
         }
     }
 }

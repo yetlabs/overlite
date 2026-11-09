@@ -284,6 +284,9 @@ pub(crate) fn oid_for_column(col: &Column, rows: &[Vec<Value>], idx: usize) -> O
         "PG_INT2" => return OID_INT2,
         "PG_INT4" => return OID_INT4,
         "PG_INT8" => return OID_INT8,
+        "PG_INT2[]" => return crate::types::array::OID_INT2_ARR,
+        "PG_INT4[]" => return crate::types::array::OID_INT4_ARR,
+        "PG_INT8[]" => return crate::types::array::OID_INT8_ARR,
         _ => {}
     }
     // pg_constraint's key columns, int2[] held as JSON arrays.

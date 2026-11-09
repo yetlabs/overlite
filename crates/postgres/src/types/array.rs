@@ -23,7 +23,7 @@ use std::sync::LazyLock;
 const OID_BOOL_ARR: Oid = Oid::new(1000);
 const OID_BYTEA_ARR: Oid = Oid::new(1001);
 pub(crate) const OID_INT2_ARR: Oid = Oid::new(1005);
-const OID_INT4_ARR: Oid = Oid::new(1007);
+pub(crate) const OID_INT4_ARR: Oid = Oid::new(1007);
 pub(crate) const OID_TEXT_ARR: Oid = Oid::new(1009);
 const OID_VARCHAR_ARR: Oid = Oid::new(1015);
 pub(crate) const OID_INT8_ARR: Oid = Oid::new(1016);
