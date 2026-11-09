@@ -998,6 +998,23 @@ const INTENDED: &[Intended] = &[
         },
     ),
     (
+        "a partition set WITH ORDINALITY is an empty relation with the columns the statement names, overlite \
+         having no partitions: the text pass left WITH ORDINALITY after its subquery, a syntax error that \
+         failed psql's \\d of every table with a foreign key",
+        |old, new| {
+            let set = |t: &[String]| {
+                t.windows(3).any(|w| {
+                    w[0] == "null"
+                        && matches!(
+                            w[1].as_str(),
+                            "pg_partition_ancestors" | "pg_partition_tree" | "pg_partition_root"
+                        )
+                }) && t.windows(2).any(|w| w[0] == "with" && w[1] == "ordinality")
+            };
+            set(old) && !new.iter().any(|x| x == "ordinality")
+        },
+    ),
+    (
         "jsonb_typeof and json_typeof name a value's type as Postgres does (number, string, boolean): the text \
          pass wrote SQLite's json_type alone, which says integer, real, text, true and false",
         |old, new| {
