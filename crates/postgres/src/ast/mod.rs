@@ -37,7 +37,7 @@ pub(crate) static ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("OVER
 /// The reason it is not translated: a parse error, more than one statement, or the
 /// first node outside the slice.
 pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
-    let parsed = parse::shared(sql)?;
+    let parsed = parse::kept_or_new(sql)?;
     let one = |stmt: &pg_query::NodeEnum| match env::current() {
         Some(ctx) => Ok(emit::typed(stmt, None, ctx)?.sql),
         None => emit::statement(stmt),
@@ -73,7 +73,7 @@ pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
 /// path translates it with the thread's context: what Describe answers.
 pub(crate) fn param_types(sql: &str) -> Option<Vec<types::Ty>> {
     let ctx = env::current()?;
-    let parsed = parse::shared(sql).ok()?;
+    let parsed = parse::kept_or_new(sql).ok()?;
     Some(emit::typed(one_statement(&parsed).ok()?, None, ctx).ok()?.params)
 }
 
@@ -106,7 +106,7 @@ fn one_statement(parsed: &pg_query::protobuf::ParseResult) -> Result<&pg_query::
 /// The labels of sql's result columns (`labels::result_labels`), read from its tree:
 /// those of a statement as the client sent it, before the session expands it.
 pub(crate) fn result_labels(sql: &str) -> Option<Vec<Option<String>>> {
-    let parsed = parse::shared(sql).ok()?;
+    let parsed = parse::kept_or_new(sql).ok()?;
     labels::result_labels(one_statement(&parsed).ok()?)
 }
 
@@ -142,7 +142,7 @@ pub(crate) fn translate_labelled(sql: &str, labels: &[Option<String>]) -> Option
     if outside(shape) {
         return None;
     }
-    let parsed = parse::shared(sql).ok()?;
+    let parsed = parse::kept_or_new(sql).ok()?;
     let out = one_statement(&parsed).and_then(|stmt| match env::current() {
         Some(ctx) => emit::typed(stmt, Some(labels), ctx).map(|p| p.sql),
         None => emit::statement_labelled(stmt, Some(labels)),

@@ -111,6 +111,20 @@ pub(crate) fn shared(sql: &str) -> Shared {
     tree
 }
 
+/// A parse `shared` keeps, or a new one, not kept: what the translation reads. A
+/// statement it translates is mostly one the cache of translations holds after, or one
+/// a client writes its values into, which no parse kept would serve again.
+///
+/// # Errors
+///
+/// As `parse`.
+pub(crate) fn kept_or_new(sql: &str) -> Shared {
+    if let Some(hit) = PARSED.with(|c| c.borrow().get(sql).cloned()) {
+        return hit;
+    }
+    parse(sql).map(Rc::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse;
