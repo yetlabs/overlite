@@ -536,8 +536,10 @@ pub(crate) fn jsonb_exists_all(j: &str, keys_json: &str) -> bool {
 /// The keys of `?|` and `?&`: a JSON array, or Postgres' text form of an array, which an
 /// untyped literal (`'{a,b}'`) or a parameter is in.
 fn json_str_array(s: &str) -> Vec<String> {
-    let s = match crate::builtins::arrays::array_as_json(&overlite_core::Value::Text(s.to_string())) {
-        overlite_core::Value::Text(json) => json,
+    // A text[]: each element a string, `123` and `000` included, read as array_in
+    // reads Postgres' text form, quotes and backslashes too.
+    let s = match crate::builtins::canonical::canonical_array(&overlite_core::Value::Text(s.to_string()), "text") {
+        Ok(overlite_core::Value::Text(json)) => json,
         _ => s.to_string(),
     };
     match json_unmarshal(&s) {

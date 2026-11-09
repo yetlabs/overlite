@@ -1120,7 +1120,12 @@ impl<'a> Emitter<'a> {
             if i > 0 {
                 self.push(", ");
             }
-            self.push(&format!("\"_ov_c{i}\" AS "));
+            // A jsonb item keeps its type (and its order) past the subquery.
+            if self.typed() && self.ty(boxed(t.val.as_deref())?).is(Base::Jsonb) {
+                self.push(&format!("(\"_ov_c{i}\") COLLATE JSONB AS "));
+            } else {
+                self.push(&format!("\"_ov_c{i}\" AS "));
+            }
             let label = if t.name.is_empty() {
                 match figure_colname(boxed(t.val.as_deref())?) {
                     Label::Named(l) => l,
@@ -1143,6 +1148,14 @@ impl<'a> Emitter<'a> {
             self.expr(key, Prec::Or)?;
             self.push(&format!(" AS \"_ov_o{i}\", "));
         }
+        // Without ORDER BY, the rows in the order of the ON keys, as Postgres' sort
+        // for them leaves them.
+        if keys.is_empty() {
+            for (i, d) in on.iter().enumerate() {
+                self.expr(d, Prec::Or)?;
+                self.push(&format!(" AS \"_ov_d{i}\", "));
+            }
+        }
         self.row_number(&on, &keys)?;
         if !s.from_clause.is_empty() {
             self.push(" FROM ");
@@ -1161,7 +1174,15 @@ impl<'a> Emitter<'a> {
             self.expr(node(h)?, Prec::Or)?;
         }
         self.push(") AS _ov WHERE _ov_rn = 1");
-        if !keys.is_empty() {
+        if keys.is_empty() {
+            self.push(" ORDER BY ");
+            for i in 0..on.len() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                self.push(&format!("\"_ov_d{i}\" NULLS LAST"));
+            }
+        } else {
             self.push(" ORDER BY ");
             for (i, (key, k)) in keys.iter().enumerate() {
                 if i > 0 {
@@ -3905,6 +3926,30 @@ impl<'a> Emitter<'a> {
                 self.in_arrow = inner;
                 r1?;
                 self.push(if op == "->" { " -> " } else { " ->> " });
+                // A key SQLite's `->` would not take for a label (one opening as a path
+                // does, or holding what JSON escapes) as the path to it, quoted as the
+                // key is written in the stored text. (`->>` is the engine's, by key.)
+                if op == "->"
+                    && let NodeEnum::AConst(k) = r
+                    && let Some(Val::Sval(key)) = &k.val
+                    && (key.sval.starts_with('$') || key.sval.chars().any(|c| c == '\\' || c == '"' || c < ' '))
+                {
+                    let mut path = String::from("$.\"");
+                    for c in key.sval.chars() {
+                        match c {
+                            '\\' => path.push_str("\\\\"),
+                            '"' => path.push_str("\\\""),
+                            c if c < ' ' => path.push_str(&format!("\\u{:04x}", u32::from(c))),
+                            c => path.push(c),
+                        }
+                    }
+                    path.push('"');
+                    self.push(&quote_literal(&path));
+                    if top {
+                        self.push(") COLLATE JSONB");
+                    }
+                    return Ok(());
+                }
                 let was = std::mem::replace(&mut self.in_arrow, false);
                 let r2 = self.expr(r, Prec::Unary);
                 self.in_arrow = was;

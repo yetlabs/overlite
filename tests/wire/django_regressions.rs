@@ -550,3 +550,39 @@ fn subscripts_read_elements() {
         (vec![23], vec![vec!["1".to_string()]])
     );
 }
+
+// `->` of a key holding a backslash or a quote, or opening with `$`, was SQLite's label,
+// which matches no such key (or is a bad path); `?&` read `{nested,123,000}` as
+// numbers, `000` no JSON at all, so every row had all the keys; DISTINCT ON over `#>`
+// sent its item as text, in no order.
+#[test]
+fn jsonb_keys_are_any_text() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE TABLE jk (id int, v jsonb)");
+    must_exec(
+        &conn,
+        r#"INSERT INTO jk VALUES (1, '{"back\\slash": "some value", "double\"": 1, "$d": 2}'),
+           (2, '{"nested": {"a": 1}, "123": 1, "array": [{"789": 1}, 2], "000": 3}'),
+           (3, '{"k": {"l": "m"}}'), (4, '{"k": {"l": null}}'), (5, NULL)"#,
+    );
+    let ids = |w: &str| rows(&conn, &format!("SELECT id FROM jk WHERE {w} ORDER BY id"));
+    assert_eq!(ids(r#"(v -> E'back\\slash') = '"some value"'::jsonb"#), ["1"]);
+    assert_eq!(ids(r#"(v ->> 'double"') = '1'"#), ["1"]);
+    assert_eq!(ids("(v -> '$d') = '2'::jsonb"), ["1"]);
+    assert_eq!(ids(r#"v ?| E'{"back\\\\slash",does_not_exist}'"#), ["1"]);
+    assert_eq!(ids("v ?& '{nested,123,array,000}'"), ["2"]);
+    assert_eq!(ids("(v #> '{array,0}') ? '789'"), ["2"]);
+    let q = "SELECT DISTINCT ON ((v #> '{k,l}')) (v #> '{k,l}') AS x FROM jk";
+    assert_eq!(
+        texts(&conn, q),
+        (
+            vec![3802],
+            vec![
+                vec!["null".to_string()],
+                vec![r#""m""#.to_string()],
+                vec!["NULL".to_string()]
+            ]
+        )
+    );
+}
