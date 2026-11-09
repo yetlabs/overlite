@@ -586,3 +586,22 @@ fn jsonb_keys_are_any_text() {
         )
     );
 }
+
+// A Describe of a portal bound for binary results said text for every column, so a
+// client reading the description (psycopg's binary cursor) read binary rows as text.
+#[test]
+fn a_portal_is_described_in_its_formats() {
+    let server = start_server();
+    let conn = connect(&server);
+    let r = conn
+        .exec_params::<&[u8]>("SELECT 1::int4, 'x'::text", &[], &[], &[], &[1])
+        .unwrap();
+    assert_eq!(r.fields.iter().map(|f| f.format).collect::<Vec<_>>(), [1, 1]);
+    assert_eq!(r.rows[0][0].as_deref().unwrap(), [0, 0, 0, 1]);
+    let r = conn
+        .exec_params::<&[u8]>("SELECT 1::int4, 'x'::text", &[], &[], &[], &[0, 1])
+        .unwrap();
+    assert_eq!(r.fields.iter().map(|f| f.format).collect::<Vec<_>>(), [0, 1]);
+    let r = conn.exec_params::<&[u8]>("SELECT 1::int4", &[], &[], &[], &[]).unwrap();
+    assert_eq!(r.fields[0].format, 0);
+}

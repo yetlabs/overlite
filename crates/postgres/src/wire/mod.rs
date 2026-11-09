@@ -359,6 +359,17 @@ impl WireConn {
 
     /// Describes result columns. All columns use text format.
     pub(crate) fn send_row_description(&mut self, cols: &[Column], oids: &[Oid]) -> Result<()> {
+        self.send_row_description_bound(cols, oids, &[])
+    }
+
+    /// A RowDescription with each column's format code from Bind's result formats, as a
+    /// Describe of a portal answers: the rows that follow are in those formats.
+    pub(crate) fn send_row_description_bound(
+        &mut self,
+        cols: &[Column],
+        oids: &[Oid],
+        formats: &[Format],
+    ) -> Result<()> {
         let mut t = Vec::new();
         append_int16(&mut t, cols.len() as i32);
         for (i, col) in cols.iter().enumerate() {
@@ -374,7 +385,7 @@ impl WireConn {
                 declared_typmod(&col.decl_type)
             };
             append_int32(&mut t, typmod);
-            append_int16(&mut t, 0); // format code: 0 = text
+            append_int16(&mut t, i32::from(format_for(formats, i) == Format::Binary));
         }
         self.send(MSG_ROW_DESCRIPTION, &t)
     }

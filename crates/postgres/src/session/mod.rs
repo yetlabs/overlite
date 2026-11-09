@@ -879,7 +879,9 @@ impl Session {
             }
             oids.push(oid);
         }
-        self.c.send_row_description(&cols, &oids)?;
+        // A portal's columns in the formats it was bound with, as the rows will be.
+        let formats = pt.as_ref().map(|p| p.borrow().formats.clone()).unwrap_or_default();
+        self.c.send_row_description_bound(&cols, &oids, &formats)?;
         match pt {
             Some(p) => p.borrow_mut().result_oids = oids,
             None => prep.borrow_mut().result_oids = oids,
