@@ -100,12 +100,12 @@ pub fn rewrite(sql: &str) -> String {
         return text_tail(sql);
     }
     cache::cached(sql, || {
-        match crate::ast::ENABLED.then(|| crate::ast::translate(sql)).flatten() {
-            Some(ast) => {
-                crate::ast::shadow::check(sql, || text_tail(&rewrite_full(sql)));
-                ast
-            }
-            None => text_tail(&rewrite_full(sql)),
+        if let Some(ast) = crate::ast::ENABLED.then(|| crate::ast::translate(sql)).flatten() {
+            crate::ast::shadow::check(sql, || text_tail(&rewrite_full(sql)));
+            ast
+        } else {
+            crate::ast::record::text_passes(sql);
+            text_tail(&rewrite_full(sql))
         }
     })
 }

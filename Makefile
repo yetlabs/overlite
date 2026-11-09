@@ -1,4 +1,4 @@
-.PHONY: test build run fmt lint doc check clean ast-corpus
+.PHONY: test build run fmt lint doc check clean ast-corpus text-passes
 
 # The release workflow sets VERSION to the tag.
 VERSION ?=
@@ -38,3 +38,11 @@ ast-corpus:
 	rm -f target/wire-statements.hex
 	OVERLITE_RECORD_STATEMENTS=$(CURDIR)/target/wire-statements.hex cargo test --release --test wire -- --skip panics::
 	OVERLITE_RECORDED=$(CURDIR)/target/wire-statements.hex cargo test --release -p overlite-postgres --lib grow_the_corpus -- --ignored --nocapture
+
+# Records what the wire suite's servers hand to the text passes (rewrite_full) and
+# counts it by node kind; target/text-passes.txt lists each statement with its kind.
+text-passes:
+	rm -f target/text-passes.hex
+	OVERLITE_RECORD_TEXT_PASSES=$(CURDIR)/target/text-passes.hex cargo test --release --test wire -- --skip panics::
+	OVERLITE_RECORDED_TEXT_PASSES=$(CURDIR)/target/text-passes.hex OVERLITE_LEFT=$(CURDIR)/target/text-passes.txt \
+		cargo test --release -p overlite-postgres --lib count_what_reached_the_text_passes -- --ignored --nocapture

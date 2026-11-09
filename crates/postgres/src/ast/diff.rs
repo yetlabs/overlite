@@ -623,3 +623,84 @@ fn list_what_the_text_passes_translate() {
         }
     }
 }
+
+/// The kind of statement sql is, by its parse tree: the node's name, with the object
+/// kind of a DROP, the first action of an ALTER TABLE and the setting of a SET; "parse
+/// error" for what Postgres refuses to parse.
+pub(crate) fn node_kind(sql: &str) -> String {
+    use pg_query::NodeEnum;
+    let Ok(parsed) = crate::ast::parse::parse(sql) else {
+        return "parse error".into();
+    };
+    let mut kinds = Vec::new();
+    for raw in &parsed.stmts {
+        let Some(node) = raw.stmt.as_deref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        let name = format!("{node:?}");
+        let name = name.split('(').next().unwrap_or("").to_string();
+        let detail = match node {
+            NodeEnum::DropStmt(d) => format!(" {:?}", d.remove_type()),
+            NodeEnum::AlterTableStmt(a) => a
+                .cmds
+                .iter()
+                .find_map(|c| {
+                    if let Some(NodeEnum::AlterTableCmd(c)) = c.node.as_ref() {
+                        Some(format!(" {:?}", c.subtype()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+            NodeEnum::VariableSetStmt(v) => format!(" {}", v.name),
+            NodeEnum::RenameStmt(r) => format!(" {:?}", r.rename_type()),
+            NodeEnum::GrantStmt(g) => format!(" {:?}", g.objtype()),
+            _ => String::new(),
+        };
+        kinds.push(name + &detail);
+    }
+    if kinds.is_empty() {
+        "empty".into()
+    } else {
+        kinds.join("; ")
+    }
+}
+
+/// Counts, by node kind (`node_kind`), the statements recorded in the file
+/// OVERLITE_RECORDED_TEXT_PASSES names (`record::text_passes`): what reached the text
+/// passes in a running server. Each line: occurrences, distinct statements, kind.
+/// OVERLITE_LEFT names a file to write each distinct statement to, with its kind.
+#[test]
+#[ignore = "a listing, not a check"]
+fn count_what_reached_the_text_passes() {
+    use std::collections::BTreeSet;
+    use std::io::Write;
+    let Some(recorded) = std::env::var_os("OVERLITE_RECORDED_TEXT_PASSES") else {
+        panic!("OVERLITE_RECORDED_TEXT_PASSES names no file");
+    };
+    let recorded = std::fs::read_to_string(recorded).unwrap_or_default();
+    let mut by_kind: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+    for line in recorded.lines() {
+        let Ok(bytes) = hex::decode(line.trim()) else { continue };
+        let Ok(sql) = String::from_utf8(bytes) else { continue };
+        let slot = by_kind.entry(node_kind(&sql)).or_default();
+        slot.0 += 1;
+        slot.1.insert(sql);
+    }
+    let mut rows: Vec<_> = by_kind.iter().collect();
+    rows.sort_by_key(|(k, (n, d))| (std::cmp::Reverse(d.len()), std::cmp::Reverse(*n), (*k).clone()));
+    let (total, distinct) = rows.iter().fold((0, 0), |(t, d), (_, (n, s))| (t + n, d + s.len()));
+    eprintln!("{total} statements, {distinct} distinct");
+    for (kind, (n, d)) in &rows {
+        eprintln!("{n:>7} {:>6}  {kind}", d.len());
+    }
+    if let Some(path) = std::env::var_os("OVERLITE_LEFT") {
+        let mut f = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        for (kind, (_, d)) in &rows {
+            for sql in d {
+                let one = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                writeln!(f, "{kind}\t{one}").unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            }
+        }
+    }
+}
