@@ -143,8 +143,8 @@ pub fn temp_dir() -> TempDir {
 
 /// A port no other test of this process was given. It comes from a UDP socket: a
 /// TCP listener would stay open in any child forked by another test before its exec,
-/// long enough to answer `listening` and then reset the connection. `start` retries
-/// when the port turns out to be taken for TCP.
+/// and take the server's port. `start` retries when the port turns out to be taken
+/// for TCP, which another process of the machine can do at any time.
 fn free_port() -> u16 {
     static USED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     loop {
@@ -180,19 +180,43 @@ fn spawn(db: &Path, port: u16, max_open: usize, env: &Env) -> Child {
     }
     cmd.envs(env.vars.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    if std::env::var_os("OVERLITE_RS_LOG").is_some() {
-        cmd.stderr(Stdio::inherit());
-    } else {
-        cmd.stderr(Stdio::null());
-    }
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     cmd.spawn().expect("spawn the server")
 }
 
-fn listening(addr: &str) -> bool {
-    let sa = addr.parse().expect("socket address");
-    // A probe of a free port in the ephemeral range can connect to itself.
-    TcpStream::connect_timeout(&sa, Duration::from_millis(100)).is_ok_and(|c| c.local_addr().ok() != c.peer_addr().ok())
+/// Reads the server's log until it says it listens on `addr`, true then, or false
+/// when the server exits first (the port was taken: `listen: Address already in
+/// use`) or stays silent for 5s. The rest of the log goes on being read, to the
+/// test's stderr under OVERLITE_RS_LOG and nowhere otherwise, so the server never
+/// blocks on a full pipe.
+///
+/// A connection to the port proves nothing: another process of the machine can
+/// listen on a port this process found free a moment before (an editor's helper, a
+/// container's port forward), and on macOS that happened in about one full run of the
+/// suite in three. The server's bind then failed, the probe reached the other
+/// listener, and the test's connection met an EOF, a 5s silence or another server's
+/// password prompt. Only the server itself can say the listener is its own.
+fn listening(child: &mut Child, addr: &str) -> bool {
+    let stderr = child.stderr.take().expect("the server's stderr is piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ready = format!(" protocol on {addr} ");
+    std::thread::spawn(move || {
+        let echo = std::env::var_os("OVERLITE_RS_LOG").is_some();
+        let mut tx = Some(tx);
+        let mut lines = io::BufReader::new(stderr);
+        let mut line = Vec::new();
+        while matches!(io::BufRead::read_until(&mut lines, b'\n', &mut line), Ok(n) if n > 0) {
+            if echo {
+                let _ = io::stderr().write_all(&line);
+            }
+            if tx.is_some() && String::from_utf8_lossy(&line).contains(&ready) {
+                let _ = tx.take().expect("checked").send(());
+            }
+            line.clear();
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(5)).is_ok()
 }
 
 /// A server on `db`, which the caller owns.
@@ -210,21 +234,16 @@ fn start(db: &Path, max_open: usize, mut env: Env, mut dirs: Vec<TempDir>) -> Se
         let port = free_port();
         let addr = format!("127.0.0.1:{port}");
         let mut child = spawn(db, port, max_open, &env);
-        for _ in 0..500 {
-            if listening(&addr) {
-                let proc = ServerProc {
-                    addr,
-                    port,
-                    child: Mutex::new(Some(child)),
-                    _dirs: dirs,
-                };
-                return Server(Arc::new(proc));
-            }
-            if child.try_wait().expect("wait").is_some() {
-                break; // lost the port to something else: try another
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        if listening(&mut child, &addr) {
+            let proc = ServerProc {
+                addr,
+                port,
+                child: Mutex::new(Some(child)),
+                _dirs: dirs,
+            };
+            return Server(Arc::new(proc));
         }
+        // Lost the port to something else: try another.
         let _ = child.kill();
         let _ = child.wait();
     }
