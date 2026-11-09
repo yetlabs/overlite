@@ -126,8 +126,9 @@ const BAD_REGEX: usize = 2768;
 /// schema name a file cannot hold. And a write the old server stored as it came, that
 /// the column's type does not read: an array or an hstore that is neither (22P02,
 /// 42601), a timestamp past any offset (22009). The reads of those arrays that failed
-/// on them answer now.
-const STATE_BY_KIND: usize = 252;
+/// on them answer now. And ALTER TYPE of a type named only by white space (`" "`),
+/// which the old server took for a type with no name and altered: 42704.
+const STATE_BY_KIND: usize = 254;
 
 /// A `time` column: the old server described it by its text, 25, where Postgres says
 /// 1083. These hold what no time can be, which Postgres would have refused; and as such
