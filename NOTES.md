@@ -513,6 +513,25 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   FOR EACH, WHEN) must read as a Postgres trigger's, so SQLite's TEMP, IF NOT EXISTS
   and a WHEN without parentheses are taken, a trigger without BEFORE or AFTER is not.
   Postgres' `CREATE TRIGGER ... EXECUTE FUNCTION` is 0A000 as before.
+- Since stage 5c the session's handlers read their statement's tree (roles, GRANT and
+  REVOKE, owners, RLS, schemas, sequences, types, databases, COMMENT, COPY, TimeZone,
+  TRUNCATE, extensions, collations, materialized views, CREATE TABLE's serial and
+  identity columns, ALTER TABLE): a name is folded as Postgres folds it unless quoted
+  (a GRANT's table, a LISTEN channel, a PREPARE name, an enum type, a sequence; enum
+  lookups compare without case, so older files keep working). Answers that were wrong
+  and are Postgres' now (tests/wire/privilege_trees.rs, handler_trees.rs): a role
+  creating `"secret copy"` was recorded as the owner of `secret`, past every grant on
+  it; `GRANT ... TO CURRENT_USER` and `CREATE POLICY ... TO CURRENT_USER` name the
+  current role (the second matched none); a policy named with a space was a syntax
+  error; `ALTER TABLE t ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY` did only the
+  last action; `LISTEN Foo` did not receive `NOTIFY FOO`; `EXECUTE BYID` did not find
+  `PREPARE byId`; `COMMENT ... IS ''` stored an empty comment instead of dropping it;
+  `ALTER SEQUENCE IF EXISTS s` altered a sequence named "if", and an ALTER SEQUENCE that
+  did not name CYCLE turned it off; the serial and identity columns of a table named
+  with a space lost their default; a DEFAULT dropped was cut at a space inside a
+  literal; `ALTER COLUMN "d e"` read the name up to the space; `ALTER ... TYPE citext`
+  compares without case; ALTER TYPE of a name that is only white space is 42704 (it
+  succeeded); COPY's `NULL 'csv header'` set no CSV or HEADER option.
 - Since stage 5c, also from the tree: hstore's `->` gives a value as text and of an
   array of keys their values, `?|`, `?&`, `@>` and `<@` read an hstore column as one;
   hstore's `->>`, which hstore has not, is 42883 (it read the stored JSON); a json

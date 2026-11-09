@@ -1,6 +1,6 @@
 # 0001: Translate SQL from a parse tree, not from text
 
-Status: accepted; stages 0 to 4, 5a and 5b landed on main (below), stage 1's week of the owner's apps pending
+Status: accepted, done: stages 0 to 5c landed on main (below); stage 1's week of the owner's apps pending
 Date: 2026-11-08
 
 ## Context
@@ -1132,6 +1132,144 @@ in turn, seconds: 6491d37 2.230 / 2.201 / 2.184, stage 5b 2.220 / 2.177 / 2.237:
    the engine's type passes, `rewrite/tokens.rs`, `blank.rs`, `resolve/names.rs`,
    OVERLITE_AST and the shadow.
 
+## Stage 5c result: the migration is done
+
+There are no text passes. A client's statement takes the fast path, is translated from
+its tree, or is refused: with Postgres' own error where Postgres refuses it, 0A000 for
+a node the printer has no form for. SQLite's `CREATE TRIGGER ... BEGIN ... END` is the
+one statement run as written.
+
+**1. The nine typed refusals**, each answered by the printer now (tests/wire/
+ast_refusals.rs): a boolean column holding text is read in both forms as
+resolve/booleans.rs read it (`col = <truth value>` as `col IN` every spelling, any
+other reading `overlite_bool(col)`, a whole select item as it is; only where the
+catalog has such a column); hstore's `->` (overlite_hstore_get, new: a value as text,
+of an array of keys their values), `?`, `?|`, `?&`, `@>`, `<@` over an hstore column,
+its `->>`, which hstore has not, 42883 as in Postgres; a json operator over an array
+42883 (`operator does not exist: integer[] -> integer`, with its position), as are
+`%` and the range operators over known types Postgres has no operator for; AT TIME
+ZONE of a date as of its midnight in the session's zone (timezone(text, timestamptz)
+over the cast).
+
+**2. What Postgres refuses.** A parse error is libpg_query's message and cursor
+position (the ErrorResponse's P field, now sent with a HINT where there is one), with
+the grammar's own codes where it raises another (`role name "public" is reserved`,
+42939; the table in `parse::grammar_state`), answered before any classifier or grant
+reads the statement (`ast::grammar_refusal`), as Postgres parses first; one that reads
+or writes rows by its translation, which parses it anyway. A derived column list too
+long is 42P10 with Postgres' message. A fast-path statement SQLite calls a syntax
+error gets Postgres' error (`postgres_syntax_error`). SQLite's dialect, by the owner's
+decision: refused as Postgres refuses it (AUTOINCREMENT, EXPLAIN QUERY PLAN, `LIMIT a,
+b` with its hint, PRAGMA, ATTACH, VACUUM INTO, INSERT OR ..., DROP TRIGGER without ON,
+`current_user()`, PREPARE of DDL), except its trigger, which is the only trigger
+while PL/pgSQL does not run: `ast::sqlite_trigger` reads its head with the grammar,
+the body replaced by `EXECUTE FUNCTION overlite_sqlite_trigger_body()` (SQLite's TEMP
+and IF NOT EXISTS left out, its WHEN given parentheses), so both forms are a
+CreateTrigStmt, told apart by the function: a PL/pgSQL to come takes a real one beside
+it. The fast path, whose words took `INSERT OR IGNORE`, now also asks that the grammar
+read each new shape of statement it takes (`rewrite::parses`, by `ast::shape`).
+
+**3. The handlers' readers on the tree** (branch ast5c-handlers, merged): roles, GRANT
+and REVOKE, owners, RLS DDL, schemas, SET ROLE, the no-op ALTERs, sequences, types and
+enum columns, databases, COMMENT, COPY, TimeZone, TRUNCATE, extensions, collations,
+materialized views and partitions, CREATE TABLE's serial, identity and nextval
+columns, ALTER TABLE's target and actions; LISTEN/NOTIFY, PREPARE/EXECUTE, a SELECT's
+row lock and the batch splitter on main. Each was held to its text reader over the
+corpus in a test deleted with the reader (counts in each commit's body); ddl/words.rs
+and the classifiers' `*_text` fallbacks are gone (`unquote_ident` stays for names
+read from a table's stored DDL). Where a
+handler writes back a piece of the client's SQL (an EXCLUDE's elements, a column's
+definition) it cuts it with Postgres' scanner. The privilege-relevant ones have wire
+tests (tests/wire/privilege_trees.rs), which found a privilege escalation: a role
+creating `"secret copy"` was recorded as the owner of `secret`.
+
+**4. Deletions.** prost decodes without its recursion limit, and `parse` refuses a
+tree nested past 1000 protobuf messages before decoding it (54001; read without
+recursion; an 8 MiB thread overflowed at about 5000): a 200-member UNION runs.
+Deleted: rewrite_full and its 66 passes, holding_literals and
+literals_survive_the_whole_rewrite, rewrite::labels, rewrite/tokens.rs, the
+param_types regexes and type_by_text, text_tail (the fast path leaves ORDER BY and
+LIKE to the printer), the engine's type passes (resolve/temporal.rs, numeric.rs,
+booleans.rs, tsvector.rs, time_zone.rs) and resolve/names.rs, OVERLITE_AST,
+OVERLITE_AST_SHADOW, the shapes remembered as outside, compare.rs and the
+differential test, `make text-passes`. A translation without a session context reads
+an empty catalog; the session's own SQL is translated with its context
+(`rewrite_typed`). The corpus is a snapshot of the printer's output
+(tests/fixtures/ast-corpus/printed.txt, `ast::snapshot`): of 16349 statements, 15170
+translated, 2 refused as Postgres refuses them (42P10), 1177 left to the session or
+refused (1008 the session's statement kinds, 133 parse errors, 24 EXCLUDE and 6 CREATE
+TABLE AS forms the session's handlers take, 2 stars over tables the empty catalog does
+not know, 4 others).
+
+**The fast path, measured.** With fast_path answering false, pgbench's lookup (a point
+lookup the fast path takes, its literal new each time, so a parse each) ran 93273 /
+93807 tps in simple mode against 108509 / 109183 with it (−14%), and 91121 / 91058
+against 90448 / 91005 prepared (level: a prepared statement is translated once). It
+stays: what it sends is held to the
+printer (rewrite/fastpath.rs runs every word of the crate's source, the wire corpus
+and random statements through both and compares Postgres' deparse of each, which found
+shapes it took and the printer reads otherwise: a name before a parameter or a literal
+is a typed literal, `user`, a row in parentheses, SELECT INTO, shifts, a product in a
+select list), and a column of any type the translation reads takes a statement off it
+(TableTypes::typed_differs: all but text, a bigint or the rowid and a float).
+
+**What still reads text**: the session's door (`statement_text`, rewrite/blank.rs and
+strings.rs) and what follows it, the expansions (`apply_rls`, function inlining,
+session identity, sequence calls, advisory locks), the parameter count and the fast
+path's scan, through the engine's blank.rs; the privilege check's fallbacks
+(`required_privileges`, the stored triggers' and views' readers); the readers of a
+table's stored DDL (SQLite's text in sqlite_master); the engine's readers of the
+printer's SQL (name resolution, column_types). These are not translations of a
+client's statement, and are what a next step would put on the tree.
+
+**Bugs fixed**, each with a wire test held to Postgres 17: the parse errors and
+SQLite-dialect refusals above; hstore's `->` gives text and `->>` is refused; the json
+operator over an array; the handlers' (NOTES.md, Behavior: ownership of a table named
+with a space, GRANT/POLICY TO CURRENT_USER, a policy named with a space, two RLS
+actions in one ALTER, folded channel and prepared names, COMMENT IS '', ALTER SEQUENCE
+IF EXISTS and CYCLE, serial columns of a table named with a space, a DEFAULT cut at a
+space, ALTER COLUMN "d e", ALTER TYPE citext, ALTER TYPE " ", COPY NULL 'csv header').
+
+**Client-visible changes** (NOTES.md, Behavior; README, Limitations): Postgres' syntax
+errors with position, SQLite's dialect refused but its trigger, 0A000 for what the
+printer has no form for, 54001 past the nesting bound, names folded unless quoted.
+
+**Performance.** pgbench as before (4 clients, 4 threads, 8 s, each binary on its own
+copy of the 100,000-row `kv`, the order swapped in round 2), 6779015 against b79c9f4,
+tps per round:
+
+| script, mode | 6779015 | stage 5c | means |
+|---|---|---|---|
+| lookup (fast path), simple | 104721 / 105105 / 104573 | 108470 / 109164 / 108726 | +3.8% |
+| lookup (fast path), prepared | 88533 / 88938 / 88780 | 90930 / 90863 / 90684 | +2.3% |
+| lookup2, simple | 77220 / 77607 / 77181 | 79904 / 80106 / 79999 | +3.4% |
+| lookup2, prepared | 80623 / 81354 / 80715 | 81261 / 81648 / 79521 | −0.1% |
+| mix, simple | 13424 / 13236 / 13397 | 13928 / 13933 / 13761 | +3.9% |
+| mix, prepared | 13323 / 13324 / 13193 | 13318 / 13408 / 13383 | +0.7% |
+| lookup3, simple | 77292 / 77092 / 77162 | 80108 / 79416 / 78874 | +3.0% |
+| lookup3, prepared | 78971 / 79506 / 79204 | 79331 / 79767 / 79717 | +0.5% |
+
+The first run after the merge had every simple-mode script 8 to 17% down: the
+handlers' tree readers parsed every statement, a SELECT included, and a Query ending
+in a semicolon was scanned to be split; b79c9f4 removed both, and the simple path
+skips the engine's type passes it ran before. DDL: the 1,000 statements of stage 5b
+through psql, seconds: 6779015 2.186 / 2.174 / 2.181, stage 5c 2.190 / 2.188 /
+2.167: level. Binary: 16,532,240 bytes at 6779015, 15,795,680 at stage 5c (−0.74 MB,
+release, macOS arm64).
+
+**Lines.** The crates and the binary, 6779015 to b79c9f4: 107 files changed, 4670 insertions(+), 19668 deletions(-). The wire
+tests: 13 files changed, 716 insertions(+), 38 deletions(-). Rust in the repository: 104,405 lines to 90,086. Deleted
+files: 26 of rewrite/ (all but mod.rs, cache.rs, fastpath.rs, blank.rs and
+strings.rs), resolve/temporal.rs, numeric.rs, booleans.rs, tsvector.rs, time_zone.rs
+and names.rs, ast/compare.rs, diff.rs and shadow.rs, ddl/words.rs. The corpus'
+snapshot (printed.txt, 16,349 lines) is new.
+
+**Exit criterion.** Nothing reaches a text pass because there are none: every corpus
+statement is translated by the tree, passed through deliberately (SQLite's trigger),
+refused with Postgres' error, or the session's own (snapshot above); the wire suite and
+the privilege tests are green.
+
+
 ## Risks
 
 - **Fidelity.** The tree drops what SQLite does not need but a later text reader might: the
@@ -1142,18 +1280,17 @@ in turn, seconds: 6491d37 2.230 / 2.201 / 2.184, stage 5b 2.220 / 2.177 / 2.237:
   spelling can change (`E'a\nb'` becomes a string with a newline in it), never its meaning.
   Parentheses are SQLite's, not the client's.
 - **Grammar version.** pg_query 18 parses PG 18; a client of an older server sends nothing it
-  rejects. A newer client could send PG 19 syntax before pg_query 19: it then falls back, while
-  the text passes exist, and later fails as Postgres 18 would.
+  rejects. A newer client could send PG 19 syntax before pg_query 19: it fails as Postgres 18
+  would.
 - **Performance.** A statement off the fast path and not in the cache pays a parse. The
   cache is per thread (a client's thread), so it starts cold per connection; a shared cache
-  is the next step if connection churn shows up. Unsupported statements pay the parse and the
-  text passes until their stage lands (the cache keeps the result either way).
+  is the next step if connection churn shows up.
 - **Windows and cross builds.** bindgen at build time needs libclang for the build host and
   the target's headers (BINDGEN_EXTRA_CLANG_ARGS for the Docker arm64 cross build).
   The C code itself builds with MSVC per pg_query's build.rs. Stage 0 gates it.
 - **Binary size.** +3.0 MB (11.74 to 14.78 MB); a server, not a concern, but noted for the Docker image.
 
-## What changes in ARCHITECTURE.md at the end
+## What changes in ARCHITECTURE.md at the end (done in stage 5c)
 
 - The opening line: there is a parser. A statement is parsed by Postgres' grammar, classified
   and translated on the tree, printed as SQLite SQL, and run by SQLite.
