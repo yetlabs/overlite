@@ -22,12 +22,6 @@ use std::rc::Rc;
 /// Why a statement is left to the text passes: the first node the printer does not know.
 pub(crate) type Unsupported = &'static str;
 
-/// The refusals that depend on the catalog, not on the statement's shape: `%` whose
-/// operands' types are not known, a json operator over what is not known to be json,
-/// and a boolean column that may hold text.
-pub(crate) const TYPE_REFUSAL_OPERANDS: Unsupported = "% of operands of unknown type";
-pub(crate) const TYPE_REFUSAL_JSON: Unsupported = "json operator on what is not known to be json";
-pub(crate) const TYPE_REFUSAL_RANGE: Unsupported = "range operator with a side that is no range";
 pub(crate) const TYPE_REFUSAL_STAR: Unsupported =
     "star of a relation the catalog does not know in a derived column list";
 
@@ -82,6 +76,27 @@ fn no_operator(op: &str, l: Ty, r: Ty, at: i32) -> Unsupported {
 
 type Out = Result<(), Unsupported>;
 
+/// The value of a literal under a cast, as a literal: what a cast of a literal in a
+/// table's DDL is stored as. None when it is not one or fails to convert, which leaves
+/// it to SQLite.
+fn fold_literal(operand: &str, name: &str) -> Option<String> {
+    let body = operand.strip_prefix('\'')?.strip_suffix('\'')?;
+    if body.replace("''", "").contains('\'') {
+        return None;
+    }
+    if name.eq_ignore_ascii_case("boolean") || name.eq_ignore_ascii_case("bool") {
+        // As the storage format keeps one.
+        return overlite_core::parse_bool(body).map(|b| if b { "1" } else { "0" }.to_string());
+    }
+    let value = overlite_core::Value::Text(body.replace("''", "'"));
+    match overlite_engine::cast(&value, &overlite_engine::CastType::parse(name)?).ok()? {
+        overlite_core::Value::Text(s) => Some(quote_literal(&s)),
+        overlite_core::Value::Int(n) => Some(n.to_string()),
+        overlite_core::Value::Float(f) => Some(f.to_string()),
+        _ => None,
+    }
+}
+
 /// The text a boolean column that may hold text holds for true and false besides 1
 /// and 0: every spelling Postgres' boolin reads, as resolve/booleans.rs lists them.
 const BOOL_TRUE_FORMS: &[&str] = &[
@@ -113,10 +128,11 @@ enum Prec {
     Atom,
 }
 
-/// The functions the text passes rewrite by name (each found by running every word of
-/// the rewrite's sources as a call through `rewrite_full`): a call to one is written
-/// here as they write it, or left to them. Any other function is written as it came,
-/// SQLite's, the engine's, or one of the session's that it inlines.
+/// The functions the text passes rewrote by name (each found, until stage 5c, by
+/// running every word of their sources as a call): a call to one is written as they
+/// wrote it, or refused, since written as it came it would mean something else in
+/// SQLite. Any other function is written as it came, SQLite's, the engine's, or one of
+/// the session's that it inlines.
 pub(crate) const REWRITTEN: &[&str] = &[
     "array_to_string",
     "clock_timestamp",
@@ -3060,7 +3076,7 @@ impl<'a> Emitter<'a> {
     fn table_ddl_cast(&mut self, arg: &NodeEnum, name: &str) -> Out {
         if let NodeEnum::AConst(k) = arg
             && let Some(Val::Sval(s)) = &k.val
-            && let Some(v) = crate::rewrite::typed_cast::fold_literal(&quote_literal(&s.sval), name)
+            && let Some(v) = fold_literal(&quote_literal(&s.sval), name)
         {
             self.push(&v);
             return Ok(());
@@ -3487,12 +3503,12 @@ impl<'a> Emitter<'a> {
                 self.expr(r, Prec::Unary)
             }
             "@>" | "<@" | "&&" | "-|-" | "<<" | ">>" | "&<" | "&>" if self.is_range(l) || self.is_range(r) => {
-                self.range_op(op, l, r)
+                self.range_op(op, l, r, a.location)
             }
             // Only ranges have these here (and geometry, which overlite has not), and a
             // shift beside a range's literal is a range's.
-            "-|-" | "&<" | "&>" => self.range_op(op, l, r),
-            "<<" | ">>" if is_range_literal(l) || is_range_literal(r) => self.range_op(op, l, r),
+            "-|-" | "&<" | "&>" => self.range_op(op, l, r, a.location),
+            "<<" | ">>" if is_range_literal(l) || is_range_literal(r) => self.range_op(op, l, r, a.location),
             "@>" | "<@" | "&&" if self.ty(l).array || self.ty(r).array => self.array_op(op, l, r),
             // A range's literal containing what the catalog does not know, a range or an
             // element: json_contains reads either.
@@ -3555,7 +3571,7 @@ impl<'a> Emitter<'a> {
                     self.push(" % ");
                     return self.expr(r, Prec::Concat);
                 }
-                Err(TYPE_REFUSAL_OPERANDS)
+                Err(no_operator("%", tl, tr, a.location))
             }
             _ => Err("operator"),
         }
@@ -3629,7 +3645,7 @@ impl<'a> Emitter<'a> {
     /// A range operator or comparison over ranges, as the engine reads them
     /// (overlite_range_op): their bounds, where SQLite compared their texts. The other
     /// side is a range too, or a literal or a parameter read as one.
-    fn range_op(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+    fn range_op(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum, at: i32) -> Out {
         let (tl, tr) = (self.ty(l), self.ty(r));
         let ok = |me: &mut Self, n: &NodeEnum, t: Ty| me.is_range(n) || matches!(t.base, Base::Unknown | Base::Any);
         if matches!(op, "@>" | "<@") {
@@ -3647,7 +3663,7 @@ impl<'a> Emitter<'a> {
             }
         }
         if !(ok(self, l, tl) && ok(self, r, tr)) {
-            return Err(TYPE_REFUSAL_RANGE);
+            return Err(no_operator(op, tl, tr, at));
         }
         self.note_param(l, tr);
         self.note_param(r, tl);
@@ -3861,7 +3877,7 @@ impl<'a> Emitter<'a> {
         }
         let (tl, tr) = (self.ty(l), self.ty(r));
         if self.is_range(l) || self.is_range(r) {
-            return self.range_op(op, l, r);
+            return self.range_op(op, l, r, -1);
         }
         // Two arrays in Postgres' order, element by element, whichever form each is in.
         let array = |t: Ty| t.array || t.base == Base::Unknown;

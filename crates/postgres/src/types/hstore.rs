@@ -1,9 +1,6 @@
 //! hstore values, stored as a JSON object.
 
 use crate::auth::rls::text_or_empty;
-use crate::ddl::sequences::is_ident_part;
-use crate::rewrite::strings::end_of_string_literal;
-use crate::rewrite::utf8_string;
 use overlite_core::Value;
 use overlite_core::text::text_to_bytes;
 use overlite_engine::{Json, hstore_in, json_marshal, json_unmarshal};
@@ -85,67 +82,3 @@ fn hstore_scalar(v: &Json) -> String {
 // hstore over SQLite: stored as a JSON object (see engine/hstore). A column
 // declared `hstore` keeps that declared type (so we can format its output back
 // to hstore text); the value flows through json1 for `->` and `?`.
-
-/// Turns a `'k=>v'::hstore` literal into hstore_in('k=>v') (its JSON object), and
-/// drops the cast on a non-literal (already JSON).
-pub(crate) fn rewrite_hstore_cast(sql: &str) -> String {
-    let low = sql.to_lowercase();
-    if !low.contains("::hstore") && !low.contains(":: hstore") {
-        return sql.to_string();
-    }
-    let s = sql.as_bytes();
-    let mut b: Vec<u8> = Vec::with_capacity(s.len() + 16);
-    let mut i = 0;
-    while i < s.len() {
-        let c = s[i];
-        if c == b'\'' {
-            let j = end_of_string_literal(sql, i);
-            let lit = &s[i..j];
-            let mut k = j;
-            while k < s.len() && (s[k] == b' ' || s[k] == b'\t') {
-                k += 1;
-            }
-            let m = hstore_cast_at(sql, k);
-            if m > 0 {
-                b.extend_from_slice(b"hstore_in(");
-                b.extend_from_slice(lit);
-                b.push(b')');
-                i = m;
-                continue;
-            }
-            b.extend_from_slice(lit);
-            i = j;
-            continue;
-        }
-        if c == b':' && i + 1 < s.len() && s[i + 1] == b':' {
-            let m = hstore_cast_at(sql, i);
-            if m > 0 {
-                // expr::hstore -> drop cast
-                i = m;
-                continue;
-            }
-        }
-        b.push(c);
-        i += 1;
-    }
-    utf8_string(b)
-}
-
-/// Reports the index past a `::hstore` starting at pos, or 0.
-fn hstore_cast_at(sql: &str, pos: usize) -> usize {
-    let s = sql.as_bytes();
-    if pos + 1 >= s.len() || s[pos] != b':' || s[pos + 1] != b':' {
-        return 0;
-    }
-    let mut k = pos + 2;
-    while k < s.len() && (s[k] == b' ' || s[k] == b'\t') {
-        k += 1;
-    }
-    if sql[k..].to_lowercase().starts_with("hstore") {
-        let e = k + "hstore".len();
-        if e >= s.len() || !is_ident_part(s[e]) {
-            return e;
-        }
-    }
-    0
-}

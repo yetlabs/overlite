@@ -4,11 +4,9 @@
 //! whole. It reads the text `statement_text` leaves (comments blanked, one kind of
 //! string literal).
 //!
-//! `OUTSIDE` remembers shapes the AST path left to the text passes, so that another
-//! statement of the shape goes to them without a parse. Being wrong costs nothing but
-//! that parse or, at worst, a statement the AST path could have taken going the text
-//! passes' way, which is the way every statement went before it: a mistake can make
-//! a translation slower, never different from the text passes' own.
+//! The fast path remembers the shapes Postgres' grammar read (`rewrite::fast_path`), so
+//! that a statement of a shape seen is not parsed again: the values of its literals do
+//! not change what the grammar reads.
 
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) fn of(sql: &str) -> u64 {
     let b = sql.as_bytes();
     // One key for the process, so that every thread agrees on a shape; a collision
-    // only sends a statement to the text passes.
+    // could only take a statement the grammar refuses to SQLite, which refuses it too.
     let mut h = FIXED.build_hasher();
     let mut i = 0;
     let mut start = 0;
@@ -94,9 +92,6 @@ impl Shapes {
         self.0[(shape as usize) % SLOTS].store(shape, Ordering::Relaxed);
     }
 }
-
-/// Shapes the AST path does not cover.
-pub(crate) static OUTSIDE: Shapes = Shapes::new();
 
 #[cfg(test)]
 mod tests {

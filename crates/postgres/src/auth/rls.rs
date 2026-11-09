@@ -14,7 +14,6 @@ use crate::ddl::alter::split_qualified_ref;
 use crate::ddl::sequences::{is_ident_part, is_ident_start};
 use crate::ddl::words::{Word, ddl_words};
 use crate::error::{Error, Result, errf};
-use crate::rewrite::rewrite;
 use crate::rewrite::strings::end_of_string_literal;
 use crate::rewrite::tokens::{CodeTok, CodeTokKind, code_tokens};
 use crate::session::Session;
@@ -716,7 +715,7 @@ impl Session {
             Ok(q) => q,
             Err(e) => return Some(Err(e)),
         };
-        let prov = match self.exec(&rewrite(&counted), params) {
+        let prov = match self.exec(&self.rewrite_typed(&counted), params) {
             Ok(rs) if !rs.rows.is_empty() => rs,
             // A source the check cannot count is not let through unchecked.
             Ok(_) => return Some(Err(rls_violation(&bare))),
@@ -727,7 +726,7 @@ impl Session {
             Ok(q) => q,
             Err(e) => return Some(Err(e)),
         };
-        let pass = match self.exec(&rewrite(&q), params) {
+        let pass = match self.exec(&self.rewrite_typed(&q), params) {
             Ok(rs) if !rs.rows.is_empty() => rs,
             Ok(_) => return Some(Err(rls_violation(&bare))),
             Err(e) => return Some(Err(e)),

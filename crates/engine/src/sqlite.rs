@@ -14,7 +14,7 @@ use crate::resolve::public_qualifier::strip_public_qualifier;
 use crate::resolve::regclass::resolve_to_regclass;
 use crate::resolve::schema_qualify::qualify_schema_names;
 use crate::resolve::search_path::resolve_search_path;
-use crate::resolve::{apply_result_types, resolve_types, split_typed};
+use crate::resolve::{apply_result_types, split_typed};
 use crate::sql_funcs::try_function_ddl;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use overlite_core::sync::MutexExt;
@@ -627,10 +627,6 @@ fn execute(sp: Option<&[String]>, st: &DbState, q: &Connection, query: &str, arg
     }
     let (query, typed) = split_typed(query);
     let query = resolve_names(sp, st, q, query);
-    let query = match typed {
-        Some(_) => query,
-        None => Cow::Owned(resolve_types(st, q, &query, args).into_owned()),
-    };
     let cmd = leading_command(&query);
     if is_query(&query) {
         let mut rs = do_query(q, &query, args, &cmd).map_err(|e| missing_from_entry(e, &query))?;
@@ -639,9 +635,7 @@ fn execute(sp: Option<&[String]>, st: &DbState, q: &Connection, query: &str, arg
     }
     let rs = do_exec(q, &query, args, &cmd).map_err(|e| missing_from_entry(e, &query));
     if ["CREATE", "ALTER", "DROP"].iter().any(|c| cmd.starts_with(c)) {
-        st.forget_bool_columns();
         st.forget_table_types();
-        crate::resolve::time_zone::DDL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
     rs
 }
@@ -1167,10 +1161,6 @@ fn describe(
 ) -> Result<Option<Vec<Column>>> {
     let (query, typed) = split_typed(query);
     let query = resolve_names(sp, st, q, query);
-    let query = match typed {
-        Some(_) => query,
-        None => Cow::Owned(resolve_types(st, q, &query, args).into_owned()),
-    };
     let Some(intro) = introspection_sql(&query) else {
         return Ok(None); // statement produces no rows
     };

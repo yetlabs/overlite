@@ -4,8 +4,8 @@
 //! (`with`), from its connection's snapshot of the tables' columns
 //! (`overlite_engine::TableTypes`) and its search_path. A translation made under a
 //! context is kept in the cache under the context's stamp, so that it is answered only
-//! while the same snapshot and search_path stand; one made with none (the session's own
-//! probes, DDL helpers) is the untyped translation the engine's type passes finish.
+//! while the same snapshot and search_path stand. One made with none (DDL's helpers)
+//! reads an empty catalog.
 
 use overlite_engine::{ColumnType, TableTypes};
 use std::cell::RefCell;
@@ -99,7 +99,11 @@ pub(crate) fn with<T>(ctx: Option<Context>, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Runs f with no context: what is translated in it is untyped.
-pub(crate) fn without<T>(f: impl FnOnce() -> T) -> T {
-    with(None, f)
+/// The current context, or one of an empty catalog when the thread has none: what
+/// the catalog does not know is read as the printer reads an unknown column.
+pub(crate) fn current_or_empty() -> Rc<Context> {
+    thread_local! {
+        static EMPTY: Rc<Context> = Rc::new(Context::new(Arc::new(TableTypes::of(&[])), None));
+    }
+    current().unwrap_or_else(|| EMPTY.with(Rc::clone))
 }

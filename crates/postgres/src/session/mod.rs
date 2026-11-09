@@ -318,11 +318,17 @@ impl Session {
         Ok(sql)
     }
 
+    /// `rewrite` of SQL the session writes itself (a probe, a policy's check), typed
+    /// from this connection's catalog as a client's statement is.
+    pub(crate) fn rewrite_typed(&self, sql: &str) -> String {
+        crate::ast::env::with(self.type_context(sql), || crate::rewrite::rewrite(sql))
+    }
+
     /// The type environment's context for a translation of sql (ast/env.rs): the
     /// catalog as this connection last read it and the search_path, for a statement
     /// that reads or writes rows. None for anything else, and with the AST path off.
     pub(crate) fn type_context(&self, sql: &str) -> Option<crate::ast::env::Context> {
-        if !*crate::ast::ENABLED || !crate::rewrite::cache::reads_or_writes_rows(sql) {
+        if !crate::rewrite::cache::reads_or_writes_rows(sql) {
             return None;
         }
         Some(crate::ast::env::Context::new(
@@ -1478,8 +1484,8 @@ impl<'a> BodyReader<'a> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::rewrite::needs_no_rewrite;
     use crate::rewrite::tokens::code_tokens;
-    use crate::rewrite::{needs_no_rewrite, rewrite_full};
     use crate::session::utility::SavepointKind;
     use overlite_engine::blank_literals;
 
@@ -1662,11 +1668,6 @@ pub(crate) mod tests {
                 squash(&crate::rewrite::rewrite(&door)),
                 squash(&crate::rewrite::rewrite(&bare)),
                 "rewrite of {with:?}"
-            );
-            assert_eq!(
-                squash(&rewrite_full(&door)),
-                squash(&rewrite_full(&bare)),
-                "rewrite_full of {with:?}"
             );
         }
     }

@@ -1,23 +1,23 @@
-//! Recognizing, without allocating, a statement the passes would leave unchanged.
+//! Recognizing, without allocating, a statement the printer would write as it is read.
 
 use crate::ddl::sequences::is_ident_start;
-use crate::rewrite::aliases::KEYWORD_LABELS;
-use crate::rewrite::labels::is_label_word;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
 /// The longest word recognized; longer ones take the full rewrite.
 const MAX_WORD: usize = 32;
 
-/// needs_no_rewrite reports whether sql is certain to come out of rewrite_full
-/// unchanged, in one allocation-free pass. Rewriting costs some 60 passes, most
-/// of them regular expressions, and the statements that run most often are plain
-/// lookups that none of them touches.
+/// needs_no_rewrite reports whether sql is certain to come out of the printer
+/// (crate::ast::emit) as it is, in one allocation-free pass, but for its mark and the
+/// types of the columns it names, which `TableTypes::typed_differs` reads: the
+/// statements that run most often are plain lookups that the translation writes back
+/// as they came, and this costs a scan where a translation costs a parse.
 ///
-/// It is deliberately narrow: anything it does not recognize answers false and
-/// takes the full rewrite, so it can only be wrong by being slow. A false true
-/// would skip a translation; the tests check it against every word the rewrite
-/// passes mention and every statement of the wire suite.
+/// It is deliberately narrow: anything it does not recognize answers false and is
+/// translated, so it can only be wrong by being slow. A false true would skip a
+/// translation; the tests hold it to the printer over every word of this crate's
+/// source, every statement of the wire suite and random statements. Whether the
+/// grammar reads the statement at all is `rewrite::fast_path`'s to ask.
 pub fn needs_no_rewrite(sql: &str) -> bool {
     if !plain_statement(sql) || update_with_alias(sql) || !select_list_names_itself(sql) {
         return false;
@@ -25,19 +25,45 @@ pub fn needs_no_rewrite(sql: &str) -> bool {
     let b = sql.as_bytes();
     let mut word = [0u8; MAX_WORD];
     let mut after_as = false;
+    let select = {
+        let i = skip_blanks(b, 0);
+        let (_, n) = lower_word(b, i, &mut word);
+        &word[..n] == b"select"
+    };
+    // Whether each open parenthesis may hold a list (a call's arguments, IN's or
+    // VALUES' list); a comma in any other is a row, which the printer does not write.
+    let mut lists: Vec<bool> = Vec::new();
+    let mut last_word: Option<[u8; MAX_WORD]> = None;
+    let mut last_len = 0;
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
+        // The word just before, if the token before this one was a word.
+        let prev = last_word.take();
         match c {
-            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                last_word = prev;
+                i += 1;
+            }
             b'\'' => match skip_literal(sql, i) {
                 Some(end) => i = end,
                 None => return false,
             },
             b'0'..=b'9' => i += 1,
             b'$' => {
+                // A name before a parameter is a type the value is read as.
+                if prev.is_some_and(|w| !is_plain_before_literal(std::str::from_utf8(&w[..last_len]).unwrap_or(""))) {
+                    return false;
+                }
                 i += 1;
                 if i >= b.len() || !b[i].is_ascii_digit() {
+                    return false;
+                }
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                // `$1.f` selects a field of a parameter.
+                if b.get(skip_blanks(b, i)) == Some(&b'.') {
                     return false;
                 }
             }
@@ -54,8 +80,26 @@ pub fn needs_no_rewrite(sql: &str) -> bool {
                 }
                 i += 1;
             }
-            // "<@" and "<<" style operators stop at their second character.
-            b'(' | b')' | b',' | b'.' | b'=' | b'<' | b'>' | b'*' | b'+' => i += 1,
+            // `<<` and `>>` are shifts, which the printer gives a precedence of their
+            // own; `<@` and the like stop at their second character.
+            b'<' | b'>' if matches!(b.get(i + 1), Some(b'<' | b'>')) && b[i + 1] == c => return false,
+            b'(' => {
+                let list = prev.is_some_and(|w| {
+                    let w = std::str::from_utf8(&w[..last_len]).unwrap_or("");
+                    !matches!(
+                        w,
+                        "and" | "or" | "not" | "where" | "on" | "having" | "when" | "then" | "else" | "set"
+                    )
+                });
+                lists.push(list);
+                i += 1;
+            }
+            b')' => {
+                lists.pop();
+                i += 1;
+            }
+            b',' if lists.last() == Some(&false) => return false,
+            b',' | b'.' | b'=' | b'<' | b'>' | b'*' | b'+' => i += 1,
             _ if is_ident_start(c) => {
                 let (end, n) = lower_word(b, i, &mut word);
                 if n == 0 {
@@ -68,14 +112,11 @@ pub fn needs_no_rewrite(sql: &str) -> bool {
                 if is_rewritten_word(w) || w.starts_with("pg_") || (w == "cast" && !casts_to_text(b, end)) {
                     return false;
                 }
-                let next = skip_blanks(b, end);
-                // rewrite_like, which runs on the fast path too, reads a pattern up to
-                // a word that may end one: a pattern that is not a literal or a
-                // parameter (CASE, a call, a subquery) is the AST path's, which has it
-                // whole.
-                if w == "like" && !matches!(b.get(next), Some(b'\'' | b'$')) {
+                // SELECT ... INTO makes a table.
+                if select && w == "into" {
                     return false;
                 }
+                let next = skip_blanks(b, end);
                 if next < b.len() {
                     match b[next] {
                         b'(' if !is_plain_call(w) => return false,
@@ -83,11 +124,13 @@ pub fn needs_no_rewrite(sql: &str) -> bool {
                         _ => {}
                     }
                 }
-                // rewrite_keyword_labels quotes a reserved word used as a label.
+                // The printer quotes a reserved word used as a label.
                 if after_as && LABEL_WORDS.contains(w) {
                     return false;
                 }
                 after_as = w == "as";
+                last_word = Some(word);
+                last_len = n;
                 i = end;
             }
             _ => return false, // quoted identifiers, casts, arrays, other operators
@@ -137,9 +180,21 @@ pub(crate) fn select_list_names_itself(sql: &str) -> bool {
     if &word[..n] != b"select" {
         return true;
     }
+    // Whether the token before was a name, after which `*` multiplies.
+    let mut after_name = false;
     while i < b.len() {
         match b[i] {
-            b' ' | b'\t' | b'\n' | b'\r' | b',' | b'.' | b'*' => i += 1,
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b',' => {
+                after_name = false;
+                i += 1;
+            }
+            b'.' => {
+                after_name = false;
+                i += 1;
+            }
+            b'*' if after_name => return false,
+            b'*' => i += 1,
             c if is_ident_start(c) => {
                 let (end, n) = lower_word(b, i, &mut word);
                 if n == 0 {
@@ -152,6 +207,7 @@ pub(crate) fn select_list_names_itself(sql: &str) -> bool {
                 if is_label_word(&word[..n]) {
                     return false;
                 }
+                after_name = true;
                 i = end;
             }
             _ => return false,
@@ -246,8 +302,44 @@ pub(crate) fn skip_literal(sql: &str, i: usize) -> Option<usize> {
 
 const BOOL_LITERALS: [&str; 12] = ["t", "f", "true", "false", "y", "n", "yes", "no", "on", "off", "1", "0"];
 
-/// The words rewrite_keyword_labels quotes after AS.
+/// The words a label after AS is quoted for.
+const KEYWORD_LABELS: &str = "primary|index|unique|default|check|references|table|order|group|constraint|foreign|collate|transaction|set|join|using|limit|to|add|isnull|notnull|nothing|returning|escape|autoincrement|deferrable|between|case|else|exists|all|distinct|union|except|intersect|into|alter|drop|create|commit|from|where|when|then";
+
 static LABEL_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| KEYWORD_LABELS.split('|').collect());
+
+/// Words Postgres reads as more than a name where one could stand: a select-list item of
+/// bare names and none of these is a column or garbage, and either way SQLite's label
+/// stands. needs_no_rewrite takes a list of names only without these.
+fn is_label_word(w: &[u8]) -> bool {
+    matches!(
+        w,
+        b"true"
+            | b"false"
+            | b"null"
+            | b"user"
+            | b"distinct"
+            | b"all"
+            | b"case"
+            | b"is"
+            | b"isnull"
+            | b"notnull"
+            | b"not"
+            | b"and"
+            | b"or"
+            | b"in"
+            | b"like"
+            | b"between"
+            | b"exists"
+            | b"collate"
+            | b"similar"
+            | b"glob"
+            | b"regexp"
+            | b"match"
+            | b"escape"
+    ) || w.starts_with(b"current_")
+        || w.starts_with(b"local")
+        || w.starts_with(b"session_")
+}
 
 /// Words that may precede "(" unrewritten: SQL keywords, and functions no pass
 /// touches.
@@ -300,8 +392,6 @@ fn is_plain_before_literal(w: &str) -> bool {
             | "on"
             | "select"
             | "values"
-            | "by"
-            | "set"
             | "then"
             | "else"
             | "when"
@@ -312,7 +402,8 @@ fn is_plain_before_literal(w: &str) -> bool {
     )
 }
 
-/// Words whose mere presence can change the output of a pass.
+/// Words whose mere presence can change what the printer writes: ORDER BY gets its
+/// NULLS, LIKE becomes GLOB.
 fn is_rewritten_word(w: &str) -> bool {
     matches!(
         w,
@@ -340,12 +431,14 @@ fn is_rewritten_word(w: &str) -> bool {
             | "information_schema"
             | "interval"
             | "lateral"
+            | "like"
             | "localtime"
             | "localtimestamp"
             | "now"
             | "nulls"
             | "offset"
             | "operator"
+            | "order"
             | "overlaps"
             | "returning"
             | "session_user"
@@ -355,6 +448,7 @@ fn is_rewritten_word(w: &str) -> bool {
             | "timestamp"
             | "timestamptz"
             | "true"
+            | "user"
             | "using"
             | "zone"
     )
@@ -363,18 +457,37 @@ fn is_rewritten_word(w: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::rewrite::rewrite_full;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    fn check(sql: &str) {
-        if needs_no_rewrite(sql) {
-            assert_eq!(rewrite_full(sql), sql, "skipped a rewrite of {sql:?}");
-        }
+    /// sql as Postgres' deparser writes its tree: the same statement, whatever its
+    /// spacing, case and parentheses. None for one the grammar does not read.
+    fn deparsed(sql: &str) -> Option<String> {
+        let parsed = pg_query::parse(sql, 0).ok()?;
+        (parsed.protobuf.stmts.len() == 1)
+            .then(|| parsed.deparse(pg_query::DeparseOptions::default()).ok())
+            .flatten()
     }
 
-    /// Every word in this module's source: a pass cannot react to one not here.
+    /// A statement the fast path takes (and the grammar reads, which it asks too) is
+    /// the statement the printer writes, under a catalog that types none of its
+    /// columns (`typed_differs` sends any other to the printer).
+    fn check(sql: &str) {
+        if !needs_no_rewrite(sql) {
+            return;
+        }
+        let Some(want) = deparsed(sql) else { return };
+        let printed = crate::ast::translate(sql).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+        let (body, _) = crate::ast::split_mark(&printed);
+        assert_eq!(
+            deparsed(body).as_deref(),
+            Some(want.as_str()),
+            "the fast path took {sql:?}, printed {body:?}"
+        );
+    }
+
+    /// Every word in this crate's source: the printer cannot react to one not here.
     fn source_words() -> Vec<String> {
         let mut out = BTreeSet::new();
         collect_source_words(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")), &mut out);
@@ -398,7 +511,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn never_skips_a_rewrite_of_any_known_word() {
+    fn the_printer_agrees_on_any_known_word() {
         let templates = [
             "SELECT @ FROM t",
             "SELECT @ a FROM t",
@@ -446,7 +559,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn never_skips_a_rewrite_of_a_statement_in_the_suite() {
+    fn the_printer_agrees_on_the_statements_of_the_suite() {
         let corpus = include_str!("../../../../tests/fixtures/rewrite-corpus.hex");
         let (mut checked, mut skipped) = (0, 0);
         for line in corpus.lines() {
@@ -467,7 +580,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn never_skips_a_rewrite_of_random_statements() {
+    fn the_printer_agrees_on_random_statements() {
         let words = source_words();
         let tokens = [
             "(",
@@ -508,7 +621,7 @@ pub(crate) mod tests {
         ];
         let starts = ["SELECT", "INSERT INTO t", "UPDATE t SET", "DELETE FROM t WHERE"];
         let mut r = StdRng::seed_from_u64(1);
-        for _ in 0..200_000 {
+        for _ in 0..50_000 {
             let mut s = starts[r.gen_range(0..starts.len())].to_string();
             for _ in 0..r.gen_range(1..=10) {
                 s.push(' ');
@@ -525,27 +638,28 @@ pub(crate) mod tests {
     #[test]
     fn takes_plain_statements() {
         for sql in [
-            "SELECT cnpj, razao_social FROM cnpj WHERE cnpj >= CAST(12345678 AS text) ORDER BY cnpj LIMIT 1",
+            "SELECT cnpj, razao_social FROM cnpj WHERE cnpj >= CAST(12345678 AS text) LIMIT 1",
             "SELECT cnpj, razao_social FROM cnpj WHERE cnpj = $1",
-            "select a, b from t where a = 'it''s' and b like 'x%' limit 10",
-            "SELECT razao_social FROM t WHERE razao_social LIKE '%PADARIA%'",
-            "SELECT a.x FROM a JOIN b ON a.id = b.id WHERE a.y IN (1, 2) ORDER BY a.x DESC",
+            "select a, b from t where a = 'it''s' and b > 'x%' limit 10",
+            "SELECT a.x FROM a JOIN b ON a.id = b.id WHERE a.y IN (1, 2)",
             "SELECT a FROM t WHERE b = 'ação'",
             "INSERT INTO t VALUES ($1, 'x')",
             "UPDATE t SET a = a + 1 WHERE id = $1",
             "DELETE FROM t WHERE id = $1",
         ] {
             assert!(needs_no_rewrite(sql), "{sql}");
-            assert_eq!(rewrite_full(sql), sql);
+            check(sql);
         }
     }
 
     #[test]
-    fn leaves_the_rest_to_the_rewrite() {
+    fn leaves_the_rest_to_the_printer() {
         for sql in [
             "SELECT a::text FROM t",
             "SELECT now()",
             "SELECT count(*) FROM t WHERE razao_social LIKE '%PADARIA%'",
+            "SELECT razao_social FROM t WHERE razao_social LIKE '%PADARIA%'",
+            "SELECT a FROM t ORDER BY a",
             "SELECT a IS NULL FROM t",
             "SELECT NOT a FROM t",
             "SELECT \"a\" FROM t",

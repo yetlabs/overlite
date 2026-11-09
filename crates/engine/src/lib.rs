@@ -52,9 +52,8 @@ pub use catalog::grants::{forget_table_rows_sql, move_table_rows_sql, set_sessio
 pub use catalog::schema::stored_table_name;
 pub use cluster::{Cluster, DEFAULT_MAX_OPEN_DATABASES, open_cluster, single};
 pub use error::{Error, ErrorKind, Result};
-pub use resolve::names::{Meets, NamedTable, ParamColumn, param_columns};
+pub use resolve::TYPED_MARK;
 pub use resolve::schema_qualify::split_stored_name;
-pub use resolve::{TYPED_MARK, type_passes_without_tables};
 pub use sql_funcs::function_ddl_target;
 pub use sql_funcs::rewrite::{FunctionCall, inline_function_body};
 pub use sqlite::{DbSession, InterruptHandle, Sqlite, ViewsAndTriggers};

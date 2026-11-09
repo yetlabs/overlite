@@ -14,7 +14,8 @@
 //! # }
 //! ```
 //!
-//! SQL goes through [`rewrite`], whose fast path is [`needs_no_rewrite`]:
+//! A client's statement goes through [`translate`], whose fast path is
+//! [`needs_no_rewrite`]; [`rewrite`] is the same for SQL the server writes itself:
 //!
 //! ```
 //! use overlite_postgres::{needs_no_rewrite, rewrite};
@@ -22,7 +23,7 @@
 //! assert!(needs_no_rewrite("SELECT id FROM t WHERE id = 1"));
 //! assert_eq!(
 //!     rewrite("SELECT a FROM t WHERE a ~ 'x'"),
-//!     "SELECT a FROM t WHERE a REGEXP 'x'"
+//!     "SELECT a FROM t WHERE a REGEXP 'x' /*overlite typed*/"
 //! );
 //! ```
 
@@ -42,5 +43,5 @@ pub const UNSTAMPED_LOG_TARGET: &str = "overlite::unstamped";
 
 pub use error::{Error, ErrorKind, Result};
 pub use protocol::Protocol;
-pub use rewrite::{needs_no_rewrite, rewrite, rewrite_full, translate};
+pub use rewrite::{needs_no_rewrite, rewrite, translate};
 pub use server::Server;

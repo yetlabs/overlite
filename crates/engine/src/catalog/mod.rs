@@ -52,7 +52,6 @@ use crate::catalog::type_mod::{
     type_numeric_precision, type_numeric_precision_radix, type_numeric_scale,
 };
 use crate::error::{Error, ErrorKind, Result, errf};
-use crate::resolve::booleans::bool_forms_json;
 use crate::sql_funcs::parse::identity_args;
 use crate::sql_funcs::{SqlFunc, func_by_oid_lookup};
 use crate::sqlite::{set_function_state, sqlite_error};
@@ -2119,4 +2118,32 @@ fn extreme(args: &[Value], want: std::cmp::Ordering) -> Value {
         }
     }
     best.cloned().unwrap_or(Value::Null)
+}
+
+/// The text a boolean column may hold for true, besides 1: what Postgres' boolin
+/// reads as true, in lower case, upper case and capitalized. Integers aside, these
+/// are what a client sends, so what the Go server stored.
+pub(crate) const TRUE_FORMS: &[&str] = &[
+    "t", "true", "y", "yes", "on", "T", "TRUE", "Y", "YES", "ON", "True", "Yes", "On",
+];
+/// The same for false, besides 0.
+pub(crate) const FALSE_FORMS: &[&str] = &[
+    "f", "false", "n", "no", "off", "F", "FALSE", "N", "NO", "OFF", "False", "No", "Off",
+];
+
+/// What overlite_bool_forms answers: the forms of v's truth value as a JSON array,
+/// `[null]` for NULL, so that `col IN` it is NULL as `col = NULL` is.
+pub(crate) fn bool_forms_json(b: Option<bool>) -> String {
+    let Some(b) = b else {
+        return "[null]".to_string();
+    };
+    let (n, words) = if b { ("1", TRUE_FORMS) } else { ("0", FALSE_FORMS) };
+    let mut out = format!("[{n}");
+    for w in words {
+        out.push_str(",\"");
+        out.push_str(w);
+        out.push('"');
+    }
+    out.push(']');
+    out
 }

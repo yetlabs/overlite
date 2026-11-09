@@ -7,20 +7,37 @@
 //! A table found that way is named by a key of its own (`#<n>`), which the consumer
 //! matches as an alias, so the same alias in two scopes cannot be confused.
 
-use overlite_engine::{Meets, NamedTable, ParamColumn};
+/// How a parameter meets a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Meets {
+    /// Compared with it, or in its IN list, BETWEEN or arithmetic: the column's type.
+    Value,
+    /// `col = ANY($n)`: an array of the column's type.
+    Array,
+}
+
+/// A column a parameter meets, by the parameter's number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParamColumn {
+    pub param: usize,
+    /// The parts in front of the column's name: an alias, a table, a schema and a
+    /// table, or none.
+    pub qualifier: Vec<String>,
+    pub column: String,
+    pub meets: Meets,
+}
+
+/// A table a statement names, for typing its parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamedTable {
+    /// As written, quotes and schema included.
+    pub text: String,
+    /// The parts of its name, lowercase and unquoted.
+    pub parts: Vec<String>,
+    pub alias: Option<String>,
+}
 use pg_query::NodeEnum;
 use pg_query::protobuf::{self as pb, SubLinkType};
-
-/// The tables and the parameter columns of a statement, None when it does not parse.
-pub(crate) fn param_columns(sql: &str) -> Option<(Vec<NamedTable>, Vec<ParamColumn>)> {
-    let parsed = crate::ast::parse::kept_or_new(sql).ok()?;
-    let [raw] = parsed.stmts.as_slice() else {
-        return None;
-    };
-    let mut w = Walker::default();
-    w.statement(raw.stmt.as_deref()?.node.as_ref()?);
-    Some((w.tables, w.out))
-}
 
 /// Where a parameter of an INSERT goes: a column of its list, or a place in the row
 /// of one without a list, which the table's column order names.
@@ -45,6 +62,13 @@ pub(crate) struct Facts {
 
 /// The facts of a statement the AST path translates, None for any other: those keep
 /// the text readers until their stage (docs/adr/0001-sql-ast.md).
+/// The tables a statement names and the column each parameter meets, by scope
+/// (`facts`).
+#[cfg(test)]
+pub(crate) fn param_columns(sql: &str) -> Option<(Vec<NamedTable>, Vec<ParamColumn>)> {
+    facts(sql).map(|f| (f.tables, f.refs))
+}
+
 pub(crate) fn facts(sql: &str) -> Option<Facts> {
     let parsed = crate::ast::parse::kept_or_new(sql).ok()?;
     let [raw] = parsed.stmts.as_slice() else {

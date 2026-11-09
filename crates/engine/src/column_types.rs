@@ -4,6 +4,7 @@
 
 use crate::blank::{blank_literals, code_only, is_word};
 use crate::builtins::casts::CastType;
+use crate::builtins::temporal::{Kind, result_kind};
 
 /// What a statement's text says of a computed column's type, which SQLite does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +81,7 @@ fn item_type(item: &str) -> TypeHint {
             && matching_close(item, call.len() - 1) == Some(item.len() - 1)
     };
     // A numeric in the form resolve/numeric.rs writes.
-    if crate::resolve::temporal::is_numeric_form(item) {
+    if is_numeric_form(item) {
         return TypeHint::Strong("DECIMALTEXT");
     }
     if closed("overlite_cast(") {
@@ -104,7 +105,7 @@ fn item_type(item: &str) -> TypeHint {
     }
     // A sum of dates, times or intervals: resolve/temporal.rs.
     if closed("overlite_tadd(") || closed("overlite_tsub(") || closed("overlite_tmul(") {
-        return crate::resolve::temporal::sum_decl(item).map_or(TypeHint::None, TypeHint::Strong);
+        return sum_decl(item).map_or(TypeHint::None, TypeHint::Strong);
     }
     // A cast to an array, as the rewrite writes one.
     if closed("overlite_assign(") {
@@ -476,6 +477,87 @@ fn last_top_level_as(code: &str) -> Option<usize> {
         }
     }
     found
+}
+
+/// Whether t is written in the numeric form, with or without its parentheses.
+pub(crate) fn is_numeric_form(t: &str) -> bool {
+    let t = t.trim();
+    let t = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t);
+    t.get(..5).is_some_and(|head| head.eq_ignore_ascii_case("CAST(")) && t.ends_with(" AS DECIMALTEXT) COLLATE DECIMAL")
+}
+
+/// What a call the printer writes gives, read from its text.
+fn call_kind(item: &str) -> Option<Kind> {
+    let t = item.trim();
+    let closed = |name: &str| {
+        t.len() > name.len() && t.get(..name.len()).is_some_and(|h| h.eq_ignore_ascii_case(name)) && t.ends_with(')')
+    };
+    let last_arg = || {
+        t[..t.len() - 1]
+            .rsplit(", '")
+            .next()
+            .map_or("", |a| a.trim_end_matches('\''))
+    };
+    if closed("overlite_cast(") {
+        return Kind::of_decl(last_arg());
+    }
+    for (name, sub) in [("overlite_tadd(", false), ("overlite_tsub(", true)] {
+        if closed(name) {
+            let args: Vec<&str> = t[..t.len() - 1].rsplitn(3, ", '").collect();
+            let kb = args.first().map(|a| a.trim_end_matches('\''))?;
+            let ka = args.get(1).map(|a| a.trim_end_matches('\''))?;
+            return result_kind(sub, Kind::of_name(ka)?, Kind::of_name(kb)?);
+        }
+    }
+    if [
+        "dec_add(",
+        "dec_sub(",
+        "dec_mul(",
+        "dec_div(",
+        "dec_round(",
+        "dec_greatest(",
+        "dec_least(",
+        "overlite_numeric_op(",
+    ]
+    .iter()
+    .any(|f| closed(f))
+        || is_numeric_form(t)
+    {
+        return Some(Kind::Decimal);
+    }
+    if closed("overlite_tmul(") {
+        return Some(Kind::Interval);
+    }
+    if closed("overlite_tz_in(") {
+        return Some(Kind::TimestampTz);
+    }
+    if closed("overlite_now(") || closed("overlite_clock_timestamp(") || closed("datetime(") {
+        return Some(Kind::TimestampTz);
+    }
+    if closed("date(") {
+        return Some(Kind::Date);
+    }
+    // AT TIME ZONE, as rewrite and time_zone.rs write it.
+    if closed("overlite_from_time_zone(") {
+        return Some(Kind::TimestampTz);
+    }
+    if closed("overlite_instant_at_time_zone(") || closed("overlite_column_at_time_zone(") {
+        return Some(Kind::Timestamp);
+    }
+    None
+}
+
+/// The declared type the protocol reads for a sum the printer wrote.
+pub(crate) fn sum_decl(item: &str) -> Option<&'static str> {
+    Some(match call_kind(item)? {
+        Kind::Date => "DATE",
+        Kind::Time => "TIME",
+        Kind::Timestamp => "TIMESTAMP",
+        Kind::TimestampTz => "TIMESTAMPTZ",
+        Kind::Interval => "INTERVAL",
+        Kind::Decimal => "DECIMALTEXT",
+        Kind::Number => return None,
+    })
 }
 
 #[cfg(test)]

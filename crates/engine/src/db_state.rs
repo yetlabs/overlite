@@ -3,7 +3,6 @@
 use crate::catalog::enums::{ENUM_OID_BAND_WIDTH, ENUM_OID_BASE};
 use crate::catalog::rls_cache::RlsCache;
 use crate::catalog::schema::db_name_from_path;
-use crate::resolve::booleans::BoolColumns;
 use overlite_core::sync::{MutexExt, RwLockExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -20,8 +19,6 @@ pub(crate) struct DbState {
     /// rebuilds the catalog views it built from the old set.
     schema_generation: AtomicU64,
     pub(crate) rls: RlsCache,
-    /// The boolean columns, as resolve_booleans reads them; None until first asked.
-    pub(crate) bools: RwLock<Option<Arc<BoolColumns>>>,
     /// The columns of the tables and views, as the AST path types them
     /// (table_types.rs); None until first asked.
     pub(crate) table_types: RwLock<Option<Arc<crate::table_types::TableTypes>>>,
@@ -48,7 +45,6 @@ pub(crate) fn state_for(path: &str) -> Arc<DbState> {
         schemas: RwLock::new(Arc::new(Vec::new())),
         schema_generation: AtomicU64::new(0),
         rls: RlsCache::default(),
-        bools: RwLock::new(None),
         table_types: RwLock::new(None),
         table_types_version: AtomicU64::new(0),
         func_names: RwLock::new(Arc::new(HashSet::new())),

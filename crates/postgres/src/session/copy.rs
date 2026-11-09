@@ -3,7 +3,6 @@
 //! and COPY (query) TO STDOUT, in text (default) and CSV formats.
 
 use crate::error::{Error, Result, errf};
-use crate::rewrite::rewrite;
 use crate::session::Session;
 use crate::session::utility::unquote_ident;
 use crate::wire::{
@@ -29,14 +28,6 @@ pub(crate) struct CopyStmt {
 }
 
 lazy_regex!(RE_COPY, r"(?is)^\s*COPY\s+(.*?)\s+(FROM\s+STDIN|TO\s+STDOUT)\s*(.*)$");
-
-impl CopyStmt {
-    /// The query of `COPY (query) TO STDOUT`, which the session translates alone.
-    #[cfg(test)]
-    pub(crate) fn query(&self) -> Option<&str> {
-        (!self.from_stdin && !self.query.is_empty()).then_some(self.query.as_str())
-    }
-}
 
 /// Parses a COPY statement, or returns None if it isn't one.
 pub(crate) fn parse_copy(sql: &str) -> Option<CopyStmt> {
@@ -194,10 +185,11 @@ impl Session {
     fn copy_in(&mut self, cs: &CopyStmt) -> Result<()> {
         let mut cols = cs.columns.clone();
         if cols.is_empty() {
-            let describe = match self
-                .db
-                .describe(&rewrite(&("SELECT * FROM ".to_string() + &cs.table)), &[], None)
-            {
+            let describe = match self.db.describe(
+                &self.rewrite_typed(&("SELECT * FROM ".to_string() + &cs.table)),
+                &[],
+                None,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     return self.c.send_error(e.sql_state(), e.message());

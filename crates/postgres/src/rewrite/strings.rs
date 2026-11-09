@@ -4,7 +4,6 @@ use crate::error::{Error, Result};
 use crate::rewrite::blank::{skip_block_comment, skip_line_comment};
 use crate::rewrite::catalog::is_word_byte;
 use crate::rewrite::index_from;
-use crate::rewrite::tokens::{CodeTokKind, code_tokens};
 use overlite_core::SqlState;
 use std::borrow::Cow;
 
@@ -370,12 +369,6 @@ fn decode_unicode_string(value: &str, escape: char) -> Result<String> {
     Ok(out)
 }
 
-/// normalize_literals for what has not been through it: a string it refuses stays as
-/// it is, for SQLite to refuse.
-pub(crate) fn rewrite_escape_strings(sql: &str) -> String {
-    normalize_literals(sql).map_or_else(|_| sql.to_string(), Cow::into_owned)
-}
-
 /// Returns the index just past the single-quoted string literal that starts at
 /// i (with '' treated as an escaped quote).
 pub(crate) fn end_of_string_literal(sql: &str, i: usize) -> usize {
@@ -414,133 +407,4 @@ pub(crate) fn map_outside_strings(sql: &str, mut f: impl FnMut(&str) -> String) 
     }
     b.push_str(&f(&sql[code_start..]));
     b
-}
-
-/// What stands for a literal's text while a pass runs: outside the characters anything
-/// spells, and any such character a client sent is inside a literal, held out with it.
-const HELD_OPEN: char = '\u{F0000}';
-const HELD_CLOSE: char = '\u{F0001}';
-
-/// Runs a pass that has no use for what literals say with their text held out of its
-/// sight, so that it can neither find its words there nor cut a literal apart. Each
-/// literal is one opaque literal to the pass, which may move or repeat it, and comes
-/// back byte for byte.
-pub(crate) fn holding_literals(sql: &str, pass: fn(&str) -> String) -> String {
-    if !sql.contains('\'') {
-        return pass(sql);
-    }
-    let mut held: Vec<&str> = Vec::new();
-    let mut masked = String::with_capacity(sql.len());
-    let mut at = 0;
-    for t in code_tokens(sql) {
-        if t.kind == CodeTokKind::Value && sql.as_bytes()[t.span.start] == b'\'' {
-            masked.push_str(&sql[at..t.span.start]);
-            masked.push('\'');
-            masked.push(HELD_OPEN);
-            masked.push_str(&held.len().to_string());
-            masked.push(HELD_CLOSE);
-            masked.push('\'');
-            held.push(&sql[t.span.clone()]);
-            at = t.span.end;
-        }
-    }
-    masked.push_str(&sql[at..]);
-    let out = pass(&masked);
-    if out == masked {
-        return sql.to_string();
-    }
-    let mut b = String::with_capacity(out.len() + sql.len());
-    let mut rest = out.as_str();
-    while let Some(open) = rest.find(HELD_OPEN) {
-        let Some(close) = rest[open..].find(HELD_CLOSE) else {
-            break;
-        };
-        let close = open + close;
-        // The quotes around the mark are the literal's own, which held has.
-        b.push_str(&rest[..open - 1]);
-        let i: usize = rest[open + HELD_OPEN.len_utf8()..close].parse().unwrap_or(0);
-        b.push_str(held[i]);
-        rest = &rest[close + HELD_CLOSE.len_utf8() + 1..];
-    }
-    b.push_str(rest);
-    b
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use crate::rewrite::assert_rewrites;
-
-    #[test]
-    fn holding_literals_gives_them_back() {
-        fn drop_word(sql: &str) -> String {
-            sql.replace("word", "").replace("a(", "a(1, ")
-        }
-        for (sql, want) in [
-            ("no literal word", "no literal "),
-            ("word 'word'", " 'word'"),
-            ("'it''s word' word 'x'", "'it''s word'  'x'"),
-            ("a('word', '')", "a(1, 'word', '')"),
-            ("'\u{F0000}0\u{F0001}' word", "'\u{F0000}0\u{F0001}' "),
-            ("-- it's word\n'word' word", "-- it's \n'word' "),
-            ("'unclosed word", "'unclosed word"),
-        ] {
-            assert_eq!(holding_literals(sql, drop_word), want, "{sql:?}");
-        }
-    }
-
-    #[test]
-    fn rewrite_escape_strings_cases() {
-        assert_rewrites(
-            rewrite_escape_strings,
-            &[
-                (r"array_to_string(x, E'\n')", "array_to_string(x, '\n')"),
-                (r"SELECT E'\t', a", "SELECT '\t', a"),
-                ("SELECT 'plain'", "SELECT 'plain'"),
-                (r"SELECT 'a\nb'", r"SELECT 'a\nb'"),
-                ("SELECT nextval('e')", "SELECT nextval('e')"),
-                ("SELECT ' escape '", "SELECT ' escape '"),
-                ("WHERE x = E'y'", "WHERE x = 'y'"),
-                (r"SELECT E'it\'s'", "SELECT 'it''s'"),
-                (r"SELECT E'a\\b''c'", r"SELECT 'a\b''c'"),
-                (r"SELECT E'\x41\101A\U00000041'", "SELECT 'AAAA'"),
-                (r"SELECT E'\xc3\xa9'", "SELECT 'é'"),
-                (r"SELECT E'\q'", "SELECT 'q'"),
-                (r"SELECT e'\x4'", "SELECT '\x04'"),
-                (r"SELECT E'😀'", "SELECT '😀'"),
-                ("SELECT E'a\n'\n  'b\\t'", "SELECT 'a\nb\t'"),
-                ("SELECT 'a'\n  'b''c'", "SELECT 'ab''c'"),
-                ("SELECT 'a' 'b'", "SELECT 'a' 'b'"),
-                (r"SELECT U&'d\0061t\+000061'", "SELECT 'data'"),
-                (r"SELECT U&'d!0061\t' UESCAPE '!'", r"SELECT 'da\t'"),
-                (r"SELECT u&'\\'", r"SELECT '\'"),
-                (r"SELECT 1 -- E'\n'", r"SELECT 1 -- E'\n'"),
-                (r#"SELECT "E'\n'" FROM t"#, r#"SELECT "E'\n'" FROM t"#),
-                (r"SELECT $$E'\n'$$", r"SELECT $$E'\n'$$"),
-                (r"SELECT type'\n'", r"SELECT type'\n'"),
-                (r"SELECT $1, E'\n'", "SELECT $1, '\n'"),
-            ],
-        );
-    }
-
-    #[test]
-    fn bad_strings_are_refused_as_postgres_refuses_them() {
-        for (sql, state) in [
-            (r"SELECT E'\xff'", "22021"),
-            (r"SELECT E'\0'", "22021"),
-            (r"SELECT E'\u12'", "22025"),
-            (r"SELECT E'\U0011FFFF'", "42601"),
-            (r"SELECT E'\uD83D'", "42601"),
-            (r"SELECT E'\uDE00'", "42601"),
-            (r"SELECT E'\u0000'", "42601"),
-            (r"SELECT E'\400'", "22021"),
-            (r"SELECT U&'\12'", "42601"),
-            (r"SELECT U&'\D83D'", "42601"),
-            (r"SELECT U&'\0000'", "42601"),
-            (r"SELECT E'abc", "42601"),
-        ] {
-            let err = normalize_literals(sql).unwrap_err();
-            assert_eq!(err.sql_state().as_str(), state, "{sql}");
-        }
-    }
 }

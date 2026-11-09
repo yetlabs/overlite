@@ -606,7 +606,7 @@ fn table_constraint(src: &Src, a: usize, b: usize, k: &pb::Constraint, edits: &m
 /// reads it alike.
 fn kept(src: &Src, a: usize, b: usize, printed: String) -> String {
     let written = src.span(a, b);
-    if crate::ast::compare::same_tokens(written, &printed) {
+    if same_tokens(written, &printed) {
         written.to_string()
     } else {
         printed
@@ -938,6 +938,46 @@ fn with_query(src: &Src, rel: Option<&pb::RangeVar>, query: Option<&pb::Node>) -
     let mut edits = Edits::default();
     edits.replace(src, as_ + 1, end, emit::statement(query)?);
     edits.apply(src.sql)
+}
+
+/// Whether two texts are the same SQL token for token, as Postgres' scanner reads them:
+/// spacing, the case of keywords, an optional AS and the quotes of a name that needs
+/// none apart. False for a text the scanner refuses.
+fn same_tokens(a: &str, b: &str) -> bool {
+    fn tokens(sql: &str) -> Option<Vec<String>> {
+        use pg_query::protobuf::{KeywordKind, Token};
+        let scanned = pg_query::scan(sql).ok()?;
+        let mut out = Vec::with_capacity(scanned.tokens.len());
+        for t in &scanned.tokens {
+            let text = sql.get(usize::try_from(t.start).ok()?..usize::try_from(t.end).ok()?)?;
+            let token = Token::try_from(t.token).unwrap_or(Token::Nul);
+            if matches!(token, Token::Ascii59 | Token::SqlComment | Token::CComment) {
+                continue;
+            }
+            if KeywordKind::try_from(t.keyword_kind).unwrap_or(KeywordKind::NoKeyword) != KeywordKind::NoKeyword {
+                let w = text.to_ascii_lowercase();
+                if !matches!(w.as_str(), "as" | "inner" | "outer") {
+                    out.push(w);
+                }
+                continue;
+            }
+            out.push(match token {
+                Token::Ident if text.starts_with('"') => {
+                    let name = &text[1..text.len() - 1];
+                    let plain = !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|c| c == b'_' || c.is_ascii_lowercase() || c.is_ascii_digit());
+                    if plain { name.to_string() } else { text.to_string() }
+                }
+                Token::Ident => text.to_ascii_lowercase(),
+                Token::NotEquals => "<>".to_string(),
+                _ => text.to_string(),
+            });
+        }
+        Some(out)
+    }
+    matches!((tokens(a), tokens(b)), (Some(x), Some(y)) if x == y)
 }
 
 #[cfg(test)]

@@ -7,7 +7,6 @@
 use crate::auth::rls::text_or_empty;
 use crate::ddl::truncate::is_truncate;
 use crate::error::{Result, errf};
-use crate::rewrite::rewrite;
 use crate::rewrite::tokens::code_tokens;
 use crate::session::Session;
 use crate::session::utility::first_word_upper;
@@ -427,7 +426,7 @@ impl Session {
             return Ok(None);
         }
         let probe = "SELECT ".to_string() + &args.join(", ") + " " + &sql[toks[from].span.start..];
-        let rows = self.exec(&rewrite(&probe), &[])?.rows;
+        let rows = self.exec(&self.rewrite_typed(&probe), &[])?.rows;
         let mut answers = Vec::with_capacity(rows.len());
         for row in &rows {
             let (Some(name), Some(value)) = (row.first(), row.get(1)) else {

@@ -3,9 +3,7 @@
 //! takes that write lock (the session does, by row_lock), which is a lock on every
 //! row; the clause itself is then dropped.
 
-use crate::rewrite::strings::map_outside_strings;
 use overlite_core::lazy_regex;
-use overlite_core::text::replace_all;
 
 // Matches the locking clause at the end of a SELECT, with its optional
 // table list and wait behaviour.
@@ -62,12 +60,4 @@ pub(crate) fn locked_table(sql: &str) -> String {
             last.trim_matches('"').to_string()
         })
         .unwrap_or_default()
-}
-
-/// Drops a row-locking clause from a SELECT.
-pub(crate) fn rewrite_row_lock(sql: &str) -> String {
-    if !sql.to_uppercase().contains(" FOR ") {
-        return sql.to_string();
-    }
-    map_outside_strings(sql, |code| replace_all(&RE_ROW_LOCK, code, ""))
 }

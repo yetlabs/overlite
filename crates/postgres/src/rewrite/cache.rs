@@ -559,7 +559,7 @@ mod tests {
     fn time_the_cache() {
         use std::hint::black_box;
         use std::time::Instant;
-        let stmts: Vec<(String, String)> = crate::ast::diff::corpus()
+        let stmts: Vec<(String, String)> = crate::ast::snapshot::corpus()
             .into_iter()
             .filter(|(_, s)| cacheable(s))
             .take(3000)

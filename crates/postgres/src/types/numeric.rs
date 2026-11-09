@@ -5,79 +5,7 @@
 //! affinity and lets overlite advertise OID 1700; the collation makes
 //! `<`/`>`/`ORDER BY` compare as numbers.
 
-use crate::rewrite::tokens::{CodeTok, CodeTokKind, code_tokens};
-use crate::session::utility::{first_word_upper, second_word_upper};
-
-/// Re-types numeric/decimal columns in a CREATE TABLE. It only touches CREATE
-/// TABLE so casts like `x::numeric` elsewhere are untouched. Any (precision,
-/// scale) is kept on the marker (DECIMALTEXT(10,2)) — SQLite ignores it for
-/// affinity, but information_schema.columns reports it.
-pub(crate) fn rewrite_numeric_columns(sql: &str) -> String {
-    if second_word_upper(sql) != "TABLE" {
-        return sql.to_string();
-    }
-    let dropped = drop_array_sizes(sql);
-    let sql = dropped.as_deref().unwrap_or(sql);
-    match first_word_upper(sql).as_str() {
-        "CREATE" => retype_numeric(sql),
-        // A column ADD COLUMN brings is one as CREATE TABLE's are.
-        "ALTER" if code_tokens(sql).iter().any(|t| t.depth == 0 && t.is_word(sql, "add")) => retype_numeric(sql),
-        "ALTER" => quote_modified_arrays(sql),
-        _ => sql.to_string(),
-    }
-}
-
-/// Drops the sizes of an array type in a column's definition: Postgres takes
-/// `double precision[2]` and `int[3][3]` and enforces neither, so they are `[]` and
-/// `[][]`. A bracket is a type's where a column's type is written: at the level of
-/// CREATE TABLE's column list, or the top level of an ALTER TABLE, after a word that
-/// is not ARRAY or after a type's modifier. A subscript sits deeper, in a CHECK's or
-/// generated column's parentheses. None when nothing changes.
-fn drop_array_sizes(sql: &str) -> Option<String> {
-    if !sql.contains('[') {
-        return None;
-    }
-    let toks = code_tokens(sql);
-    let create = first_word_upper(sql) == "CREATE";
-    // CREATE TABLE's column list is the first top-level parenthesis, unless AS comes first.
-    let (lo, hi, depth) = if create {
-        let open = toks
-            .iter()
-            .position(|t| t.depth == 0 && (t.is_punct(sql, "(") || t.is_word(sql, "as")))?;
-        if !toks[open].is_punct(sql, "(") {
-            return None;
-        }
-        let close = (open + 1..toks.len()).find(|&j| toks[j].depth == 0 && toks[j].is_punct(sql, ")"))?;
-        (open + 1, close, 1)
-    } else {
-        (0, toks.len(), 0)
-    };
-    let mut out = String::with_capacity(sql.len());
-    let mut at = 0;
-    for i in lo.max(1)..hi {
-        let t = &toks[i];
-        if t.depth != depth || !t.is_punct(sql, "[") {
-            continue;
-        }
-        let prev = &toks[i - 1];
-        let after_type = (prev.kind == CodeTokKind::Word && !prev.is_word(sql, "array"))
-            || prev.is_punct(sql, "]")
-            || prev.is_punct(sql, ")")
-            || (prev.kind == CodeTokKind::Value && sql[prev.span.clone()].starts_with('"'));
-        let size = toks
-            .get(i + 1)
-            .is_some_and(|n| n.kind == CodeTokKind::Word && sql[n.span.clone()].bytes().all(|c| c.is_ascii_digit()));
-        if after_type && size && toks.get(i + 2).is_some_and(|c| c.is_punct(sql, "]")) {
-            out.push_str(&sql[at..t.span.end]);
-            at = toks[i + 1].span.end;
-        }
-    }
-    if at == 0 {
-        return None;
-    }
-    out.push_str(&sql[at..]);
-    Some(out)
-}
+use crate::rewrite::tokens::{CodeTok, code_tokens};
 
 /// The types that take a modifier, and could have one before array brackets.
 const MODIFIED_TYPES: [&str; 12] = [
@@ -294,34 +222,4 @@ fn numeric_fields(weight: i16, sign: u16, dscale: u16, groups: &[u16]) -> Vec<u8
         out.extend_from_slice(&g.to_be_bytes());
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn array_sizes_are_dropped_from_types_only() {
-        let cases = [
-            (
-                "CREATE TABLE t (id int, f double precision[2], g int[3][3], h varchar(10)[2])",
-                "CREATE TABLE t (id int, f double precision[], g int[][], h \"varchar(10)[]\")",
-            ),
-            (
-                "CREATE TABLE t (a int[2] CHECK (a[1] > 0) DEFAULT ARRAY[1, 2])",
-                "CREATE TABLE t (a int[] CHECK (a[1] > 0) DEFAULT ARRAY[1, 2])",
-            ),
-            (
-                "ALTER TABLE t ADD COLUMN b text[4]",
-                "ALTER TABLE t ADD COLUMN b text[]",
-            ),
-            (
-                "CREATE TABLE t AS SELECT a[1] FROM u",
-                "CREATE TABLE t AS SELECT a[1] FROM u",
-            ),
-        ];
-        for (sql, want) in cases {
-            assert_eq!(rewrite_numeric_columns(sql), want, "{sql}");
-        }
-    }
 }

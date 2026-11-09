@@ -78,10 +78,6 @@ impl DbSession {
         let (st, q) = (&self.state, &self.conn);
         let (query, typed) = crate::resolve::split_typed(sql);
         let query = crate::sqlite::resolve_names(sp, st, q, query);
-        let query = match typed {
-            Some(_) => query,
-            None => std::borrow::Cow::Owned(crate::resolve::resolve_types(st, q, &query, args).into_owned()),
-        };
         let mut script = Script::new(q, &query);
         let Some(stmt) = script.next()? else {
             return Err(crate::error::errf!(SqlState::SYNTAX_ERROR, "a cursor needs a query"));

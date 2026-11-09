@@ -46,18 +46,6 @@ impl Kind {
         })
     }
 
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Kind::Date => "DATE",
-            Kind::Time => "TIME",
-            Kind::Timestamp => "TIMESTAMP",
-            Kind::TimestampTz => "TIMESTAMPTZ",
-            Kind::Interval => "INTERVAL",
-            Kind::Number => "NUMBER",
-            Kind::Decimal => "DECIMAL",
-        }
-    }
-
     pub(crate) fn of_name(name: &str) -> Option<Kind> {
         Some(match name {
             "DATE" => Kind::Date,
