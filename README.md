@@ -1,14 +1,10 @@
-<p align="center">
-  <img src="assets/logo/overlite-mark.svg" alt="" width="160">
-</p>
+<img src="assets/logo/overlite-mark.svg" alt="Overlite" width="120">
 
-<h1 align="center">Overlite</h1>
+# Overlite
 
-<p align="center">
-  <a href="https://github.com/yetlabs/overlite/actions/workflows/ci.yml"><img src="https://github.com/yetlabs/overlite/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <a href="https://github.com/yetlabs/overlite/releases/latest"><img src="https://img.shields.io/github/v/release/yetlabs/overlite?label=release" alt="release"></a>
-  <a href="https://hub.docker.com/r/yetlabs/overlite"><img src="https://img.shields.io/docker/v/yetlabs/overlite?label=docker&sort=semver" alt="docker"></a>
-</p>
+[![ci](https://github.com/yetlabs/overlite/actions/workflows/ci.yml/badge.svg)](https://github.com/yetlabs/overlite/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/yetlabs/overlite?label=release)](https://github.com/yetlabs/overlite/releases/latest)
+[![docker](https://img.shields.io/docker/v/yetlabs/overlite?label=docker&sort=semver)](https://hub.docker.com/r/yetlabs/overlite)
 
 **Speak PostgreSQL, store SQLite.** Overlite is a lightweight server that talks
 the PostgreSQL wire protocol on the front and keeps all your data in a single
