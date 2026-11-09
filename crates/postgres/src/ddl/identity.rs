@@ -204,13 +204,12 @@ impl Session {
     fn identity_sequence(&mut self, stored: &str, column: &str, options: &str, after: Option<i64>) -> Result<()> {
         let (_, relation) = split_stored_name(stored);
         let seq = relation + "_" + column + "_seq";
-        let mut tokens: Vec<String> = vec![quote_ident(&seq)];
-        tokens.extend(options.split_whitespace().map(str::to_string));
-        if let Some(after) = after.filter(|_| !options.to_ascii_lowercase().contains("start")) {
-            tokens.extend(["START".to_string(), "WITH".to_string(), (after + 1).to_string()]);
+        let mut opts = crate::ddl::sequences::sequence_options_text(options);
+        if let Some(after) = after.filter(|_| !opts.start_set) {
+            opts.start = after + 1;
+            opts.start_set = true;
         }
-        let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        self.create_sequence(&tokens)?;
+        self.create_sequence(&seq, false, &opts)?;
         let (t, c) = (quote_literal(stored), quote_literal(column));
         self.exec(
             &format!(

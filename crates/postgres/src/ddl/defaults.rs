@@ -12,7 +12,7 @@ use crate::rewrite::strings::end_of_string_literal;
 use crate::rewrite::tokens::code_tokens;
 use crate::session::Session;
 use crate::session::utility::{first_word_upper, second_word_upper, unquote_ident};
-use overlite_core::text::{eq_fold, quote_ident, quote_literal, slice, split_words};
+use overlite_core::text::{eq_fold, quote_literal, slice, split_words};
 use overlite_engine::{code_only, stored_table_name};
 use std::collections::HashSet;
 
@@ -70,8 +70,7 @@ impl Session {
                 continue;
             }
             let seq = [relation.as_str(), "_", &unquote_ident(&name), "_seq"].concat();
-            let quoted = quote_ident(&seq);
-            let _ = self.create_sequence(&["IF", "NOT", "EXISTS", quoted.as_str()]);
+            let _ = self.create_sequence(&seq, true, &crate::ddl::sequences::default_seq_options());
             // The mark says the sequence is the column's own, as pg_depend and
             // pg_get_serial_sequence read it; a default on any other sequence is no serial.
             let cons = [

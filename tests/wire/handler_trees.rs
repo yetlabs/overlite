@@ -77,3 +77,17 @@ fn comment_on_reads_its_object_and_drops_an_empty_comment() {
         .unwrap_err();
     assert_eq!(err.code(), "42704");
 }
+
+// ALTER SEQUENCE IF EXISTS s altered a sequence named "if", and any ALTER SEQUENCE
+// without CYCLE turned a cycling sequence's CYCLE off.
+#[test]
+fn alter_sequence_reads_its_name_and_options() {
+    let conn = connect(&start_server());
+    must_exec(&conn, "CREATE SEQUENCE s");
+    must_exec(&conn, "ALTER SEQUENCE IF EXISTS s INCREMENT BY 5");
+    let next = |seq: &str| query_column(&conn, &format!("SELECT nextval('{seq}')::text"), 0);
+    assert_eq!((next("s"), next("s")), (vec!["1".to_string()], vec!["6".to_string()]));
+    must_exec(&conn, "CREATE SEQUENCE c MAXVALUE 2 CYCLE");
+    must_exec(&conn, "ALTER SEQUENCE c INCREMENT BY 1");
+    assert_eq!([next("c"), next("c"), next("c")].concat(), ["1", "2", "1"]);
+}
