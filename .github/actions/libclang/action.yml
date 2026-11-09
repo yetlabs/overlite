@@ -37,7 +37,8 @@ runs:
         } else {
           $flavor = if ($env:RUNNER_ARCH -eq 'ARM64') { 'woa64' } else { 'win64' }
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-$flavor.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm.exe"
+          # GitHub's release CDN has answered 504 here; retry before failing.
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm.exe" -MaximumRetryCount 5 -RetryIntervalSec 15
           # NSIS: /S is silent, /D the directory, last and unquoted.
           Start-Process -Wait -FilePath "$env:RUNNER_TEMP\llvm.exe" -ArgumentList '/S', '/D=C:\llvm'
           $bin = 'C:\llvm\bin'
@@ -53,6 +54,19 @@ runs:
     # cc runs cl.exe and bindgen's clang reads the MSVC headers: INCLUDE, LIB and
     # PATH as the Developer Command Prompt of the runner's architecture sets them.
     - if: runner.os == 'Windows'
-      uses: ilammy/msvc-dev-cmd@v1
+      uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
       with:
         arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+
+    # With that environment set, rustc runs whichever link.exe comes first on
+    # PATH, and a `shell: bash` step puts Git's /usr/bin first, whose link.exe is
+    # the coreutils one. Name MSVC's linker outright, so every shell gets it.
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $link = (Get-Command link.exe -CommandType Application | Select-Object -First 1).Source
+        if ($link -notlike '*\VC\Tools\MSVC\*') { throw "first link.exe on PATH is $link, not MSVC's" }
+        $triple = if ($env:RUNNER_ARCH -eq 'ARM64') { 'AARCH64_PC_WINDOWS_MSVC' } else { 'X86_64_PC_WINDOWS_MSVC' }
+        "CARGO_TARGET_${triple}_LINKER=$link" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        Write-Output "linker: $link"
