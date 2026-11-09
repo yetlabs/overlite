@@ -5,8 +5,9 @@
 
 use crate::types::range::{OID_TSTZRANGE, range_array_oid_for_decl, range_of_array};
 use crate::types::{
-    OID_BOOL, OID_BYTEA, OID_DATE, OID_FLOAT8, OID_INT2, OID_INT4, OID_INT8, OID_JSON, OID_JSONB, OID_NUMERIC,
-    OID_TEXT, OID_TIME, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID, OID_VARCHAR, encode_binary, oid_from_decl_type,
+    OID_BOOL, OID_BYTEA, OID_DATE, OID_FLOAT8, OID_HSTORE, OID_INT2, OID_INT4, OID_INT8, OID_JSON, OID_JSONB,
+    OID_NUMERIC, OID_TEXT, OID_TIME, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_UUID, OID_VARCHAR, encode_binary,
+    oid_from_decl_type,
 };
 use overlite_core::text::{eq_fold, text_from_bytes, text_to_bytes};
 use overlite_core::{Oid, Value, format_float};
@@ -31,6 +32,8 @@ const OID_JSON_ARR: Oid = Oid::new(199);
 const OID_JSONB_ARR: Oid = Oid::new(3807);
 const OID_TIME_ARR: Oid = Oid::new(1183);
 const OID_TIMESTAMPTZ_ARR: Oid = Oid::new(1185);
+/// hstore[], as the catalog's pg_type gives hstore's typarray.
+const OID_HSTORE_ARR: Oid = Oid::new(16401);
 /// The arrays of the range types (types::range).
 const RANGE_ARRAYS: [Oid; 6] = [
     Oid::new(3905),
@@ -59,6 +62,7 @@ static ARRAY_OIDS: LazyLock<HashMap<Oid, bool>> = LazyLock::new(|| {
         (OID_JSONB_ARR, true),
         (OID_TIME_ARR, true),
         (OID_TIMESTAMPTZ_ARR, true),
+        (OID_HSTORE_ARR, true),
         (RANGE_ARRAYS[0], true),
         (RANGE_ARRAYS[1], true),
         (RANGE_ARRAYS[2], true),
@@ -84,6 +88,9 @@ pub(crate) fn array_oid_for_decl(decl: &str) -> Oid {
     let elem = d.strip_suffix("[]").unwrap_or(d).trim();
     if let Some(oid) = range_array_oid_for_decl(elem) {
         return oid;
+    }
+    if eq_fold(elem.trim_matches('"'), "hstore") {
+        return OID_HSTORE_ARR;
     }
     let oid = oid_from_decl_type(elem);
     if oid == OID_TIMESTAMPTZ {
@@ -125,7 +132,7 @@ pub(crate) fn json_array_to_pg_text(oid: Oid, v: &Value) -> Vec<u8> {
     };
     match json_decode_first(&s) {
         // A timestamptz's elements, and a tstzrange's bounds, in the session's zone.
-        Some(Json::Arr(arr)) if matches!(array_elem_oid(oid), OID_TIMESTAMPTZ | OID_TSTZRANGE) => {
+        Some(Json::Arr(arr)) if matches!(array_elem_oid(oid), OID_TIMESTAMPTZ | OID_TSTZRANGE | OID_HSTORE) => {
             let elem = array_elem_oid(oid);
             pg_array_text(&in_session_zone(arr, elem)).into_bytes()
         }
@@ -136,11 +143,14 @@ pub(crate) fn json_array_to_pg_text(oid: Oid, v: &Value) -> Vec<u8> {
 }
 
 /// The elements of a timestamptz or tstzrange array as their text in the session's
-/// zone, at any depth.
+/// zone, and of an hstore array in hstore's text, at any depth.
 fn in_session_zone(arr: Vec<Json>, elem: Oid) -> Vec<Json> {
     arr.into_iter()
         .map(|j| match j {
             Json::Arr(inner) => Json::Arr(in_session_zone(inner, elem)),
+            // An hstore element, a JSON object, or the text of one, in hstore's form.
+            Json::Obj(_) if elem == OID_HSTORE => Json::Str(crate::types::hstore::hstore_text(&json_marshal(&j))),
+            Json::Str(s) if elem == OID_HSTORE => Json::Str(crate::types::hstore::hstore_text(&s)),
             Json::Str(s) => Json::Str(if elem == OID_TSTZRANGE {
                 crate::types::range::range_text(elem, &s)
             } else {
@@ -169,6 +179,7 @@ fn array_elem_oid(oid: Oid) -> Oid {
         OID_JSONB_ARR => OID_JSONB,
         OID_TIME_ARR => OID_TIME,
         OID_TIMESTAMPTZ_ARR => OID_TIMESTAMPTZ,
+        OID_HSTORE_ARR => OID_HSTORE,
         o => range_of_array(o).unwrap_or(OID_TEXT),
     }
 }

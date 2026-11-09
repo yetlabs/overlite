@@ -67,7 +67,7 @@ const OID_INTERVAL: Oid = Oid::new(1186);
 const OID_UUID: Oid = Oid::new(2950);
 const OID_JSONB: Oid = Oid::new(3802);
 /// hstore has a per-database OID in Postgres; a fixed sentinel here.
-const OID_HSTORE: Oid = Oid::new(16400);
+pub(crate) const OID_HSTORE: Oid = Oid::new(16400);
 
 /// A declared type we can advertise faithfully, before value sampling.
 fn strict_decl_oid(decl: &str) -> Option<Oid> {

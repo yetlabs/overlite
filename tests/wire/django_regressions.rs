@@ -605,3 +605,30 @@ fn a_portal_is_described_in_its_formats() {
     let r = conn.exec_params::<&[u8]>("SELECT 1::int4", &[], &[], &[], &[]).unwrap();
     assert_eq!(r.fields[0].format, 0);
 }
+
+// An hstore[] went out as a text[] of JSON objects; it is hstore's array type, its
+// elements in hstore's text, and in binary each element as hstore_send lays it out.
+#[test]
+fn an_hstore_array_is_one() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE EXTENSION IF NOT EXISTS hstore");
+    must_exec(&conn, "CREATE TABLE hs (a hstore[])");
+    must_exec(
+        &conn,
+        r#"INSERT INTO hs VALUES (E'{"\\"a\\"=>\\"1\\",\\"b\\"=>\\"B\\"","\\"2\\"=>\\"c\\""}'::hstore[])"#,
+    );
+    let array_oid = rows(&conn, "SELECT typarray FROM pg_type WHERE typname = 'hstore'");
+    let (oids, cells) = texts(&conn, "SELECT a FROM hs");
+    assert_eq!(vec![oids[0].to_string()], array_oid);
+    assert_eq!(cells, [[r#"{"\"a\"=>\"1\", \"b\"=>\"B\"","\"2\"=>\"c\""}"#]]);
+    let r = conn
+        .exec_params::<&[u8]>("SELECT a FROM hs", &[], &[], &[], &[1])
+        .unwrap();
+    let b = r.rows[0][0].as_deref().unwrap();
+    // One dimension, no NULL, hstore's oid, two elements from 1.
+    assert_eq!(&b[..4], [0, 0, 0, 1]);
+    assert_eq!(&b[12..20], [0, 0, 0, 2, 0, 0, 0, 1]);
+    // The first element: its length, then hstore_send's pair count.
+    assert_eq!(&b[20..28], [0, 0, 0, 0x18, 0, 0, 0, 2]);
+}
