@@ -1,15 +1,16 @@
 //! GRANT/REVOKE handling and table-ownership tracking. These write the internal
 //! _overlite_grants / _overlite_owners tables that privileges.rs reads.
 
-use crate::auth::privileges::{Privilege, Word, owned_tables, table_name};
+use crate::auth::privileges::Privilege;
 use crate::ddl::alter::split_qualified_ref;
 use crate::ddl::sequences::is_ident_part;
+use crate::ddl::tree::{self, Role};
 use crate::error::{Result, errf};
 use crate::session::Session;
 use crate::session::utility::{first_word_upper, second_word_upper};
-use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted, split_words, trim_chars, trim_end_chars};
+use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted};
 use overlite_core::{Command, SqlState, Value};
-use overlite_engine::{code_only, forget_table_rows_sql, split_stored_name, stored_table_name};
+use overlite_engine::{forget_table_rows_sql, split_stored_name, stored_table_name};
 use pg_query::NodeEnum;
 use pg_query::protobuf as pb;
 
@@ -35,24 +36,31 @@ impl Session {
         if let Some(r) = self.try_function_acl(sql) {
             return r;
         }
-        if eq_fold(&first_word_upper(sql), "ALTER") {
+        // What is left of is_grant's statements once try_function_acl has its own:
+        // an ALTER of a function this server does not model.
+        let Some(plan) = tree::statement(sql, |n| Ok(grant_plan(sql, n)))? else {
             return Err(errf!(
                 SqlState::FEATURE_NOT_SUPPORTED,
                 "ALTER FUNCTION supports OWNER TO and SECURITY DEFINER | INVOKER only"
             ));
-        }
-        let revoke = eq_fold(&first_word_upper(sql), "REVOKE");
-        let tag = Command::from(if revoke { "REVOKE" } else { "GRANT" });
-
-        // No ON clause => role membership: GRANT <role> TO <member>.
-        if index_word(&code_only(sql).to_ascii_lowercase(), "on").is_none() {
-            self.apply_role_grant(sql, revoke)?;
-            return Ok(tag);
-        }
-
-        let Some((privs, tables, grantees)) = parse_grant(sql, revoke) else {
-            return Ok(tag); // shape we don't model (roles, schemas, ...): no-op
         };
+        let (revoke, privs, tables, grantees) = match plan {
+            GrantPlan::Roles(rg) => {
+                let revoke = rg.revoke;
+                self.apply_role_grant(&rg)?;
+                return Ok(Command::from(if revoke { "REVOKE" } else { "GRANT" }));
+            }
+            // A shape not modelled (schemas, sequences, ALL TABLES IN SCHEMA...): no-op.
+            GrantPlan::Other { revoke } => return Ok(Command::from(if revoke { "REVOKE" } else { "GRANT" })),
+            GrantPlan::Tables {
+                revoke,
+                privs,
+                tables,
+                grantees,
+            } => (revoke, privs, tables, grantees),
+        };
+        let tag = Command::from(if revoke { "REVOKE" } else { "GRANT" });
+        let grantees: Vec<String> = grantees.iter().map(|g| self.grantee_name(g)).collect();
         let tables: Vec<String> = tables.iter().map(|t| self.stored_name(t)).collect();
         for tbl in &tables {
             if self.table_ddl(tbl).is_empty() && !self.is_view(tbl) {
@@ -190,11 +198,11 @@ impl Session {
     /// Records or removes role membership for GRANT <role> TO <member> / REVOKE
     /// [ADMIN OPTION FOR] <role> FROM <member>. Only a superuser or a holder of
     /// ADMIN OPTION on the role may administer its membership.
-    fn apply_role_grant(&mut self, sql: &str, revoke: bool) -> Result<()> {
-        let Some(rg) = parse_role_grant(sql, revoke) else {
-            return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in role grant"));
-        };
-        for role in &rg.roles {
+    fn apply_role_grant(&mut self, rg: &RoleGrant) -> Result<()> {
+        let revoke = rg.revoke;
+        let roles: Vec<String> = rg.roles.iter().map(|g| self.grantee_name(g)).collect();
+        let members: Vec<String> = rg.members.iter().map(|g| self.grantee_name(g)).collect();
+        for role in &roles {
             if !self.can_grant_membership(role) {
                 return Err(errf!(
                     SqlState::INSUFFICIENT_PRIVILEGE,
@@ -202,7 +210,7 @@ impl Session {
                     quoted(role)
                 ));
             }
-            for mem in &rg.members {
+            for mem in &members {
                 if revoke {
                     if rg.admin_only {
                         // REVOKE ADMIN OPTION FOR: keep membership, drop the option.
@@ -256,6 +264,16 @@ impl Session {
         Ok(())
     }
 
+    /// The name a grantee or a granted role stands for.
+    fn grantee_name(&self, r: &Role) -> String {
+        match r {
+            Role::Named(n) => n.clone(),
+            Role::Current => self.current_role.clone(),
+            Role::Session => self.session_user.clone(),
+            Role::Public => "public".to_string(),
+        }
+    }
+
     /// Whether the current role may grant/revoke membership in role: a
     /// superuser/unmanaged role, or a holder of ADMIN OPTION.
     fn can_grant_membership(&mut self, role: &str) -> bool {
@@ -267,73 +285,34 @@ impl Session {
     /// statement. A row holds the table's stored name, as privileges read it.
     pub(crate) fn record_ownership(&mut self, sql: &str) {
         self.record_function_owner(sql);
-        let f = split_words(sql);
-        // A view is its creator's, as a table is: it reads with its owner's privileges.
-        if f.len() >= 3 && eq_fold(f[0], "create") {
-            let or_replace = eq_fold(f[1], "or") && f.len() > 4;
-            let kind = if or_replace { 3 } else { 1 };
-            let kind = kind
-                + f[kind..]
-                    .iter()
-                    .take_while(|w| eq_fold(w, "temp") || eq_fold(w, "temporary"))
-                    .count();
-            if f.get(kind).is_some_and(|w| eq_fold(w, "view")) {
-                let mut at = kind + 1;
-                if f.get(at).is_some_and(|w| eq_fold(w, "if")) {
-                    at += 3;
-                }
-                let name = f.get(at).map(|n| n.split('(').next().unwrap_or(n)).unwrap_or_default();
-                if !name.is_empty() {
-                    let conflict = if or_replace { "IGNORE" } else { "REPLACE" };
-                    let q = format!(
-                        "INSERT OR {conflict} INTO _overlite_owners (tablename, owner) VALUES ({}, {})",
-                        quote_literal(&self.stored_name(name)),
-                        quote_literal(&self.current_role)
-                    );
-                    let _ = self.exec(&q, &[]);
-                }
-                return;
-            }
-        }
-        if f.len() >= 3 && eq_fold(f[0], "drop") && eq_fold(f[1], "view") {
-            let mut at = 2;
-            if f.get(2).is_some_and(|w| eq_fold(w, "if")) {
-                at = 4;
-            }
-            for name in f[at.min(f.len())..].join(" ").split(',') {
-                let name = name.split_whitespace().next().unwrap_or_default().trim_end_matches(';');
-                if name.is_empty() || eq_fold(name, "cascade") || eq_fold(name, "restrict") {
-                    continue;
-                }
-                let stored = self.stored_name(name);
-                self.forget_table(&stored);
-            }
+        let Some(plan) = tree::read(sql, ownership_plan) else {
             return;
-        }
-        if f.len() < 3 || !eq_fold(f[1], "table") {
-            return;
-        }
-        if eq_fold(f[0], "create") {
-            let name = created_table_name(&f[2..]);
-            if !name.is_empty() {
-                // IF NOT EXISTS may have created nothing, and then takes nothing.
-                let conflict = if eq_fold(f[2], "if") { "IGNORE" } else { "REPLACE" };
+        };
+        match plan {
+            Ownership::Create { table, replace } => {
+                let conflict = if replace { "REPLACE" } else { "IGNORE" };
                 let q = format!(
                     "INSERT OR {conflict} INTO _overlite_owners (tablename, owner) VALUES ({}, {})",
-                    quote_literal(&self.stored_name(&name)),
+                    quote_literal(&self.stored_name(&table)),
                     quote_literal(&self.current_role)
                 );
                 let _ = self.exec(&q, &[]);
             }
-        } else if eq_fold(f[0], "drop") {
-            for r in owned_tables(sql) {
-                for name in self.names_of(r.table) {
-                    self.forget_table(&name);
+            Ownership::DropViews(views) => {
+                for v in views {
+                    let stored = self.stored_name(&v);
+                    self.forget_table(&stored);
                 }
             }
-            self.rls_changed();
-        } else if eq_fold(f[0], "alter") {
-            self.follow_columns(sql);
+            Ownership::DropTables(tables) => {
+                for t in tables {
+                    for name in self.names_of(&t) {
+                        self.forget_table(&name);
+                    }
+                }
+                self.rls_changed();
+            }
+            Ownership::Alter => self.follow_columns(sql),
         }
     }
 
@@ -418,67 +397,107 @@ impl Session {
     }
 }
 
+/// What a statement changes of the owners _overlite_owners keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    /// A table or view made by the current role; replace: whether it takes the place
+    /// of a row for that name (not after IF NOT EXISTS or OR REPLACE, which may have
+    /// made nothing new).
+    Create {
+        table: String,
+        replace: bool,
+    },
+    DropViews(Vec<String>),
+    DropTables(Vec<String>),
+    /// Any ALTER: its columns' grants follow it.
+    Alter,
+}
+
+/// The ownership change a statement makes, read from its node. A temporary or
+/// unlogged table records none, as before: only a permanent table's name is a stored
+/// name the owners' rows can hold.
+pub(crate) fn ownership_plan(n: &NodeEnum) -> Option<Ownership> {
+    let refs = |objects: &[pb::Node]| -> Vec<String> {
+        objects
+            .iter()
+            .filter_map(|o| match &o.node {
+                Some(NodeEnum::List(l)) => Some(tree::reference_of(&tree::strings(&l.items))),
+                _ => None,
+            })
+            .collect()
+    };
+    match n {
+        NodeEnum::ViewStmt(v) => Some(Ownership::Create {
+            table: tree::reference(v.view.as_ref()?),
+            replace: !v.replace,
+        }),
+        NodeEnum::CreateStmt(c) => {
+            let r = c.relation.as_ref()?;
+            (r.relpersistence == "p").then(|| Ownership::Create {
+                table: tree::reference(r),
+                replace: !c.if_not_exists,
+            })
+        }
+        NodeEnum::CreateTableAsStmt(c) if tree::object(c.objtype) == pb::ObjectType::ObjectTable => {
+            let r = c.into.as_ref()?.rel.as_ref()?;
+            (r.relpersistence == "p").then(|| Ownership::Create {
+                table: tree::reference(r),
+                replace: !c.if_not_exists,
+            })
+        }
+        NodeEnum::DropStmt(d) => match tree::object(d.remove_type) {
+            pb::ObjectType::ObjectView => Some(Ownership::DropViews(refs(&d.objects))),
+            pb::ObjectType::ObjectTable => Some(Ownership::DropTables(refs(&d.objects))),
+            _ => None,
+        },
+        NodeEnum::AlterTableStmt(_) | NodeEnum::RenameStmt(_) => Some(Ownership::Alter),
+        _ => None,
+    }
+}
+
 /// The parsed form of a role-membership GRANT/REVOKE.
-#[derive(Clone, Debug, Default)]
-struct RoleGrant {
-    roles: Vec<String>,
-    members: Vec<String>,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoleGrant {
+    revoke: bool,
+    roles: Vec<Role>,
+    members: Vec<Role>,
     /// GRANT ... WITH ADMIN OPTION
     admin: bool,
     /// REVOKE ADMIN OPTION FOR ...
     admin_only: bool,
 }
 
-/// Splits "GRANT r1, r2 TO m1, m2 [WITH ADMIN OPTION]" or "REVOKE [ADMIN OPTION
-/// FOR] r1 FROM m1" into its parts.
-fn parse_role_grant(sql: &str, revoke: bool) -> Option<RoleGrant> {
-    let sep = if revoke { "from" } else { "to" };
-    // Keywords are read in the code, as a quoted name can spell one.
-    let low = code_only(sql).to_ascii_lowercase();
-    let sep_idx = index_word(&low, sep)?;
-    let roles_at = first_word_end(sql);
-    let mut roles_spec = &sql[roles_at..sep_idx];
-    let mem_at = sep_idx + sep.len();
-    let mem_low = &low[mem_at..];
-    let mut mem_end = mem_low.len();
-
-    let mut rg = RoleGrant::default();
-    // GRANT ... WITH ADMIN OPTION
-    if let Some(k) = mem_low.find("with admin") {
-        rg.admin = true;
-        mem_end = k;
-    }
-    // REVOKE ADMIN OPTION FOR <role> FROM ...
-    if let Some(rest) = low[roles_at..sep_idx].trim_start().strip_prefix("admin option for") {
-        rg.admin_only = true;
-        roles_spec = &roles_spec[roles_spec.len() - rest.len()..];
-    }
-    for tail in [" granted by", " cascade", " restrict"] {
-        if let Some(k) = mem_low[..mem_end].find(tail) {
-            mem_end = k;
-        }
-    }
-    let mem_spec = trim_end_chars(&sql[mem_at..mem_at + mem_end], "; \t\n");
-    rg.roles = split_grantees(roles_spec);
-    rg.members = split_grantees(mem_spec);
-    if rg.roles.is_empty() || rg.members.is_empty() {
-        return None;
-    }
-    Some(rg)
-}
-
-/// A column a GRANT names: folded to lower case unless quoted.
+/// A column a GRANT names, as Postgres reads it (folded unless quoted).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GrantColumn {
     name: String,
+    /// Written quoted: it matches its column exactly, and only then.
     quoted: bool,
 }
 
 /// One privilege of a GRANT: SELECT, ALL, ..., with the columns it is limited to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PrivSpec {
+pub(crate) struct PrivSpec {
     name: String,
     columns: Option<Vec<GrantColumn>>,
+}
+
+/// What a GRANT or REVOKE asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GrantPlan {
+    /// Privileges on tables (and views).
+    Tables {
+        revoke: bool,
+        privs: Vec<PrivSpec>,
+        /// References as `split_qualified_ref` reads them.
+        tables: Vec<String>,
+        grantees: Vec<Role>,
+    },
+    /// Membership in roles.
+    Roles(RoleGrant),
+    /// Privileges on what is not modelled: schemas, sequences, databases, ALL
+    /// TABLES IN SCHEMA, default privileges.
+    Other { revoke: bool },
 }
 
 /// The privileges a column form of name stands for: 0LP01 for one with no column
@@ -499,179 +518,75 @@ fn column_privileges(name: &str) -> Result<&'static [&'static str]> {
     })
 }
 
-/// Extracts the privileges, tables, and grantees from a table GRANT/REVOKE. None
-/// for forms it doesn't model (e.g. GRANT <role> TO, GRANT ... ON
-/// SCHEMA/SEQUENCE/DATABASE, GRANT ... ON ALL TABLES IN SCHEMA).
-fn parse_grant(sql: &str, revoke: bool) -> Option<(Vec<PrivSpec>, Vec<String>, Vec<String>)> {
-    let low = code_only(sql).to_ascii_lowercase();
-    let on = index_word(&low, "on")?;
-    let sep = if revoke { "from" } else { "to" };
-    let from_kw = index_word(&low, sep)?;
-    if from_kw < on {
-        return None;
-    }
-
-    let priv_spec = sql[first_word_end(sql)..on].trim();
-    let mut obj_spec = sql[on + 2..from_kw].trim();
-    let mut grantee_spec = sql[from_kw + sep.len()..].trim();
-    grantee_spec = trim_end_chars(grantee_spec, "; \t\n");
-    // Strip GRANT-option / cascade tails we don't model.
-    for tail in [" with grant option", " cascade", " restrict"] {
-        if let Some(k) = grantee_spec.to_ascii_lowercase().find(tail) {
-            grantee_spec = &grantee_spec[..k];
-        }
-    }
-
-    // Object must be a plain (optionally TABLE-qualified) table list.
-    let o = obj_spec.trim();
-    obj_spec = o.strip_prefix("TABLE").unwrap_or(o).trim();
-    obj_spec = obj_spec.strip_prefix("table").unwrap_or(obj_spec).trim();
-    let low_obj = obj_spec.to_lowercase();
-    for kind in ["schema", "sequence", "database", "function", "all tables", "all "] {
-        if low_obj.starts_with(kind) {
-            return None;
-        }
-    }
-
-    let privs = split_privs(priv_spec);
-    let tables = split_tables(obj_spec);
-    let grantees = split_grantees(grantee_spec);
-    if privs.is_empty() || tables.is_empty() || grantees.is_empty() {
-        return None;
-    }
-    Some((privs, tables, grantees))
-}
-
-/// Turns "SELECT, INSERT" / "ALL" / "ALL PRIVILEGES" / "SELECT (a, \"B\"), UPDATE (c)"
-/// into a list. A comma inside a column list does not end a privilege.
-fn split_privs(spec: &str) -> Vec<PrivSpec> {
-    let mut out = Vec::new();
-    let b = spec.as_bytes();
-    let (mut depth, mut quoted, mut start) = (0_i32, false, 0);
-    let mut items = Vec::new();
-    for (i, &c) in b.iter().enumerate() {
-        match c {
-            b'"' => quoted = !quoted,
-            b'(' if !quoted => depth += 1,
-            b')' if !quoted => depth -= 1,
-            b',' if !quoted && depth == 0 => {
-                items.push(&spec[start..i]);
-                start = i + 1;
+/// A GRANT's or REVOKE's plan, from its node.
+pub(crate) fn grant_plan(sql: &str, n: &NodeEnum) -> Option<GrantPlan> {
+    let quoted = tree::quoted_names(sql);
+    match n {
+        NodeEnum::GrantStmt(g) => {
+            let revoke = !g.is_grant;
+            if pb::GrantTargetType::try_from(g.targtype) != Ok(pb::GrantTargetType::AclTargetObject)
+                || tree::object(g.objtype) != pb::ObjectType::ObjectTable
+            {
+                return Some(GrantPlan::Other { revoke });
             }
-            _ => {}
-        }
-    }
-    items.push(&spec[start..]);
-    for item in items {
-        let item = item.trim();
-        let (word, columns) = match item.find('(') {
-            Some(i) => {
-                let inner = item[i + 1..].trim_end();
-                let inner = inner.strip_suffix(')').unwrap_or(inner);
-                (item[..i].trim(), Some(split_grant_columns(inner)))
+            let mut privs: Vec<PrivSpec> = g
+                .privileges
+                .iter()
+                .filter_map(|p| match &p.node {
+                    Some(NodeEnum::AccessPriv(a)) => Some(PrivSpec {
+                        name: if a.priv_name.is_empty() {
+                            "ALL".to_string()
+                        } else {
+                            a.priv_name.to_uppercase()
+                        },
+                        columns: (!a.cols.is_empty()).then(|| {
+                            tree::strings(&a.cols)
+                                .into_iter()
+                                .map(|name| GrantColumn {
+                                    quoted: quoted.contains(&name),
+                                    name,
+                                })
+                                .collect()
+                        }),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            if privs.is_empty() {
+                // ALL [PRIVILEGES]
+                privs.push(PrivSpec {
+                    name: "ALL".to_string(),
+                    columns: None,
+                });
             }
-            None => (item, None),
-        };
-        let mut name = word.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
-        if name == "ALL PRIVILEGES" || (name.is_empty() && columns.is_none()) {
-            name = "ALL".to_string();
+            Some(GrantPlan::Tables {
+                revoke,
+                privs,
+                tables: tree::references(&g.objects),
+                grantees: g.grantees.iter().filter_map(tree::role_spec).map(tree::role).collect(),
+            })
         }
-        if !name.is_empty() {
-            out.push(PrivSpec { name, columns });
+        NodeEnum::GrantRoleStmt(g) => {
+            let admin = tree::defs(&g.opt).any(|d| d.defname == "admin" && (!g.is_grant || tree::def_bool(d)));
+            let roles = |list: &[pb::Node]| -> Vec<Role> {
+                list.iter()
+                    .filter_map(|n| match &n.node {
+                        Some(NodeEnum::AccessPriv(a)) => Some(Role::Named(a.priv_name.clone())),
+                        Some(NodeEnum::RoleSpec(r)) => Some(tree::role(r)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            Some(GrantPlan::Roles(RoleGrant {
+                revoke: !g.is_grant,
+                roles: roles(&g.granted_roles),
+                members: roles(&g.grantee_roles),
+                admin: g.is_grant && admin,
+                admin_only: !g.is_grant && admin,
+            }))
         }
+        _ => None,
     }
-    out
-}
-
-/// The names of a column list: "a, \"B\"".
-fn split_grant_columns(spec: &str) -> Vec<GrantColumn> {
-    let mut out = Vec::new();
-    let b = spec.as_bytes();
-    let (mut quoted, mut start) = (false, 0);
-    let mut push = |s: &str| {
-        let s = s.trim();
-        if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-            out.push(GrantColumn {
-                name: inner.replace("\"\"", "\""),
-                quoted: true,
-            });
-        } else if !s.is_empty() {
-            out.push(GrantColumn {
-                name: s.to_lowercase(),
-                quoted: false,
-            });
-        }
-    };
-    for (i, &c) in b.iter().enumerate() {
-        match c {
-            b'"' => quoted = !quoted,
-            b',' if !quoted => {
-                push(&spec[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    push(&spec[start..]);
-    out
-}
-
-fn split_tables(spec: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for t in spec.split(',') {
-        if let Some(name) = table_name(&Word {
-            text: t.trim(),
-            quoted: false,
-        }) {
-            out.push(name.to_string());
-        }
-    }
-    out
-}
-
-/// Returns role names, mapping GROUP/PUBLIC and quotes away.
-fn split_grantees(spec: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for g in spec.split(',') {
-        let g = g.trim();
-        let g = g.strip_prefix("GROUP ").unwrap_or(g);
-        let g = g.strip_prefix("group ").unwrap_or(g);
-        let g = g.trim();
-        if eq_fold(g, "public") {
-            out.push("public".to_string());
-            continue;
-        }
-        let g = trim_chars(g, "\"");
-        if !g.is_empty() {
-            out.push(g.to_string());
-        }
-    }
-    out
-}
-
-/// Pulls the table reference from the tokens after CREATE/DROP TABLE, skipping "IF
-/// NOT EXISTS" / "IF EXISTS".
-fn created_table_name(toks: &[&str]) -> String {
-    let mut toks = toks;
-    while !toks.is_empty() {
-        match toks[0].to_lowercase().as_str() {
-            "if" | "not" | "exists" => toks = &toks[1..],
-            _ => {
-                let mut raw = toks[0];
-                if let Some(i) = raw.find(['(', ';']) {
-                    raw = &raw[..i];
-                }
-                if let Some(name) = table_name(&Word {
-                    text: raw.trim(),
-                    quoted: false,
-                }) {
-                    return name.to_string();
-                }
-                return String::new();
-            }
-        }
-    }
-    String::new()
 }
 
 /// The byte index of a whole-word keyword in a lower-cased string, if any.
@@ -689,17 +604,4 @@ pub(crate) fn index_word(low: &str, kw: &str) -> Option<usize> {
         i = p + kw.len();
     }
     None
-}
-
-/// The byte offset just past the first word of sql.
-fn first_word_end(sql: &str) -> usize {
-    let b = sql.as_bytes();
-    let mut i = 0;
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n') {
-        i += 1;
-    }
-    while i < b.len() && !(b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n') {
-        i += 1;
-    }
-    i
 }

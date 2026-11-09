@@ -104,6 +104,7 @@ mod portal_fetch;
 mod postgres;
 mod precision;
 mod privilege_routes;
+mod privilege_trees;
 mod privileges;
 mod psql_compat;
 mod regexescapes;
