@@ -37,6 +37,7 @@ impl SqlState {
     pub const INVALID_PARAMETER_VALUE: SqlState = SqlState("22023");
     pub const INVALID_ESCAPE_CHARACTER: SqlState = SqlState("22019");
     pub const INVALID_ESCAPE_SEQUENCE: SqlState = SqlState("22025");
+    pub const NONSTANDARD_USE_OF_ESCAPE_CHARACTER: SqlState = SqlState("22P06");
     pub const INVALID_TEXT_REPRESENTATION: SqlState = SqlState("22P02");
     pub const INVALID_BINARY_REPRESENTATION: SqlState = SqlState("22P03");
     pub const INTEGRITY_CONSTRAINT_VIOLATION: SqlState = SqlState("23000");

@@ -26,12 +26,13 @@ fn exec_message(err: &Error) -> &str {
 impl Session {
     /// Reports an execution error, in Postgres' words for a cancelled query.
     pub(crate) fn send_exec_error(&mut self, err: &Error) -> Result<()> {
-        self.c.send_error(err.sql_state(), exec_message(err))
+        self.c.send_error_of(err, exec_message(err))
     }
 
     /// send_exec_error for the extended-query path (arms the skip-until-Sync flag).
     pub(crate) fn proto_exec_error(&mut self, err: &Error) -> Result<()> {
-        self.proto_error(err.sql_state(), exec_message(err))
+        self.failed = true;
+        self.c.send_error_of(err, exec_message(err))
     }
 }
 

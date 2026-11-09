@@ -29,7 +29,7 @@ use crate::builtins::arrays::{array_as_json, array_lower, is_json_array_text, js
 use crate::builtins::casts::{CastType, assign, cast};
 use crate::builtins::dates::{age_fn, at_time_zone, date_trunc_fn, from_time_zone, to_char_fn};
 use crate::builtins::decimal::{DecAgg, DecSum, bin_dec, dec_cmp, dec_cmp_str, dec_round, dec_string, parse_dec};
-use crate::builtins::hstore::{hstore_in, hstore_keys, hstore_vals};
+use crate::builtins::hstore::{hstore_get, hstore_in, hstore_keys, hstore_vals};
 use crate::builtins::json::{json_quote, jsonb_contains, jsonb_exists, jsonb_exists_all, jsonb_exists_any};
 use crate::builtins::ranges::{
     Range, RangeKind, arg_str, bound_value, is_range_text, parse_range, range_construct, range_contains,
@@ -1374,6 +1374,13 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             json_quote(&a[1].to_string())
         };
         Ok(Value::Text(format!("{{{}:{}}}", json_quote(&a[0].to_string()), v)))
+    })?;
+    // hstore's `->` (ast/emit.rs, hstore_op).
+    scalar(conn, "overlite_hstore_get", 2, |a| {
+        if a.len() < 2 || a[0].is_null() || a[1].is_null() {
+            return Ok(Value::Null);
+        }
+        Ok(hstore_get(&a[0].to_string(), &a[1].to_string()).map_or(Value::Null, Value::Text))
     })?;
     scalar(conn, "akeys", 1, |a| {
         if a.is_empty() || a[0].is_null() {

@@ -151,6 +151,52 @@ impl Ty {
         })
     }
 
+    /// The name Postgres gives this type in a message (`integer[]`, `unknown`), None
+    /// for one the environment does not know.
+    pub(crate) fn pg_name(self) -> Option<String> {
+        let base = match self.base {
+            Base::Unknown => "unknown",
+            Base::Any => return None,
+            Base::Bool => "boolean",
+            Base::Int2 => "smallint",
+            Base::Int4 => "integer",
+            Base::Int8 => "bigint",
+            Base::Float4 => "real",
+            Base::Float8 => "double precision",
+            Base::Numeric => "numeric",
+            Base::Text => "text",
+            Base::Varchar => "character varying",
+            Base::Bpchar => "character",
+            Base::Name => "name",
+            Base::Bytea => "bytea",
+            Base::Uuid => "uuid",
+            Base::Json => "json",
+            Base::Jsonb => "jsonb",
+            Base::Date => "date",
+            Base::Time => "time without time zone",
+            Base::Timetz => "time with time zone",
+            Base::Timestamp => "timestamp without time zone",
+            Base::Timestamptz => "timestamp with time zone",
+            Base::Interval => "interval",
+            Base::Tsvector => "tsvector",
+            Base::Tsquery => "tsquery",
+            Base::Hstore => "hstore",
+            Base::Inet => "inet",
+            Base::Cidr => "cidr",
+            Base::Int4Range => "int4range",
+            Base::Int8Range => "int8range",
+            Base::NumRange => "numrange",
+            Base::DateRange => "daterange",
+            Base::TsRange => "tsrange",
+            Base::TstzRange => "tstzrange",
+        };
+        Some(if self.array {
+            [base, "[]"].concat()
+        } else {
+            base.to_string()
+        })
+    }
+
     /// What the result-column mark says of this type (`overlite_engine::TYPED_MARK`):
     /// an integer's width, which a declared INTEGER does not tell the protocol, a
     /// boolean, which SQLite holds as 1 or 0, and an array's element type.
@@ -407,9 +453,6 @@ pub(crate) struct Typer {
     /// The output columns of the select whose ORDER BY is being read: a bare name
     /// there is an output column first.
     pub(crate) outputs: Option<Vec<Col>>,
-    /// Whether a column read so far is a boolean that may hold text, whose readings
-    /// the text passes keep (resolve/booleans.rs).
-    pub(crate) mixed: bool,
 }
 
 fn node(n: &pb::Node) -> Option<&NodeEnum> {
@@ -463,7 +506,6 @@ impl Typer {
             scopes: Vec::new(),
             ctes: Vec::new(),
             outputs: None,
-            mixed: false,
         }
     }
 
@@ -772,11 +814,7 @@ impl Typer {
         {
             return Some(c.clone());
         }
-        let found = self.lookup(name, quals);
-        if found.as_ref().is_some_and(|c| c.mixed) {
-            self.mixed = true;
-        }
-        found
+        self.lookup(name, quals)
     }
 
     fn lookup(&self, name: &str, quals: &[&str]) -> Option<Col> {
@@ -968,6 +1006,11 @@ impl Typer {
                     "+" | "-" | "*" | "/" | "%" | "||" => arithmetic(op, l, r),
                     "->" | "#>" if l.is(Base::Jsonb) || l.is(Base::Json) => l,
                     "->>" | "#>>" if l.is(Base::Jsonb) || l.is(Base::Json) => Ty::TEXT,
+                    // hstore's value by a key, its values by an array of keys.
+                    "->" if l.is(Base::Hstore) => Ty {
+                        base: Base::Text,
+                        array: r.array,
+                    },
                     _ => Ty::ANY,
                 }
             }
@@ -1155,7 +1198,9 @@ impl Typer {
                 Base::Timestamp => Ty::of(Base::Timestamptz),
                 // What the environment does not know is taken for an instant, as the
                 // printer writes it (overlite_column_at_time_zone).
-                Base::Timestamptz | Base::Unknown | Base::Any => Ty::of(Base::Timestamp),
+                // A date is the timestamptz of its midnight in the session's zone, as
+                // Postgres casts it.
+                Base::Timestamptz | Base::Date | Base::Unknown | Base::Any => Ty::of(Base::Timestamp),
                 _ => Ty::ANY,
             },
             // EXTRACT is a numeric since Postgres 14; date_part a double.

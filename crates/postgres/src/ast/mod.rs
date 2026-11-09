@@ -19,6 +19,7 @@ pub(crate) mod parse;
 pub(crate) mod record;
 pub(crate) mod shadow;
 pub(crate) mod shape;
+pub(crate) mod sqlite_trigger;
 pub(crate) mod types;
 
 #[cfg(test)]
@@ -67,6 +68,31 @@ pub(crate) fn try_translate(sql: &str) -> Result<String, &'static str> {
         return ddl::translate(sql, stmt);
     }
     one(stmt)
+}
+
+/// Postgres' own error for sql, when its grammar refuses it, answered before anything
+/// else reads the statement, as Postgres parses first: a syntax error (42601) with its
+/// position, or a statement nested too deep (54001). SQLite's trigger
+/// (`sqlite_trigger`) is no refusal. A statement that reads or writes rows is not
+/// parsed here: its translation, which parses it anyway, answers the same.
+pub(crate) fn grammar_refusal(sql: &str) -> Option<crate::error::Error> {
+    if crate::rewrite::cache::reads_or_writes_rows(sql) {
+        return None;
+    }
+    grammar_refusal_parsing(sql)
+}
+
+/// `grammar_refusal` of any statement, one that reads or writes rows included, which it
+/// parses (and keeps parsed, `parse::shared`): what the privilege check, which reads
+/// the tree, answers before any grant.
+pub(crate) fn grammar_refusal_parsing(sql: &str) -> Option<crate::error::Error> {
+    if parse::shared(sql).is_ok() {
+        return None;
+    }
+    if sqlite_trigger::is_sqlite_trigger(sql) {
+        return None;
+    }
+    parse::error_of(sql)
 }
 
 /// The type the environment gives each parameter of sql, `$1` first, when the AST
@@ -121,14 +147,19 @@ fn remember_outside(shape: u64, why: &'static str) {
     if !matches!(
         why,
         emit::TYPE_REFUSAL_OPERANDS
-            | emit::TYPE_REFUSAL_BOOLEAN
             | emit::TYPE_REFUSAL_JSON
             | emit::TYPE_REFUSAL_RANGE
             | emit::TYPE_REFUSAL_STAR
+            | emit::POSTGRES_REFUSAL
+            | "parse error"
+            | parse::TOO_DEEP
     ) {
         shape::OUTSIDE.insert(shape ^ mode());
     }
 }
+
+/// Why a shape is not parsed again: one the AST path left to the text passes before.
+pub(crate) const OUTSIDE: &str = "a shape left to the text passes";
 
 /// What tells a shape refused with a context from one refused without.
 fn mode() -> u64 {
@@ -137,20 +168,25 @@ fn mode() -> u64 {
 
 /// sql as SQLite SQL with these labels on its result columns
 /// (`emit::statement_labelled`), when the AST path covers it.
-pub(crate) fn translate_labelled(sql: &str, labels: &[Option<String>]) -> Option<String> {
+///
+/// # Errors
+///
+/// Why it does not, as `try_translate`.
+pub(crate) fn translate_labelled(sql: &str, labels: &[Option<String>]) -> Result<String, &'static str> {
     let shape = shape::of(sql);
     if outside(shape) {
-        return None;
+        return Err(OUTSIDE);
     }
-    let parsed = parse::kept_or_new(sql).ok()?;
-    let out = one_statement(&parsed).and_then(|stmt| match env::current() {
-        Some(ctx) => emit::typed(stmt, Some(labels), ctx).map(|p| p.sql),
-        None => emit::statement_labelled(stmt, Some(labels)),
+    let out = parse::kept_or_new(sql).and_then(|parsed| {
+        one_statement(&parsed).and_then(|stmt| match env::current() {
+            Some(ctx) => emit::typed(stmt, Some(labels), ctx).map(|p| p.sql),
+            None => emit::statement_labelled(stmt, Some(labels)),
+        })
     });
     if let Err(why) = out {
         remember_outside(shape, why);
     }
-    out.ok()
+    out
 }
 
 /// The statement as SQLite SQL, when the AST path covers all of it.
@@ -159,14 +195,18 @@ pub(crate) fn translate_labelled(sql: &str, labels: &[Option<String>]) -> Option
 /// the AST path has already left to the text passes is not parsed again: a client
 /// writing its values into the text sends one shape with ever new texts, which the
 /// translation cache cannot hold, and each would pay a parse only to be refused.
-pub(crate) fn translate(sql: &str) -> Option<String> {
+///
+/// # Errors
+///
+/// Why it does not, as `try_translate`, or [`OUTSIDE`].
+pub(crate) fn translate(sql: &str) -> Result<String, &'static str> {
     let shape = shape::of(sql);
     if outside(shape) {
-        return None;
+        return Err(OUTSIDE);
     }
     let out = try_translate(sql);
     if let Err(why) = out {
         remember_outside(shape, why);
     }
-    out.ok()
+    out
 }

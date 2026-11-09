@@ -97,7 +97,7 @@ rust-stemmers = "1.2"
 # Postgres' own grammar (libpg_query, C, built by cc; bindgen needs libclang).
 pg_query = "18.1.0"
 # pg_query's tree is protobuf; the same prost, to decode it without its summary.
-prost = { version = "0.13.5", default-features = false, features = ["std"] }
+prost = { version = "0.13.5", default-features = false, features = ["std", "no-recursion-limit"] }
 
 [package]
 name = "overlite"

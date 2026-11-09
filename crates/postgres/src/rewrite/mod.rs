@@ -33,6 +33,7 @@ mod table_funcs;
 pub(crate) mod tokens;
 pub(crate) mod typed_cast;
 
+use crate::error::Result;
 use crate::rewrite::aliases::{rewrite_drop_cascade, rewrite_keyword_labels};
 use crate::rewrite::arrays::{
     rewrite_any_array, rewrite_any_operator, rewrite_array_subquery, rewrite_array_subscript,
@@ -83,59 +84,142 @@ use crate::types::numeric::rewrite_numeric_columns;
 use crate::types::timestamptz::{rewrite_at_time_zone, rewrite_timestamptz_literal};
 use overlite_core::text::find_from;
 
-/// rewrite translates the handful of Postgres-isms we support into equivalent
-/// SQLite. It is intentionally small and syntactic; a full SQL transpiler is a
-/// non-goal.
+/// sql, a client's statement, as SQLite SQL: the fast path, or the AST path's translation (crate::ast), kept
+/// in the process's translation cache (`cache`), which says what a translation
+/// depends on.
 ///
-/// A statement off the fast path goes to the AST path when it covers the statement
-/// (crate::ast), which writes every sort key's NULLS and every LIKE itself, else to the
-/// text passes, and the result is kept in the process's translation cache (`cache`),
-/// which says what a translation depends on.
+/// Where NULLs sort and what LIKE matches are settled on the fast path, which a plain
+/// lookup with an ORDER BY or a LIKE takes: each is one scan of the tokens, made only
+/// when its word is there.
 ///
-/// Where NULLs sort and what LIKE matches are settled after the text passes and on the
-/// fast path, which a plain lookup with an ORDER BY or a LIKE takes: each is one scan
-/// of the tokens, made only when its word is there.
-pub fn rewrite(sql: &str) -> String {
+/// # Errors
+///
+/// What Postgres answers a statement it refuses: a syntax error (42601) with its
+/// position, a statement nested too deep (54001), an operator no type has (42883), a
+/// derived column list too long (42P10).
+pub fn translate(sql: &str) -> Result<String> {
     if fast_path(sql) {
-        return text_tail(sql);
+        return Ok(text_tail(sql));
     }
-    cache::cached(sql, || {
-        if let Some(ast) = crate::ast::ENABLED.then(|| crate::ast::translate(sql)).flatten() {
+    cache::cached(sql, || match crate::ast::ENABLED.then(|| crate::ast::translate(sql)) {
+        Some(Ok(ast)) => {
             crate::ast::shadow::check(sql, || text_tail(&rewrite_full(sql)));
-            ast
-        } else {
-            crate::ast::record::text_passes(sql);
-            text_tail(&rewrite_full(sql))
+            Ok(ast)
         }
+        Some(Err(why)) => refused(sql, sql, why).unwrap_or_else(|| Ok(text_passes(sql))),
+        None => Ok(text_passes(sql)),
     })
 }
 
-/// `rewrite` of expanded, which the session made of raw by writing values into it
+/// The text passes and what follows them, for the tests of a pass over a fragment of
+/// a statement, which Postgres' grammar would refuse whole.
+#[cfg(test)]
+pub(crate) fn text_passes_alone(sql: &str) -> String {
+    text_tail(&rewrite_full(sql))
+}
+
+fn text_passes(sql: &str) -> String {
+    crate::ast::record::text_passes(sql);
+    text_tail(&rewrite_full(sql))
+}
+
+/// What a statement the AST path does not translate (why) is answered: Postgres' error
+/// for one Postgres refuses, read from raw, the statement as the client sent it (sql
+/// is what the session made of it), or SQLite's own trigger, as it is. None for
+/// anything else.
+fn refused(raw: &str, sql: &str, why: &'static str) -> Option<Result<String>> {
+    use crate::ast::{emit, parse, sqlite_trigger};
+    match why {
+        emit::POSTGRES_REFUSAL => {
+            let r = emit::take_refusal()?;
+            let mut err = crate::error::Error::with_state(r.state, r.message);
+            if let Some(h) = r.hint {
+                err = err.with_hint(h);
+            }
+            // The tree's offsets are bytes of the text it parsed; the client counts
+            // characters of what it sent, which is that text when nothing was expanded.
+            if let Some(at) = r.location.filter(|_| raw == sql).and_then(|at| sql.get(..at))
+                && let Ok(p) = u32::try_from(at.chars().count() + 1)
+            {
+                err = err.at_position(p);
+            }
+            Some(Err(err))
+        }
+        "parse error" | parse::TOO_DEEP => {
+            if sqlite_trigger::is_sqlite_trigger(raw) {
+                return Some(Ok(raw.to_string()));
+            }
+            parse::error_of(raw).or_else(|| parse::error_of(sql)).map(Err)
+        }
+        _ => None,
+    }
+}
+
+/// `translate` for the SQL the server writes itself (a probe, a rebuilt table's DDL):
+/// a statement it refuses goes to SQLite as it is, which refuses it in turn.
+pub fn rewrite(sql: &str) -> String {
+    translate(sql).unwrap_or_else(|_| sql.to_string())
+}
+
+/// `translate` of expanded, which the session made of raw by writing values into it
 /// (`current_user` as its name, `nextval('s')` as a number, an RLS filter), with raw's
 /// labels on its result columns: what nextval('s') became says nothing of its name.
 /// When the AST path covers expanded, it labels its tree with those of raw's tree;
 /// otherwise the text passes read raw's labels from its text, as before.
-pub(crate) fn rewrite_expanded(raw: &str, expanded: &str) -> String {
+///
+/// # Errors
+///
+/// As `rewrite`, of raw.
+pub(crate) fn rewrite_expanded(raw: &str, expanded: &str) -> Result<String> {
     // Keyed by both: the labels are raw's, the translation expanded's.
     let key = [raw, "\0", expanded].concat();
     cache::cached(&key, || {
-        if *crate::ast::ENABLED
-            && !fast_path(expanded)
-            && let Some(labels) = crate::ast::result_labels(raw)
-            && let Some(out) = crate::ast::translate_labelled(expanded, &labels)
-        {
-            return out;
+        if *crate::ast::ENABLED && !fast_path(expanded) {
+            let out = match crate::ast::result_labels(raw) {
+                Some(labels) => crate::ast::translate_labelled(expanded, &labels),
+                None => Err("parse error"),
+            };
+            match out {
+                Ok(out) => return Ok(out),
+                Err(why) => {
+                    if let Some(answer) = refused(raw, expanded, why) {
+                        return answer;
+                    }
+                }
+            }
         }
-        apply_labels(&rewrite(expanded), &result_labels(raw))
+        Ok(apply_labels(&translate(expanded)?, &result_labels(raw)))
     })
 }
 
 /// Whether sql takes the fast path: the text passes would leave it as it is, and the
 /// AST path's typed translation would say nothing else of it under the thread's
 /// context (a column of a date or time type, an array, a range or a narrow integer
-/// leaves it, `TableTypes::typed_differs`).
+/// leaves it, `TableTypes::typed_differs`), and Postgres' grammar reads it: a
+/// statement of its shape parsed once (`parses`).
 pub(crate) fn fast_path(sql: &str) -> bool {
-    needs_no_rewrite(sql) && !(*crate::ast::ENABLED && crate::ast::env::typed_differs(sql))
+    needs_no_rewrite(sql) && !(*crate::ast::ENABLED && crate::ast::env::typed_differs(sql)) && parses(sql)
+}
+
+/// Shapes (`ast::shape::of`: the text with its literals' values left out) of
+/// statements the fast path saw Postgres' grammar read as one statement.
+static PARSED: crate::ast::shape::Shapes = crate::ast::shape::Shapes::new();
+
+/// Whether Postgres' grammar reads sql as one statement, which a statement of the
+/// same shape answers without a parse: the values of literals do not change what the
+/// grammar reads. A shape it refuses is parsed each time, and refused by the AST path
+/// with Postgres' error: SQLite's dialect, which the fast path's words would take
+/// (`INSERT OR IGNORE`), is not run.
+fn parses(sql: &str) -> bool {
+    let shape = crate::ast::shape::of(sql);
+    if PARSED.holds(shape) {
+        return true;
+    }
+    let ok = crate::ast::parse::kept_or_new(sql).is_ok_and(|p| p.stmts.len() == 1);
+    if ok {
+        PARSED.insert(shape);
+    }
+    ok
 }
 
 /// What runs after the text passes, and alone on the fast path: NULLS ordering and

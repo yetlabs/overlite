@@ -126,8 +126,11 @@ const BAD_REGEX: usize = 2768;
 /// schema name a file cannot hold. And a write the old server stored as it came, that
 /// the column's type does not read: an array or an hstore that is neither (22P02,
 /// 42601), a timestamp past any offset (22009). The reads of those arrays that failed
-/// on them answer now.
-const STATE_BY_KIND: usize = 252;
+/// on them answer now. Since stage 5c of the AST migration, what Postgres' grammar
+/// refuses (a name `"a\"b"`) is refused with Postgres' message, and a json operator over
+/// an array (`a -> 0` of a text[]) with Postgres' 42883, where the old server read the
+/// array's JSON.
+const STATE_BY_KIND: usize = 273;
 
 /// A `time` column: the old server described it by its text, 25, where Postgres says
 /// 1083. These hold what no time can be, which Postgres would have refused; and as such
@@ -141,16 +144,18 @@ const TIME_COLUMN: usize = 24;
 const OFFSET_LITERAL: usize = 26;
 
 /// A comparison, a match or a test in a select list: a boolean, t or f under OID 16 as
-/// in Postgres, where the old server sent SQLite's integer, int8 1 or 0.
-const BOOLEAN_RESULT: usize = 2055;
+/// in Postgres, where the old server sent SQLite's integer, int8 1 or 0. Less the 14
+/// `a -> 0 IS NULL` of a text[], refused now as Postgres refuses them (STATE_BY_KIND).
+const BOOLEAN_RESULT: usize = 2041;
 
 /// Whether an outcome is the old one but for booleans: in binary, each 0 or 1 int8
 /// cell that is now one byte; in text, columns now described as OID 16.
 /// The reads of rows the old server stored and Postgres refuses to: arrays and hstores
 /// that are neither, in arr, and timestamps past any offset, ts ids 0 to 11. Every write
 /// refuses them now, so what reads those rows reads none, and DELETE FROM arr deletes
-/// fewer.
-const REFUSED_WRITE_ROWS: usize = 176;
+/// fewer. Six reads of arr that read them with `a -> 0` are refused now, as Postgres
+/// refuses a json operator over an array (STATE_BY_KIND).
+const REFUSED_WRITE_ROWS: usize = 170;
 
 fn reads_refused_rows(quoted: &str) -> bool {
     if quoted.contains("FROM arr") {

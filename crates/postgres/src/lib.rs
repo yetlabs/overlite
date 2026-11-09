@@ -42,5 +42,5 @@ pub const UNSTAMPED_LOG_TARGET: &str = "overlite::unstamped";
 
 pub use error::{Error, ErrorKind, Result};
 pub use protocol::Protocol;
-pub use rewrite::{needs_no_rewrite, rewrite, rewrite_full};
+pub use rewrite::{needs_no_rewrite, rewrite, rewrite_full, translate};
 pub use server::Server;

@@ -82,7 +82,7 @@ const SLOTS: usize = 4096;
 impl Shapes {
     // Built once, in a static; the tests' own copies are small enough.
     #[allow(clippy::large_stack_arrays)]
-    const fn new() -> Shapes {
+    pub(crate) const fn new() -> Shapes {
         Shapes([const { AtomicU64::new(0) }; SLOTS])
     }
 

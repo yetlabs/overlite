@@ -122,6 +122,13 @@ impl Session {
             ));
         }
         check_internal(sql)?;
+        // A statement Postgres' grammar refuses is refused for that, before any grant
+        // is read, as Postgres parses first.
+        if depth == 0
+            && let Some(e) = crate::ast::grammar_refusal_parsing(sql)
+        {
+            return Err(e);
+        }
         if let Some(query) = create_table_as_query(sql) {
             return self.check_statement_except(query, depth, exempt);
         }

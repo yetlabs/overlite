@@ -26,13 +26,70 @@ pub(crate) type Unsupported = &'static str;
 /// operands' types are not known, a json operator over what is not known to be json,
 /// and a boolean column that may hold text.
 pub(crate) const TYPE_REFUSAL_OPERANDS: Unsupported = "% of operands of unknown type";
-pub(crate) const TYPE_REFUSAL_BOOLEAN: Unsupported = "boolean column holding text";
 pub(crate) const TYPE_REFUSAL_JSON: Unsupported = "json operator on what is not known to be json";
 pub(crate) const TYPE_REFUSAL_RANGE: Unsupported = "range operator with a side that is no range";
 pub(crate) const TYPE_REFUSAL_STAR: Unsupported =
     "star of a relation the catalog does not know in a derived column list";
 
+/// A statement Postgres refuses too, for a reason the printer finds (an operator no
+/// type has, a derived column list longer than its relation): `refuse` keeps
+/// Postgres' error on the thread for the translation's caller to send
+/// (`take_refusal`), instead of a translation.
+pub(crate) const POSTGRES_REFUSAL: Unsupported = "refused as Postgres refuses it";
+
+/// The error Postgres gives: its SQLSTATE, its message, a hint, and the byte offset in
+/// the statement it points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub state: overlite_core::SqlState,
+    pub message: String,
+    pub hint: Option<&'static str>,
+    pub location: Option<usize>,
+}
+
+thread_local! {
+    static REFUSAL: std::cell::RefCell<Option<Refusal>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps r as the statement's answer, and says so to the printer's caller.
+pub(crate) fn refuse(r: Refusal) -> Unsupported {
+    REFUSAL.with(|c| *c.borrow_mut() = Some(r));
+    POSTGRES_REFUSAL
+}
+
+/// The refusal `refuse` kept on this thread, once.
+pub(crate) fn take_refusal() -> Option<Refusal> {
+    REFUSAL.with(|c| c.borrow_mut().take())
+}
+
+/// A byte offset of the tree (-1 for none) as `Refusal::location`.
+fn location(at: i32) -> Option<usize> {
+    usize::try_from(at).ok()
+}
+
+/// Postgres' 42883 for an operator no type of its operands has.
+fn no_operator(op: &str, l: Ty, r: Ty, at: i32) -> Unsupported {
+    let (Some(l), Some(r)) = (l.pg_name(), r.pg_name()) else {
+        return "operator of operands of unknown type";
+    };
+    refuse(Refusal {
+        state: overlite_core::SqlState::UNDEFINED_FUNCTION,
+        message: format!("operator does not exist: {l} {op} {r}"),
+        hint: Some("No operator matches the given name and argument types. You might need to add explicit type casts."),
+        location: location(at),
+    })
+}
+
 type Out = Result<(), Unsupported>;
+
+/// The text a boolean column that may hold text holds for true and false besides 1
+/// and 0: every spelling Postgres' boolin reads, as resolve/booleans.rs lists them.
+const BOOL_TRUE_FORMS: &[&str] = &[
+    "t", "true", "y", "yes", "on", "T", "TRUE", "Y", "YES", "ON", "True", "Yes", "On",
+];
+const BOOL_FALSE_FORMS: &[&str] = &[
+    "f", "false", "n", "no", "off", "F", "FALSE", "N", "NO", "OFF", "False", "No", "Off",
+];
 
 /// How tightly an expression binds in SQLite, loosest first. An operand is written in
 /// parentheses when it binds looser than its place asks.
@@ -204,9 +261,6 @@ pub(crate) fn expression(n: &NodeEnum, table_ddl: bool) -> Result<String, Unsupp
     e.ddl = true;
     e.table_ddl = table_ddl;
     e.expr(n, Prec::Or)?;
-    if e.typer.as_ref().is_some_and(|t| t.mixed) {
-        return Err(TYPE_REFUSAL_BOOLEAN);
-    }
     Ok(e.out)
 }
 
@@ -227,11 +281,6 @@ fn print(stmt: &NodeEnum, labels: Option<&[Option<String>]>, typer: Option<Typer
             .iter()
             .map(|c| if c.rowid { "" } else { c.ty.mark() })
             .collect();
-        // A boolean column that may hold text keeps the text passes' readings of both
-        // forms (resolve/booleans.rs).
-        if t.mixed {
-            return Err(TYPE_REFUSAL_BOOLEAN);
-        }
         e.out.push(' ');
         e.out.push_str(overlite_engine::TYPED_MARK);
         if marks.iter().any(|m| !m.is_empty()) {
@@ -331,6 +380,9 @@ struct Emitter<'a> {
     /// `datetime('now')` and CURRENT_TIMESTAMP its keyword, as the text passes wrote
     /// them and the catalog reads them back.
     ddl: bool,
+    /// A column being written as a whole item of a select list or RETURNING: a boolean
+    /// holding text is left as it is there, its declared type reads it on the way out.
+    whole_item: bool,
 }
 
 fn node(n: &pb::Node) -> Result<&NodeEnum, Unsupported> {
@@ -593,6 +645,7 @@ impl<'a> Emitter<'a> {
             returning_table: None,
             table_ddl: false,
             ddl: false,
+            whole_item: false,
         }
     }
 
@@ -1223,9 +1276,13 @@ impl<'a> Emitter<'a> {
                 return Err("target indirection");
             }
             let val = boxed(t.val.as_deref())?;
-            match casts.then(|| self.item_cast(val)).flatten() {
-                Some((ty, name)) => self.cast_item(val, ty, name)?,
-                None => self.expr(val, Prec::Or)?,
+            if let Some((ty, name)) = casts.then(|| self.item_cast(val)).flatten() {
+                self.cast_item(val, ty, name)?;
+            } else {
+                self.whole_item = matches!(val, NodeEnum::ColumnRef(_));
+                let out = self.expr(val, Prec::Or);
+                self.whole_item = false;
+                out?;
             }
             if let NodeEnum::ColumnRef(c) = val
                 && matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(NodeEnum::AStar(_)))
@@ -1534,7 +1591,17 @@ impl<'a> Emitter<'a> {
                             },
                         };
                         if names.len() > width.len() {
-                            return Err("derived column aliases");
+                            return Err(refuse(Refusal {
+                                state: overlite_core::SqlState::INVALID_COLUMN_REFERENCE,
+                                message: format!(
+                                    "table \"{}\" has {} columns available but {} columns specified",
+                                    a.aliasname,
+                                    width.len(),
+                                    names.len()
+                                ),
+                                hint: None,
+                                location: None,
+                            }));
                         }
                         names.extend(width[names.len()..].iter().cloned());
                         let cte = format!("_alias{}", self.aliases);
@@ -2366,10 +2433,18 @@ impl<'a> Emitter<'a> {
                 }
                 if let Some(t) = &mut self.typer
                     && !matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(NodeEnum::AStar(_)))
+                    && t.column(&c.fields).is_some_and(|c| c.mixed)
+                    && !std::mem::take(&mut self.whole_item)
                 {
-                    // Read for what it is: a boolean holding text sends the statement to
-                    // the text passes.
-                    t.column(&c.fields);
+                    // A boolean that may hold text, read as Postgres' boolin reads each
+                    // spelling (resolve/booleans.rs): 1, 0 or NULL.
+                    self.push("overlite_bool(");
+                    self.whole_item = true;
+                    let out = self.expr_bare(n);
+                    self.whole_item = false;
+                    out?;
+                    self.push(")");
+                    return Ok(());
                 }
                 if let Some(written) = self.renamed(&c.fields)? {
                     self.push(&written);
@@ -3600,9 +3675,14 @@ impl<'a> Emitter<'a> {
         // not know it is json_contains whatever the other side, which reads a range
         // containing an element too.
         let (lead, other) = if op == "<@" { (tr, tl) } else { (tl, tr) };
+        if lead.is(Base::Hstore) {
+            return self.hstore_op(a, op, l, r);
+        }
         let any_json = lead.base == Base::Any && !lead.array && !(matches!(op, "@>" | "<@") && other.array);
         if !(lead.is(Base::Jsonb) || lead.is(Base::Json) || any_json) {
-            return Err(TYPE_REFUSAL_JSON);
+            // What Postgres has no such operator for (an array's `->`, a text's `?`):
+            // its error, where both sides' types are known.
+            return Err(no_operator(op, tl, tr, a.location));
         }
         match op {
             "->" | "->>" => {
@@ -3673,11 +3753,112 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// A boolean column that may hold text (col) compared with a constant truth value
+    /// (other: true, false, or a string Postgres' boolin reads), and that value.
+    fn mixed_test<'n>(&mut self, col: &'n NodeEnum, other: &NodeEnum) -> Option<(&'n NodeEnum, bool)> {
+        let NodeEnum::ColumnRef(c) = col else { return None };
+        if !self.typer.as_mut()?.column(&c.fields)?.mixed {
+            return None;
+        }
+        let k = match other {
+            NodeEnum::AConst(k) => k,
+            NodeEnum::TypeCast(t) if types::of_type_name(t.type_name.as_ref()?).is(Base::Bool) => {
+                match t.arg.as_deref()?.node.as_ref()? {
+                    NodeEnum::AConst(k) => k,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        match k.val.as_ref()? {
+            Val::Boolval(b) => Some((col, b.boolval)),
+            Val::Sval(s) => overlite_core::parse_bool(&s.sval).map(|b| (col, b)),
+            _ => None,
+        }
+    }
+
+    /// hstore's operators (the column holds a JSON object of strings): `->` a value
+    /// by its key (overlite_hstore_get, or of an array of keys an array of values),
+    /// `?`, `?|` and `?&` the json functions over the keys, `@>` and `<@`
+    /// json_contains; any other is Postgres' 42883.
+    fn hstore_op(&mut self, a: &pb::AExpr, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
+        let (tl, tr) = (self.ty(l), self.ty(r));
+        match op {
+            "->" => {
+                let keys = tr.array || matches!(r, NodeEnum::AArrayExpr(_));
+                if !keys {
+                    self.note_param(r, Ty::TEXT);
+                }
+                self.push("overlite_hstore_get(");
+                self.expr(l, Prec::Or)?;
+                self.push(", ");
+                self.expr(r, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
+            "?" | "?|" | "?&" => {
+                if op == "?" {
+                    self.note_param(r, Ty::TEXT);
+                }
+                self.push(match op {
+                    "?|" => "jsonb_exists_any(",
+                    "?&" => "jsonb_exists_all(",
+                    _ => "jsonb_exists(",
+                });
+                self.expr(l, Prec::Or)?;
+                self.push(", ");
+                self.expr(r, Prec::Or)?;
+                self.push(")");
+                Ok(())
+            }
+            "@>" | "<@" => {
+                let (container, contained) = if op == "@>" { (l, r) } else { (r, l) };
+                self.push("json_contains(");
+                self.hstore_side(container)?;
+                self.push(", ");
+                self.hstore_side(contained)?;
+                self.push(")");
+                Ok(())
+            }
+            _ => Err(no_operator(op, tl, tr, a.location)),
+        }
+    }
+
+    /// A side of an hstore containment: an untyped literal read as an hstore.
+    fn hstore_side(&mut self, n: &NodeEnum) -> Out {
+        if is_string(n) && self.ty(n).base == Base::Unknown {
+            self.push("hstore_in(");
+            self.expr(n, Prec::Or)?;
+            self.push(")");
+            return Ok(());
+        }
+        self.expr(n, Prec::Or)
+    }
+
     /// A comparison, by its sides' types: two intervals by their spans, a date with a
     /// timestamp at its midnight, a timestamp with a timestamptz in the session's zone,
     /// an untyped literal or a parameter as the type of the other side.
     fn comparison(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
         let p = binary_prec(op).ok_or("operator")?;
+        if matches!(op, "=" | "<>" | "!=")
+            && let Some((col, truth)) = self.mixed_test(l, r).or_else(|| self.mixed_test(r, l))
+        {
+            // `b = <a truth value>` over a boolean that may hold text: b among every
+            // spelling of it, which an index on b serves (resolve/booleans.rs).
+            self.whole_item = true;
+            let out = self.expr(col, Prec::Or);
+            self.whole_item = false;
+            out?;
+            let forms = if truth { BOOL_TRUE_FORMS } else { BOOL_FALSE_FORMS };
+            self.push(if op == "=" { " IN (" } else { " NOT IN (" });
+            self.push(if truth { "1" } else { "0" });
+            for f in forms {
+                self.push(", ");
+                self.push(&quote_literal(f));
+            }
+            self.push(")");
+            return Ok(());
+        }
         let (tl, tr) = (self.ty(l), self.ty(r));
         if self.is_range(l) || self.is_range(r) {
             return self.range_op(op, l, r);
@@ -4383,11 +4564,17 @@ impl<'a> Emitter<'a> {
                         "overlite_instant_at_time_zone("
                     }
                     Base::Any => "overlite_column_at_time_zone(",
+                    // A date, as Postgres takes it: the timestamptz of its midnight in
+                    // the session's zone (timezone(text, timestamptz) over the cast).
+                    Base::Date => "overlite_instant_at_time_zone(overlite_tz_in(",
                     _ => return Err("AT TIME ZONE of a time"),
                 };
                 self.note_param(zone, Ty::TEXT);
                 self.push(func);
-                if t.base == Base::Unknown {
+                if t.base == Base::Date {
+                    self.expr(x, Prec::Or)?;
+                    self.push(")");
+                } else if t.base == Base::Unknown {
                     self.value(x, Ty::of(Base::Timestamptz), Prec::Or)?;
                 } else {
                     self.expr(x, Prec::Or)?;

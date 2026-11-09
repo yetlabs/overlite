@@ -88,18 +88,9 @@ fn an_old_file_is_converted_once() {
         "1"
     );
     // A boolean column in the format is compared plainly, by its index.
-    let plan = conn
-        .exec_params(
-            r#"EXPLAIN QUERY PLAN SELECT id FROM "Answer" WHERE "ok" = $1"#,
-            &["true"],
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
-    let detail: Vec<String> = (0..plan.rows.len()).map(|i| plan.text(i, 3)).collect();
+    let detail = query_column(&conn, r#"EXPLAIN SELECT id FROM "Answer" WHERE "ok" = true"#, 0);
     assert!(
-        detail.iter().any(|d| d.contains(r#"INDEX Answer_ok_idx (ok=?)"#)),
+        detail.iter().any(|d| d.contains("Scan using Answer_ok_idx")),
         "{detail:?}"
     );
     let r = conn

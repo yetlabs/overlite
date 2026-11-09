@@ -16,9 +16,9 @@ fn hstore() {
     let s: String = conn.query_row("SELECT h FROM t WHERE id = 1", &[]).scan().unwrap();
     assert_eq!(s, r#""a"=>"1", "b"=>"2""#);
 
-    // -> value access (value text via ->>).
+    // -> value access, as text.
     let v: String = conn
-        .query_row("SELECT h ->> 'a' FROM t WHERE id = 1", &[])
+        .query_row("SELECT h -> 'a' FROM t WHERE id = 1", &[])
         .scan()
         .unwrap();
     assert_eq!(v, "1");

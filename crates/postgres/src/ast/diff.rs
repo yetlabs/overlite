@@ -376,7 +376,7 @@ fn time_the_statement_mix() {
             return text_tail(s);
         }
         crate::ast::env::with(empty_context(), || crate::ast::translate(s))
-            .unwrap_or_else(|| text_tail(&rewrite_full(s)))
+            .unwrap_or_else(|_| text_tail(&rewrite_full(s)))
     };
     // Warm the cache, as a client's third round would find it: a statement is kept
     // the second time it is translated.

@@ -491,6 +491,23 @@ impl WireConn {
         self.send(MSG_ERROR_RESPONSE, &b)
     }
 
+    /// An ERROR as Postgres sends err: its SQLSTATE, message, HINT and position.
+    pub(crate) fn send_error_of(&mut self, err: &crate::error::Error, message: &str) -> Result<()> {
+        let mut b = error_fields("ERROR", err.sql_state(), message);
+        b.pop();
+        if let Some(hint) = err.hint() {
+            b.push(b'H');
+            append_cstring(&mut b, hint);
+        }
+        if let Some(p) = err.position() {
+            b.push(b'P');
+            append_cstring(&mut b, &p.to_string());
+        }
+        b.push(0);
+        self.errored = true;
+        self.send(MSG_ERROR_RESPONSE, &b)
+    }
+
     fn send_error_severity(&mut self, severity: &str, code: SqlState, message: &str) -> Result<()> {
         let b = error_fields(severity, code, message);
         self.errored = true;

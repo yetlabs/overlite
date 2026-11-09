@@ -242,12 +242,17 @@ fn sql_execute_checks_privileges() {
     for (name, sql) in [
         ("q", "SELECT * FROM secret"),
         ("w", "INSERT INTO secret VALUES (2)"),
-        ("a", "ALTER TABLE secret ADD COLUMN y text"),
-        ("d", "DROP TABLE secret"),
+        ("u", "UPDATE secret SET id = 2"),
+        ("d", "DELETE FROM secret"),
     ] {
         must_exec(&alice, &format!("PREPARE {name} AS {sql}"));
         let err = alice.exec(&format!("EXECUTE {name}"), &[]).unwrap_err();
         assert_sqlstate(&err, "42501");
+    }
+    // PREPARE takes a statement that reads or writes rows, as Postgres' grammar has it.
+    for sql in ["ALTER TABLE secret ADD COLUMN y text", "DROP TABLE secret"] {
+        let err = alice.exec(&format!("PREPARE x AS {sql}"), &[]).unwrap_err();
+        assert_sqlstate(&err, "42601");
     }
     let n: i64 = admin.query_row("SELECT count(*) FROM secret", &[]).scan().unwrap();
     assert_eq!(n, 1);

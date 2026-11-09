@@ -840,7 +840,7 @@ fn sql_json_constructors() {
     assert_eq!(
         scan_str(
             &conn,
-            "SELECT JSON_OBJECT(('k')::text VALUE 1, 'n' : JSON_ARRAY( RETURNING JSONB) RETURNING JSONB)::text"
+            "SELECT JSON_OBJECT(('k')::text : 1, 'n' : JSON_ARRAY( RETURNING JSONB) RETURNING JSONB)::text"
         ),
         r#"{"k":1,"n":[]}"#
     );

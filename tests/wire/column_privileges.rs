@@ -546,9 +546,12 @@ fn unknown_columns_fail_closed() {
     must_exec(&admin, "GRANT SELECT (a) ON t TO carol");
     let dave = connect_as(&addr, "dave", "d");
     must_exec(&admin, "GRANT SELECT ON t TO dave");
+    // SQLite's LIMIT, which Postgres' grammar does not take, is refused for that first.
+    for conn in [&carol, &dave] {
+        let err = conn.exec("SELECT a FROM t LIMIT 0, 1", &[]).unwrap_err();
+        assert_pg_error(&err, "42601", "LIMIT #,# syntax is not supported");
+    }
     for sql in [
-        // SQLite's LIMIT, which Postgres' grammar does not take.
-        "SELECT a FROM t LIMIT 0, 1",
         // A node the reader does not walk, over the one column carol may read.
         "SELECT json_object('k': a) FROM t",
         "SELECT j.a FROM (t JOIN t t2 USING (a)) AS j",

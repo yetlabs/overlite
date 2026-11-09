@@ -13,6 +13,10 @@ pub struct Error {
     kind: ErrorKind,
     message: String,
     source: Option<std::io::Error>,
+    /// Postgres' HINT, for an error that has one.
+    hint: Option<String>,
+    /// Where in the statement the error is, in characters from 1: the P field.
+    position: Option<u32>,
 }
 
 /// The kinds of [`Error`].
@@ -37,7 +41,35 @@ impl Error {
             kind: ErrorKind::Statement(state),
             message: message.into(),
             source: None,
+            hint: None,
+            position: None,
         }
+    }
+
+    /// This error with Postgres' HINT.
+    #[must_use]
+    pub(crate) fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// This error pointing at a character of the statement, from 1.
+    #[must_use]
+    pub(crate) fn at_position(mut self, position: u32) -> Self {
+        self.position = Some(position);
+        self
+    }
+
+    /// The HINT a client is sent, if any.
+    #[must_use]
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
+
+    /// The position a client is sent, if any.
+    #[must_use]
+    pub fn position(&self) -> Option<u32> {
+        self.position
     }
 
     #[must_use]
@@ -83,6 +115,8 @@ impl From<std::io::Error> for Error {
             kind: ErrorKind::Io(e.kind()),
             message: e.to_string(),
             source: Some(e),
+            hint: None,
+            position: None,
         }
     }
 }
@@ -93,6 +127,8 @@ impl From<overlite_engine::Error> for Error {
             kind: ErrorKind::Engine(e.kind()),
             message: e.into_message(),
             source: None,
+            hint: None,
+            position: None,
         }
     }
 }

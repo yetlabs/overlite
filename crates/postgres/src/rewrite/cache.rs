@@ -354,7 +354,7 @@ pub(crate) static ENABLED: std::sync::LazyLock<bool> =
 
 /// f's translation of sql, from the cache when it holds one made under the current
 /// state of what translations depend on (the module's list).
-pub(crate) fn cached(sql: &str, f: impl FnOnce() -> String) -> String {
+pub(crate) fn cached<E>(sql: &str, f: impl FnOnce() -> Result<String, E>) -> Result<String, E> {
     if !*ENABLED || !cacheable(sql) {
         return f();
     }
@@ -366,13 +366,13 @@ pub(crate) fn cached(sql: &str, f: impl FnOnce() -> String) -> String {
     let generation = overlite_engine::collations_generation() ^ stamp;
     let h = CACHE.hash(sql) ^ stamp.rotate_left(29);
     match CACHE.lookup(sql, h, generation) {
-        Lookup::Hit(hit) => hit,
+        Lookup::Hit(hit) => Ok(hit),
         Lookup::Miss { admit } => {
-            let out = f();
+            let out = f()?;
             if admit {
                 CACHE.insert(sql, h, &out, generation);
             }
-            out
+            Ok(out)
         }
     }
 }

@@ -414,7 +414,7 @@ pub(crate) fn is_operand_char(b: u8) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::rewrite::{assert_rewrites, rewrite};
+    use crate::rewrite::assert_rewrites;
 
     #[test]
     fn rewrite_casts_cases() {
@@ -490,7 +490,7 @@ pub(crate) mod tests {
     #[test]
     fn rewrite_casts_reg() {
         assert_rewrites(
-            rewrite,
+            crate::rewrite::text_passes_alone,
             &[
                 (
                     "c.reloftype::pg_catalog.regtype::pg_catalog.text",

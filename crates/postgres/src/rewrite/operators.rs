@@ -490,7 +490,7 @@ pub(crate) mod tests {
     }
 
     use super::*;
-    use crate::rewrite::{assert_rewrites, rewrite};
+    use crate::rewrite::assert_rewrites;
 
     #[test]
     fn rewrite_match_operators_cases() {
@@ -512,7 +512,7 @@ pub(crate) mod tests {
     #[test]
     fn rewrite_operator_syntax_and_collate() {
         assert_rewrites(
-            rewrite,
+            crate::rewrite::text_passes_alone,
             &[
                 (
                     "c.relname OPERATOR(pg_catalog.~) '^(clientes)$' COLLATE pg_catalog.default",

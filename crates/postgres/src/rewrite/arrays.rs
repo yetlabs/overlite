@@ -263,12 +263,12 @@ fn array_subquery_arg(parts: &[String]) -> Option<(String, String)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::rewrite::{assert_rewrites, rewrite};
+    use crate::rewrite::assert_rewrites;
 
     #[test]
     fn rewrite_any_array_cases() {
         assert_rewrites(
-            rewrite,
+            crate::rewrite::text_passes_alone,
             &[
                 (
                     "WHERE relkind OPERATOR(pg_catalog.=) ANY (array['r', 'S', 'v'])",

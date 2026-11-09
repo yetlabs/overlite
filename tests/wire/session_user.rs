@@ -7,7 +7,13 @@ fn current_user_simple_protocol() {
     let conn = connect(&start_server());
     assert_eq!(scan_str(&conn, "SELECT current_user"), "overlite");
     assert_eq!(scan_str(&conn, "SELECT session_user"), "overlite");
-    assert_eq!(scan_str(&conn, "SELECT current_user()"), "overlite");
+    // current_user takes no parentheses, as Postgres' grammar has it.
+    let err = conn
+        .query_row("SELECT current_user()", &[])
+        .scan::<String>()
+        .unwrap_err();
+    assert_pg_error(&err, "42601", "syntax error at or near \"(\"");
+    assert_eq!(pg_error(&err).position, "20");
 }
 
 // set_role: current_user follows SET ROLE; session_user stays the login role;

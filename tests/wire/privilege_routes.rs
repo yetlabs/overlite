@@ -30,6 +30,14 @@ fn denied(conn: &Conn, sql: &str) {
     }
 }
 
+/// Refused as Postgres' grammar refuses it: 42601.
+fn refused_by_grammar(conn: &Conn, sql: &str) {
+    match conn.exec(sql, &[]) {
+        Err(e) if e.code() == "42601" => {}
+        other => panic!("{sql}: {other:?}"),
+    }
+}
+
 fn strings(conn: &Conn, sql: &str) -> Vec<String> {
     query_column(conn, sql, 0)
 }
@@ -103,11 +111,10 @@ fn prepared_cursor_and_copy_routes_are_checked() {
         "42501",
     );
     assert_eq!(String::from_utf8_lossy(&out), "");
-    // SQLite's INSERT OR REPLACE does not parse as Postgres, and is read from its text:
-    // what it reads still needs SELECT.
-    alice
-        .exec("INSERT OR REPLACE INTO pub SELECT id, s FROM secret", &[])
-        .unwrap_err();
+    // SQLite's INSERT OR REPLACE is refused as Postgres refuses it, before any grant
+    // is read.
+    refused_by_grammar(&alice, "INSERT OR REPLACE INTO pub SELECT id, s FROM secret");
+    refused_by_grammar(&admin, "INSERT OR REPLACE INTO pub SELECT id, s FROM secret");
     assert_eq!(strings(&admin, "SELECT count(*)::text FROM pub"), ["0"]);
 }
 
@@ -133,7 +140,9 @@ fn a_trigger_body_needs_the_writers_privileges() {
         &admin,
         "CREATE TRIGGER audit AFTER INSERT ON pub BEGIN INSERT INTO secret VALUES (NEW.id, NEW.v); END",
     );
-    denied(&alice, "DROP TRIGGER audit");
+    denied(&alice, "DROP TRIGGER audit ON pub");
+    // SQLite's DROP TRIGGER without its table is refused as Postgres refuses it.
+    refused_by_grammar(&alice, "DROP TRIGGER audit");
     // The body writes secret, which alice may not.
     denied(&alice, "INSERT INTO pub VALUES (1, 'x')");
     must_exec(&admin, "GRANT INSERT ON secret TO alice");
@@ -156,9 +165,15 @@ fn the_servers_own_tables_are_a_superusers() {
     );
     denied(&alice, "DELETE FROM _overlite_policies");
     denied(&alice, "SELECT * FROM main._overlite_owners");
-    denied(&alice, "PRAGMA writable_schema = 1");
-    denied(&alice, "ATTACH DATABASE ':memory:' AS x");
-    denied(&alice, "VACUUM INTO '/nonexistent/copy.db'");
+    // SQLite's own statements are refused as Postgres refuses them, for every role.
+    for sql in [
+        "PRAGMA writable_schema = 1",
+        "ATTACH DATABASE ':memory:' AS x",
+        "VACUUM INTO '/nonexistent/copy.db'",
+    ] {
+        refused_by_grammar(&alice, sql);
+        refused_by_grammar(&admin, sql);
+    }
     denied(&alice, "SELECT data FROM sqlite_dbpage");
     denied(&alice, "SELECT data FROM sqlite_dbpage('main')");
     denied(&alice, "UPDATE sqlite_dbpage SET data = NULL WHERE pgno = 2");

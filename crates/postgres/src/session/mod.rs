@@ -25,7 +25,7 @@ use crate::ddl::exclude::creates_exclusions;
 use crate::ddl::sequences::{has_seq_func, is_sequence_ddl, neutralize_sequences};
 use crate::error::{Result, errf};
 use crate::rewrite::blank::{is_blank_statement, statement_text};
-use crate::rewrite::rewrite;
+use crate::rewrite::translate;
 use crate::session::advisory::{TxAdvisoryHold, has_advisory_func, neutralize_advisory_locks, release_advisory_locks};
 use crate::session::cancel::Canceler;
 use crate::session::notify::{NotifyState, is_listen_notify, unregister_all};
@@ -305,11 +305,11 @@ impl Session {
         let x = self.expand_enums(&x)?;
         let sql = crate::ast::env::with(self.type_context(&x), || {
             if x == raw {
-                rewrite(&x)
+                translate(&x)
             } else {
                 crate::rewrite::rewrite_expanded(raw, &x)
             }
-        });
+        })?;
         if skip_all {
             // SKIP LOCKED while another transaction holds the write lock: every row is
             // locked, so none is returned.
@@ -582,17 +582,28 @@ impl Session {
                 return self.proto_error(e.sql_state(), e.message());
             }
         };
+        if let Some(e) = crate::ast::grammar_refusal(&raw) {
+            self.mark_tx_failed();
+            return self.proto_exec_error(&e);
+        }
         if let Some(route) = self.route_of(&raw) {
             return self.put_prepared(name, Prepared::routed(route));
         }
         let described = self.described_text(&raw);
         let sql = crate::ast::env::with(self.type_context(&raw), || {
             if described == raw {
-                rewrite(&raw)
+                translate(&raw)
             } else {
                 crate::rewrite::rewrite_expanded(&raw, &described)
             }
         });
+        let sql = match sql {
+            Ok(sql) => sql,
+            Err(e) => {
+                self.mark_tx_failed();
+                return self.proto_exec_error(&e);
+            }
+        };
         let num_params = count_params(&sql);
         self.put_prepared(
             name,
@@ -837,9 +848,12 @@ impl Session {
             // or take a lock; neutralize the calls to a constant, then rewrite.
             let described = self.described_text(&raw);
             let neutral = neutralize_advisory_locks(&neutralize_sequences(&described));
-            desc_sql = crate::ast::env::with(self.type_context(&raw), || {
+            desc_sql = match crate::ast::env::with(self.type_context(&raw), || {
                 crate::rewrite::rewrite_expanded(&raw, &neutral)
-            });
+            }) {
+                Ok(sql) => sql,
+                Err(e) => return self.proto_exec_error(&e),
+            };
         }
         let cols = match self.describe_sql(&desc_sql, &args) {
             Ok(c) => c,
@@ -1128,6 +1142,7 @@ impl Session {
                 Ok(rs) => rs,
                 Err(e) => {
                     log_query_error("execute", &e, &exec_sql, &prep.sql);
+                    let e = postgres_syntax_error(&prep.raw, e);
                     self.mark_tx_failed();
                     if own_tx {
                         self.end_tx(false)?;
@@ -1369,6 +1384,18 @@ fn highest_in(code: &str) -> usize {
         i = start + digits;
     }
     max
+}
+
+/// SQLite's syntax error for a statement Postgres' grammar refuses too, which the fast
+/// path sent to SQLite as written: Postgres' own error for it, with its position.
+pub(crate) fn postgres_syntax_error(raw: &str, e: crate::error::Error) -> crate::error::Error {
+    if e.sql_state() == SqlState::SYNTAX_ERROR
+        && matches!(e.kind(), crate::error::ErrorKind::Engine(_))
+        && let Some(pe) = crate::ast::parse::error_of(raw)
+    {
+        return pe;
+    }
+    e
 }
 
 /// Counts positional placeholders: the highest $N index, or the number of bare
@@ -1631,7 +1658,11 @@ pub(crate) mod tests {
                 needs_no_rewrite(&bare),
                 "fast path of {with:?}"
             );
-            assert_eq!(squash(&rewrite(&door)), squash(&rewrite(&bare)), "rewrite of {with:?}");
+            assert_eq!(
+                squash(&crate::rewrite::rewrite(&door)),
+                squash(&crate::rewrite::rewrite(&bare)),
+                "rewrite of {with:?}"
+            );
             assert_eq!(
                 squash(&rewrite_full(&door)),
                 squash(&rewrite_full(&bare)),

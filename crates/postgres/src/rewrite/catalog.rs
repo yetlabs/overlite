@@ -240,7 +240,7 @@ lazy_regex!(pub(crate) RE_PUBLIC, r#"(?i)"?\bpublic\b"?\."#);
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::rewrite::{assert_rewrites, rewrite};
+    use crate::rewrite::assert_rewrites;
 
     #[test]
     fn rewrite_information_schema_cases() {
@@ -299,7 +299,12 @@ pub(crate) mod tests {
 
     #[test]
     fn rewrite_object_defs_cases() {
-        assert!(rewrite("pg_catalog.pg_get_indexdef(i.indexrelid, 0, true)").contains("USING btree"));
-        assert!(rewrite("pg_catalog.pg_get_constraintdef(con.oid, true)").contains("FOREIGN KEY"));
+        assert!(
+            crate::rewrite::text_passes_alone("pg_catalog.pg_get_indexdef(i.indexrelid, 0, true)")
+                .contains("USING btree")
+        );
+        assert!(
+            crate::rewrite::text_passes_alone("pg_catalog.pg_get_constraintdef(con.oid, true)").contains("FOREIGN KEY")
+        );
     }
 }

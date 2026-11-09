@@ -106,10 +106,7 @@ fn concurrent_tenant_writes() {
     let setup = connect(&addr);
     for s in ["acme", "globex"] {
         must_exec(&setup, &format!("CREATE SCHEMA {s}"));
-        must_exec(
-            &setup,
-            &format!("CREATE TABLE {s}.t (id integer primary key autoincrement, v text)"),
-        );
+        must_exec(&setup, &format!("CREATE TABLE {s}.t (id serial primary key, v text)"));
     }
 
     const PER_TENANT: i64 = 40;

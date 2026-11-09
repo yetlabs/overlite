@@ -17,6 +17,7 @@ mod array;
 mod ast_catalog;
 mod ast_ddl;
 mod ast_fixes;
+mod ast_refusals;
 mod ast_shapes;
 mod ast_types;
 mod auth;

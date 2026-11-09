@@ -145,6 +145,27 @@ fn trim_num(f: f64) -> String {
     json_number(f)
 }
 
+/// hstore's `->`: the value of key as text, NULL for a key it does not have or a NULL
+/// value; of a JSON array of keys (a text[]), the JSON array of their values.
+pub(crate) fn hstore_get(json_text: &str, key: &str) -> Option<String> {
+    let m = hstore_map(json_text);
+    let value = |k: &str| match m.get(k) {
+        None | Some(Json::Null) => None,
+        Some(v) => Some(val_to_string(v)),
+    };
+    if let Some(Json::Arr(keys)) = json_unmarshal(key).filter(|_| key.starts_with('[')) {
+        let parts: Vec<String> = keys
+            .iter()
+            .map(|k| match k {
+                Json::Str(k) => value(k).map_or_else(|| "null".to_string(), |v| json_quote(&v)),
+                _ => "null".to_string(),
+            })
+            .collect();
+        return Some(format!("[{}]", parts.join(",")));
+    }
+    value(key)
+}
+
 /// The keys as a JSON array (the array storage format), sorted by key.
 pub(crate) fn hstore_keys(json_text: &str) -> String {
     let m = hstore_map(json_text);

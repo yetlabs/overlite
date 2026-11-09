@@ -460,6 +460,11 @@ impl Session {
         };
         let sql = sql.as_ref();
 
+        // What Postgres' grammar refuses is answered first, as Postgres parses first.
+        if let Some(e) = crate::ast::grammar_refusal(sql) {
+            return self.fail_tx_send(&e);
+        }
+
         // Transaction control is handled by the session.
         if let Some(control) = TxControl::of(sql) {
             return match self.apply_tx_control(control) {
@@ -673,6 +678,7 @@ impl Session {
             Ok(rs) => rs,
             Err(e) => {
                 log_query_error("simple", &e, &sql, &rewritten);
+                let e = crate::session::postgres_syntax_error(&sql, e);
                 self.mark_tx_failed();
                 return self.send_exec_error(&e);
             }
@@ -697,6 +703,6 @@ impl Session {
 
     fn fail_tx_send(&mut self, e: &Error) -> Result<()> {
         self.mark_tx_failed();
-        self.c.send_error(e.sql_state(), e.message())
+        self.c.send_error_of(e, e.message())
     }
 }
