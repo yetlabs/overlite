@@ -1387,27 +1387,31 @@ impl<'a> Emitter<'a> {
             NodeEnum::CoalesceExpr(_) | NodeEnum::MinMaxExpr(_) => true,
             NodeEnum::AExpr(a) => a.kind == pb::AExprKind::AexprNullif as i32,
             NodeEnum::SubLink(s) => s.sub_link_type == SubLinkType::ExprSublink as i32,
-            NodeEnum::FuncCall(f) => matches!(
-                func_name(f),
-                Some(
-                    "min"
-                        | "max"
-                        | "any_value"
-                        | "lag"
-                        | "lead"
-                        | "first_value"
-                        | "last_value"
-                        | "nth_value"
-                        | "sum"
-                        | "avg"
-                        | "abs"
-                        | "round"
-                        | "ceil"
-                        | "ceiling"
-                        | "floor"
-                        | "date_trunc"
-                )
-            ),
+            NodeEnum::FuncCall(f) => {
+                matches!(
+                    func_name(f),
+                    Some(
+                        "min"
+                            | "max"
+                            | "any_value"
+                            | "lag"
+                            | "lead"
+                            | "first_value"
+                            | "last_value"
+                            | "nth_value"
+                            | "sum"
+                            | "avg"
+                            | "abs"
+                            | "round"
+                            | "ceil"
+                            | "ceiling"
+                            | "floor"
+                            | "date_trunc"
+                    )
+                ) || (matches!(func_name(f), Some("lower" | "upper"))
+                    && f.args.len() == 1
+                    && node(&f.args[0]).is_ok_and(|x| self.is_range(x)))
+            }
             _ => false,
         };
         if !passes {
@@ -4289,6 +4293,19 @@ impl<'a> Emitter<'a> {
             [schema, n] if string(schema)? == "pg_catalog" => string(n)?,
             _ => return Err("qualified function"),
         };
+        // lower and upper of what the environment knows is a range: its bound, NULL for
+        // the empty range, where the overloaded lower would read `empty` as text.
+        if self.typed()
+            && matches!(name, "lower" | "upper")
+            && let [x] = f.args.as_slice()
+            && f.over.is_none()
+            && self.is_range(node(x)?)
+        {
+            self.push("overlite_range_bound(");
+            self.expr(node(x)?, Prec::Or)?;
+            self.push(if name == "lower" { ", 0)" } else { ", 1)" });
+            return Ok(());
+        }
         if self.ddl
             && f.args.is_empty()
             && matches!(

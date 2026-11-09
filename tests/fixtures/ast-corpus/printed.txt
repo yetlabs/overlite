@@ -2153,7 +2153,7 @@ ok	CREATE FUNCTION addy(a int, b int) RETURNS int LANGUAGE sql AS $$ SELECT a + 
 ok	CREATE OR REPLACE FUNCTION noop() RETURNS void AS $$ BEGIN END $$ LANGUAGE plpgsql
 ok	DROP FUNCTION addy(int, int)
 ok	SELECT int4range(1, 10) AS "int4range" /*overlite typed*/
-ok	SELECT lower(int4range(1, 10)) AS "lower", upper(int4range(1, 10)) AS "upper" /*overlite typed int4,int4*/
+ok	SELECT overlite_range_bound(int4range(1, 10), 0) AS "lower", overlite_range_bound(int4range(1, 10), 1) AS "upper" /*overlite typed int4,int4*/
 ok	SELECT json_contains(int4range(1, 10), 10) AS "?column?" /*overlite typed bool*/
 ok	SELECT isempty(int4range(5, 5)) AS "isempty" /*overlite typed bool*/
 ok	CREATE TABLE t (r int4range)
@@ -14395,8 +14395,8 @@ ok	SELECT 1 AS "_check" WHERE coalesce(CASE WHEN overlite_assign('{}', 'bigint[]
 ok	SELECT 1 AS "_check" WHERE coalesce(CASE WHEN overlite_assign(overlite_assign('{1}', 'bigint[]'), 'bigint[]') IS NULL THEN NULL ELSE coalesce(array_length(overlite_assign(overlite_assign('{1}', 'bigint[]'), 'bigint[]'), 1), 0) END = 1, true) /*overlite typed int4*/
 ok	ALTER TABLE "postgres_tests_rangesmodel" ADD CONSTRAINT "dates_contains" CHECK (json_contains(dates, dates_inner))
 ok	SELECT 1 AS "_check" WHERE coalesce(pg_bool(overlite_range_op('@>', overlite_cast('[6,10)', 'int4range'), overlite_cast('[1,5)', 'int4range'))), true) /*overlite typed int4*/
-ok	SELECT 1 AS "_check" WHERE coalesce(lower(overlite_cast('[-1,20)', 'int4range')) >= 0 AND upper(overlite_cast('[-1,20)', 'int4range')) <= 99, true) /*overlite typed int4*/
-ok	SELECT 1 AS "_check" WHERE coalesce(lower(overlite_cast('[5,10)', 'int4range')) >= 0, true) /*overlite typed int4*/
+ok	SELECT 1 AS "_check" WHERE coalesce(overlite_range_bound(overlite_cast('[-1,20)', 'int4range'), 0) >= 0 AND overlite_range_bound(overlite_cast('[-1,20)', 'int4range'), 1) <= 99, true) /*overlite typed int4*/
+ok	SELECT 1 AS "_check" WHERE coalesce(overlite_range_bound(overlite_cast('[5,10)', 'int4range'), 0) >= 0, true) /*overlite typed int4*/
 ok	ALTER TABLE "postgres_tests_rangesmodel" ADD CONSTRAINT "ints_between" CHECK (json_contains('[10,30)', ints))
 ok	CREATE UNIQUE INDEX "test_opclass" ON "postgres_tests_scene" ("scene" /*varchar_pattern_ops*/)
 ok	CREATE UNIQUE INDEX "test_opclass_func" ON "postgres_tests_scene" ((LOWER("scene")) /*text_pattern_ops*/)

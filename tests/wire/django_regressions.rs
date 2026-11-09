@@ -353,3 +353,38 @@ fn an_int4_key_is_described_as_one() {
     assert_eq!(texts(&conn, "SELECT * FROM i8").0, [20]);
     assert_eq!(rows(&conn, "SELECT id FROM s4 ORDER BY id"), ["1", "2"]);
 }
+
+// lower and upper of the empty range are NULL; the overloaded lower read `empty` as
+// text, so a filter on lower(r) >= 0 kept the empty range and a select sent `empty`.
+// A bound of a date or timestamptz range went out as text.
+#[test]
+fn the_bounds_of_the_empty_range_are_null() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE TABLE rb (id int, r int4range, d daterange, t tstzrange)");
+    must_exec(
+        &conn,
+        "INSERT INTO rb VALUES (1, '[0,10)', '[2020-01-01,2020-02-01)', '[2020-01-01 00:00+00,2020-01-02 00:00+00)'), \
+         (2, '[-5,10)', NULL, NULL), (3, 'empty', 'empty', 'empty'), (4, NULL, NULL, NULL), (5, '(,5)', '[2020-01-01,)', '(,)')",
+    );
+    assert_eq!(rows(&conn, "SELECT id FROM rb WHERE lower(r) >= 0 ORDER BY 1"), ["1"]);
+    let q = "SELECT lower(r), upper(r), lower(d), upper(d), lower(t), upper(t) FROM rb ORDER BY id";
+    assert_eq!(texts(&conn, q).0, [23, 23, 1082, 1082, 1184, 1184]);
+    assert_eq!(
+        rows(&conn, q),
+        [
+            "0|10|2020-01-01|2020-02-01|2020-01-01 00:00:00+00|2020-01-02 00:00:00+00",
+            "-5|10|NULL|NULL|NULL|NULL",
+            "NULL|NULL|NULL|NULL|NULL|NULL",
+            "NULL|NULL|NULL|NULL|NULL|NULL",
+            "NULL|5|2020-01-01|NULL|NULL|NULL",
+        ]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT lower('empty'::int4range) IS NULL, upper('[1,2]'::int4range), lower('ABC')"
+        ),
+        ["t|3|abc"]
+    );
+}

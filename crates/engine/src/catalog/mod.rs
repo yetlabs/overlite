@@ -1312,6 +1312,24 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     range_acc(conn, "upper_inc", |r| Value::Int(bool_int(!r.empty && r.hi_inc)))?;
     range_acc(conn, "lower_inf", |r| Value::Int(bool_int(!r.empty && r.lo.is_none())))?;
     range_acc(conn, "upper_inf", |r| Value::Int(bool_int(!r.empty && r.hi.is_none())))?;
+    // A range's lower (0) or upper (1) bound, as the AST path writes lower and upper of
+    // a range: NULL for the empty range and an infinite bound.
+    scalar(conn, "overlite_range_bound", 2, |a| {
+        if a[0].is_null() {
+            return Ok(Value::Null);
+        }
+        let Some(r) = parse_range(&a[0].to_string()) else {
+            return Ok(Value::Null);
+        };
+        if r.empty {
+            return Ok(Value::Null);
+        }
+        Ok(bound_value(if matches!(a[1], Value::Int(1)) {
+            r.hi.as_ref()
+        } else {
+            r.lo.as_ref()
+        }))
+    })?;
     // lower/upper are overloaded: a range yields its bound, otherwise the string
     // case functions (which SQLite provides). The word `empty` stays a string: as text
     // it is far likelier than the empty range.
