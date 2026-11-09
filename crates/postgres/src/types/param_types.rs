@@ -352,14 +352,6 @@ impl Session {
     }
 }
 
-pub(crate) fn unquote(name: &str) -> String {
-    let name = name.trim();
-    if name.len() >= 2 && name.starts_with('"') && name.ends_with('"') {
-        return name[1..name.len() - 1].replace("\"\"", "\"");
-    }
-    name.to_string()
-}
-
 /// Splits on the commas outside parentheses and quotes.
 pub(crate) fn split_top(s: &str) -> Vec<String> {
     let mut out = Vec::new();

@@ -6,9 +6,9 @@ grammar (`ast`, docs/adr/0001-sql-ast.md), classified by its node and run by SQL
 statement that reads or writes rows, the catalog's included, is translated from the
 tree, with its labels, parameter types and the types of its expressions read from it
 and the catalog, and so is DDL (CREATE TABLE, CREATE INDEX, ALTER TABLE, DROP, views).
-What Postgres' grammar does not read (SQLite's own dialect, which is served as it was,
-and what Postgres refuses) is classified by its words and goes through the text
-rewrites, which stage 5c deletes.
+There are no text rewrites: what the tree does not translate is refused, with
+Postgres' own error where Postgres refuses it too, and SQLite's own `CREATE TRIGGER
+... BEGIN ... END` is the one statement run as written.
 
 ## Crates
 
@@ -72,11 +72,12 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   tsquery in their text form, matching, ts_rank and ts_rank_cd).
 - `resolve`: per-statement name resolution, for the answers that depend on the
   session: schema qualification, search_path, `current_schema()`,
-  `current_database()`, `to_regclass()` (`resolve_names`, run on every statement), and
-  the type passes (`resolve_types`), which run on every statement but one the AST path
-  typed, which ends in `TYPED_MARK` (`split_typed` takes the mark off, and with it
-  the result columns' types it may carry: integer widths, booleans, arrays' element
-  types): `time_zone`, which prepares a probe over a
+  `current_database()`, `to_regclass()` (`resolve_names`, run on every statement).
+  A statement the translation typed ends in `TYPED_MARK`; `split_typed` takes the
+  mark off, and with it the result columns' types it may carry (integer widths,
+  booleans, arrays' element types), which `apply_result_types` gives the columns.
+  Until stage 5c of the AST migration the engine also had type passes over the text
+  of every untyped statement (`time_zone`, which prepared a probe over a
   statement's FROM to read a column's declared type: which way an AT TIME ZONE goes, and
   whether a timestamp with an offset is a time or a text. `names` reads the tables of a
   statement with their aliases, at any depth, and the column each parameter meets;
@@ -96,8 +97,9 @@ policy on poisoned locks. `text` holds the escaping of bytes outside UTF-8 (belo
   expression that is not a column as `(CAST(overlite_numeric(e) AS DECIMALTEXT)
   COLLATE DECIMAL)`, the affinity and collation a numeric column has, so that it
   compares as a number;
-  `tsvector` makes `length(col)` and `col || col` of a tsvector column count its
-  lexemes and concatenate, by the same probe.
+  `tsvector` made `length(col)` and `col || col` of a tsvector column count its
+  lexemes and concatenate, by the same probe); the printer writes all of it from its
+  type environment now, and there is no untyped statement left for them.
 - `sql_funcs`: `LANGUAGE sql` functions: stored with their owner, SECURITY DEFINER
   and EXECUTE list, and their calls found (`DbSession::function_calls`, by the names
   kept per database in `DbState`, never a built-in's). The engine inlines none; the

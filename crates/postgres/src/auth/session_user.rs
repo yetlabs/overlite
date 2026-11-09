@@ -5,13 +5,10 @@
 
 use crate::auth::privileges::lowercase;
 use crate::ddl::sequences::{is_ident_part, is_ident_start};
-use crate::ddl::words::{Word, ddl_words};
 use crate::error::{Result, errf};
-use crate::rewrite::functions::skip_spaces;
-use crate::rewrite::strings::end_of_string_literal;
 use crate::session::Session;
 use overlite_core::SqlState;
-use overlite_core::text::{eq_fold, quote_literal, quoted, split_words, string_from_cut_utf8};
+use overlite_core::text::{end_of_string_literal, eq_fold, quote_literal, quoted, string_from_cut_utf8};
 
 impl Session {
     /// Replaces current_user / current_role / session_user (bare or called) with
@@ -55,9 +52,10 @@ impl Session {
                 }
             };
             // Consume an optional "()" call suffix.
-            let k = skip_spaces(sql, j);
+            let skip_spaces = |p: usize| p + s[p..].iter().take_while(|c| c.is_ascii_whitespace()).count();
+            let k = skip_spaces(j);
             if k < s.len() && s[k] == b'(' {
-                let m = skip_spaces(sql, k + 1);
+                let m = skip_spaces(k + 1);
                 if m < s.len() && s[m] == b')' {
                     j = m + 1;
                 }
@@ -217,53 +215,10 @@ pub(crate) fn is_set_role(sql: &str) -> bool {
 }
 
 /// What a SET or RESET of the role or the session's authorization asks for, by its
-/// tree (`classify::set_role`), or by its text where Postgres' grammar does not read
-/// it; None for any other statement.
+/// tree (`classify::set_role`); None for any other statement. One Postgres' grammar
+/// does not read never gets here (`ast::grammar_refusal`).
 pub(crate) fn role_change(sql: &str) -> Option<Result<crate::ast::classify::RoleChange>> {
-    if let Some(change) = crate::ast::classify::read(sql, crate::ast::classify::set_role) {
-        return change.map(Ok);
-    }
-    is_set_role_text(sql).then(|| role_change_text(sql))
-}
-
-/// `is_set_role` by the text: SET or RESET, then ROLE or SESSION AUTHORIZATION.
-pub(crate) fn is_set_role_text(sql: &str) -> bool {
-    let f = split_words(sql);
-    if f.len() < 2 {
-        return false;
-    }
-    match f[0].to_uppercase().as_str() {
-        "SET" | "RESET" => {
-            eq_fold(f[1], "role") || (f.len() >= 3 && eq_fold(f[1], "session") && eq_fold(f[2], "authorization"))
-        }
-        _ => false,
-    }
-}
-
-fn role_change_text(sql: &str) -> Result<crate::ast::classify::RoleChange> {
-    let f = split_words(sql);
-    let session_authorization = !f.get(1).is_some_and(|w| eq_fold(w, "role"));
-    let reset = f.first().is_some_and(|w| eq_fold(w, "reset"));
-    let target = if reset { String::new() } else { role_target(sql)? };
-    let reset = reset || (!session_authorization && eq_fold(&target, "none"));
-    Ok(crate::ast::classify::RoleChange {
-        session_authorization,
-        reset,
-        local: false,
-        target,
-    })
-}
-
-/// Reads the role name after an optional TO / = from the tokens.
-fn role_target(sql: &str) -> Result<String> {
-    let words = ddl_words(sql)?;
-    let value = words
-        .iter()
-        .skip(2)
-        .find(|w| !w.is("to") && **w != Word::Punct('=') && !w.is("authorization"));
-    Ok(match value {
-        Some(Word::Str(s)) => s.clone(),
-        Some(word) => word.name().unwrap_or_default().to_string(),
-        None => String::new(),
-    })
+    crate::ast::classify::read(sql, crate::ast::classify::set_role)
+        .flatten()
+        .map(Ok)
 }

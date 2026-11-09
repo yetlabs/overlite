@@ -76,6 +76,18 @@ fn no_operator(op: &str, l: Ty, r: Ty, at: i32) -> Unsupported {
 
 type Out = Result<(), Unsupported>;
 
+/// Reports whether a Postgres collation name denotes a case-insensitive
+/// collation (by convention or ICU comparison level).
+pub(crate) fn collation_is_ci(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("nocase")
+        || n.contains("insensitive")
+        || n.contains("ks-level1")
+        || n.contains("ks-level2")
+        || n.ends_with("_ci")
+        || n.ends_with("-ci")
+}
+
 /// The value of a literal under a cast, as a literal: what a cast of a literal in a
 /// table's DDL is stored as. None when it is not one or fails to convert, which leaves
 /// it to SQLite.
@@ -2673,7 +2685,7 @@ impl<'a> Emitter<'a> {
             [" COLLATE ", name].concat()
         } else if overlite_engine::collation_known(name) {
             [" COLLATE \"", &name.replace('"', "\"\""), "\""].concat()
-        } else if crate::rewrite::operators::collation_is_ci(name) {
+        } else if collation_is_ci(name) {
             " COLLATE NOCASE".to_string()
         } else {
             String::new()

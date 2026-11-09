@@ -12,14 +12,7 @@ use std::time::Instant;
 
 /// Whether sql is an EXPLAIN.
 pub(crate) fn is_explain(sql: &str) -> bool {
-    crate::ast::classify::read(sql, crate::ast::classify::explain).unwrap_or_else(|| is_explain_text(sql))
-}
-
-/// `is_explain` by the text, for what Postgres' grammar does not read (SQLite's
-/// EXPLAIN QUERY PLAN).
-pub(crate) fn is_explain_text(sql: &str) -> bool {
-    let head = sql.trim_start().as_bytes();
-    head.len() > 7 && head[..7].eq_ignore_ascii_case(b"explain") && !head[7].is_ascii_alphanumeric()
+    crate::ast::classify::read(sql, crate::ast::classify::explain).unwrap_or_default()
 }
 
 /// The statement an EXPLAIN explains, whatever its options, SQLite's EXPLAIN QUERY

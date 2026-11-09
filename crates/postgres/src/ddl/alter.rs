@@ -9,37 +9,19 @@ use crate::auth::grants::index_word;
 use crate::auth::rls::{balanced_paren, is_rls_ddl, text_or_empty};
 use crate::ddl::alter_actions::split_alter_actions;
 use crate::ddl::column_if_exists::has_column_if_exists;
-use crate::ddl::drop_constraint::{parse_drop_column, parse_drop_constraint};
+use crate::ddl::drop_constraint::{DropColumn, DropConstraint};
 use crate::ddl::exclude::parse_exclusion;
 use crate::ddl::identity::retype_identity;
 use crate::ddl::sequences::{is_ident_part, is_ident_start, split_top_level};
+use crate::ddl::tree::{self, code_tokens};
 use crate::error::{Error, Result, errf};
-use crate::rewrite::catalog::{RE_PUBLIC, is_word_byte};
-use crate::rewrite::ddl_syntax::mark_key_deferral;
-use crate::rewrite::operators::rewrite_collate;
 use crate::rewrite::rewrite;
-use crate::rewrite::strings::end_of_string_literal;
-use crate::rewrite::tokens::code_tokens;
 use crate::session::Session;
 use crate::session::utility::{alter_is_noop, first_word_upper, log_query, second_word_upper, unquote_ident};
-use crate::types::numeric::retype_numeric;
-use overlite_core::text::{
-    eq_fold, quote_ident, quote_literal, quoted, replace_all, slice, split_words, trim_end_chars, trim_start_chars,
-};
+use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted, slice, trim_start_chars};
 use overlite_core::{Command, SqlState, lazy_regex};
-use overlite_engine::{
-    NOT_VALID_MARK, assignment_type, code_only, move_table_rows_sql, split_stored_name, stored_table_name,
-};
-
-// The table of ALTER TABLE IF EXISTS, however it is qualified and quoted.
-lazy_regex!(
-    RE_ALTER_TARGET,
-    r#"(?is)^\s*ALTER\s+TABLE\s+(IF\s+EXISTS\s+)?(?:ONLY\s+)?((?:"(?:[^"]|"")+"|[\w$]+)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[\w$]+))?)\s*(.*)$"#
-);
-lazy_regex!(
-    RE_ALTER_IF_EXISTS,
-    r#"(?is)^\s*ALTER\s+TABLE\s+IF\s+EXISTS\s+(?:ONLY\s+)?((?:"(?:[^"]|"")+"|[\w$]+)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[\w$]+))?)"#
-);
+use overlite_engine::{NOT_VALID_MARK, assignment_type, move_table_rows_sql, split_stored_name, stored_table_name};
+use pg_query::NodeEnum;
 
 impl Session {
     /// Handles the ALTER TABLE forms we can implement; None for the rest (which
@@ -52,20 +34,14 @@ impl Session {
         let target = alter_target(sql)?;
         let if_exists = target.if_exists;
         // Clients qualify with public.; in SQLite that schema is the unqualified
-        // name, while any other schema really is part of the table's name. Both
-        // halves may be quoted, which is how every ORM writes them.
-        let table = self.stored_table(unquote_ref(&replace_all(&RE_PUBLIC, target.reference, "")));
-        let f = split_words(target.action);
-        let rest = &f[..];
-        if rest.is_empty() {
-            return None;
-        }
+        // name, while any other schema really is part of the table's name.
+        let table = self.stored_table(target.unqualified.clone());
         let tag = || Command::from("ALTER TABLE");
         if let Some(r) = self.column_if_exists(sql, &table) {
             return Some(r.map(|()| tag()));
         }
-        match rest[0].to_uppercase().as_str() {
-            "ADD" => {
+        match &target.kind {
+            AlterKind::Add => {
                 // A rebuild puts the constraint in the CREATE TABLE, where the catalog
                 // reads it back as a constraint rather than as a bare index, which is
                 // what lets a dump round-trip. Both fallbacks below keep a restore
@@ -84,42 +60,33 @@ impl Session {
                 if let Some(def) = add_column_computed_default(sql) {
                     // The reference as written, not the unqualified name: the rebuild
                     // has to find the table in its own schema.
-                    return Some(self.alter_add_column_default(&unquote_ref(target.reference), &def).map(|()| tag()));
+                    return Some(
+                        self.alter_add_column_default(&unquote_ref(&target.reference), &def)
+                            .map(|()| tag()),
+                    );
                 }
                 if adds_unique(sql) {
                     return Some(self.alter_add_unique(sql, &table).map(|()| tag()));
                 }
             }
-            "ALTER" => return Some(self.alter_column(sql, &table, &rest[1..]).map(|()| tag())),
-            "VALIDATE" if rest.len() >= 3 && eq_fold(rest[1], "constraint") => {
-                let name = unquote_ident(trim_end_chars(rest[2], ";"));
-                match self.validate_check(&table, &name) {
-                    Ok(true) => return Some(Ok(tag())),
-                    Ok(false) => {}
-                    Err(e) => return Some(Err(e)),
-                }
+            AlterKind::AlterColumn(column, cmd) => {
+                return Some(self.alter_column(sql, &table, column, cmd).map(|()| tag()));
             }
-            "DROP" => {
-                if let Some(drop) = parse_drop_constraint(sql) {
-                    return Some(self.alter_drop_constraint(&table, &drop, if_exists).map(|()| tag()));
-                }
-                if let Some(drop) = parse_drop_column(sql) {
-                    return Some(self.alter_drop_column(&table, &drop).map(|()| tag()));
-                }
+            AlterKind::Validate(name) => match self.validate_check(&table, name) {
+                Ok(true) => return Some(Ok(tag())),
+                Ok(false) => {}
+                Err(e) => return Some(Err(e)),
+            },
+            AlterKind::DropConstraint(drop) => {
+                return Some(self.alter_drop_constraint(&table, drop, if_exists).map(|()| tag()));
             }
-            "RENAME" if rest.len() >= 3 && eq_fold(rest[1], "to") => {
-                let new_name = unquote_ident(trim_end_chars(rest[2], ";"));
-                return Some(self.alter_rename(&table, &new_name).map(|()| tag()));
+            AlterKind::DropColumn(drop) => {
+                return Some(self.alter_drop_column(&table, drop).map(|()| tag()));
             }
-            "SET"
-                // ALTER TABLE t SET SCHEMA y -- move the table between schemas.
-                if rest.len() >= 3 && eq_fold(rest[1], "schema") => {
-                    return Some(
-                        self.alter_set_schema(&table, &unquote_ident(rest[2]))
-                            .map(|()| tag()),
-                    );
-                }
-            _ => {}
+            AlterKind::Rename(new_name) => return Some(self.alter_rename(&table, new_name).map(|()| tag())),
+            // ALTER TABLE t SET SCHEMA y -- move the table between schemas.
+            AlterKind::SetSchema(schema) => return Some(self.alter_set_schema(&table, schema).map(|()| tag())),
+            AlterKind::Other => {}
         }
         None
     }
@@ -128,10 +95,10 @@ impl Session {
     /// action: a notice for the client, and true. Every route comes through here
     /// first, as most of them would fail or write down a row for the table.
     pub(crate) fn alter_skipped(&mut self, sql: &str) -> Result<bool> {
-        let Some(m) = RE_ALTER_IF_EXISTS.captures(sql) else {
+        let Some(target) = alter_target(sql).filter(|t| t.if_exists) else {
             return Ok(false);
         };
-        let reference = m.get(1).map_or("", |x| x.as_str());
+        let reference = target.reference.as_str();
         let stored = self.stored_name(reference);
         let q = "SELECT 1 FROM main.sqlite_master WHERE type IN ('table', 'view') AND lower(name) = lower(".to_string()
             + &quote_literal(&stored)
@@ -215,26 +182,128 @@ pub(crate) fn alter_table_routed(sql: &str) -> bool {
         || split_alter_actions(sql).len() > 1
         || alter_is_noop(sql)
         || is_rls_ddl(sql)
-        || RE_ALTER_IF_EXISTS.is_match(sql)
+        || alter_target(sql).is_some_and(|t| t.if_exists)
 }
 
-/// What an ALTER TABLE acts on.
+/// What an ALTER TABLE acts on, read from its node (an ALTER TABLE ... RENAME TO and
+/// SET SCHEMA are statements of their own there).
 struct AlterTarget<'a> {
     if_exists: bool,
-    /// The table, as written: a quoted name stays whole, spaces and all.
-    reference: &'a str,
-    /// What is done to it.
+    /// The table as a reference (`split_qualified_ref`'s), as Postgres reads it.
+    reference: String,
+    /// The table without a public qualifier: `t`, or `s.t` in another schema.
+    unqualified: String,
+    /// The text of its first action, as written.
     action: &'a str,
+    kind: AlterKind,
 }
 
-/// Reads the head of an ALTER TABLE. pg_dump writes ONLY; that is about inheritance,
-/// which does not exist here, so it is simply not the table name.
+/// The first action of an ALTER TABLE.
+enum AlterKind {
+    /// ADD COLUMN or ADD CONSTRAINT.
+    Add,
+    /// ALTER [COLUMN] name ...
+    AlterColumn(String, ColumnCmd),
+    /// VALIDATE CONSTRAINT name.
+    Validate(String),
+    DropConstraint(DropConstraint),
+    DropColumn(DropColumn),
+    /// RENAME TO name.
+    Rename(String),
+    /// SET SCHEMA name.
+    SetSchema(String),
+    Other,
+}
+
+/// What ALTER COLUMN does.
+enum ColumnCmd {
+    Type,
+    SetNotNull,
+    DropNotNull,
+    SetDefault,
+    DropDefault,
+    AddIdentity,
+    DropIdentity { if_exists: bool },
+    SetGenerated { always: bool },
+    Other,
+}
+
 fn alter_target(sql: &str) -> Option<AlterTarget<'_>> {
-    let m = RE_ALTER_TARGET.captures(sql)?;
+    use pg_query::protobuf::{AlterTableType as A, DropBehavior, ObjectType};
+    let (relation, if_exists, kind) = tree::read(sql, |n| match n {
+        NodeEnum::AlterTableStmt(a) if tree::object(a.objtype) == ObjectType::ObjectTable => {
+            let Some(NodeEnum::AlterTableCmd(c)) = a.cmds.first()?.node.as_ref() else {
+                return None;
+            };
+            let cascade = c.behavior == DropBehavior::DropCascade as i32;
+            let kind = match A::try_from(c.subtype).ok()? {
+                A::AtAddColumn | A::AtAddConstraint => AlterKind::Add,
+                A::AtAlterColumnType => AlterKind::AlterColumn(c.name.clone(), ColumnCmd::Type),
+                A::AtSetNotNull => AlterKind::AlterColumn(c.name.clone(), ColumnCmd::SetNotNull),
+                A::AtDropNotNull => AlterKind::AlterColumn(c.name.clone(), ColumnCmd::DropNotNull),
+                A::AtColumnDefault if c.def.is_some() => AlterKind::AlterColumn(c.name.clone(), ColumnCmd::SetDefault),
+                A::AtColumnDefault => AlterKind::AlterColumn(c.name.clone(), ColumnCmd::DropDefault),
+                A::AtAddIdentity => AlterKind::AlterColumn(c.name.clone(), ColumnCmd::AddIdentity),
+                A::AtDropIdentity => AlterKind::AlterColumn(
+                    c.name.clone(),
+                    ColumnCmd::DropIdentity {
+                        if_exists: c.missing_ok,
+                    },
+                ),
+                A::AtSetIdentity => {
+                    let always = tree::defs(match c.def.as_deref().and_then(|d| d.node.as_ref()) {
+                        Some(NodeEnum::List(l)) => &l.items,
+                        _ => &[][..],
+                    })
+                    .find(|d| d.defname == "generated")
+                    .is_some_and(|d| {
+                        matches!(d.arg.as_deref().and_then(|a| a.node.as_ref()), Some(NodeEnum::Integer(i)) if i.ival == i32::from(b'a'))
+                    });
+                    AlterKind::AlterColumn(c.name.clone(), ColumnCmd::SetGenerated { always })
+                }
+                A::AtSetExpression
+                | A::AtDropExpression
+                | A::AtSetStatistics
+                | A::AtSetOptions
+                | A::AtResetOptions
+                | A::AtSetStorage
+                | A::AtSetCompression => AlterKind::AlterColumn(c.name.clone(), ColumnCmd::Other),
+                A::AtValidateConstraint => AlterKind::Validate(c.name.clone()),
+                A::AtDropConstraint => AlterKind::DropConstraint(DropConstraint::new(&c.name, c.missing_ok, cascade)),
+                // DROP COLUMN IF EXISTS is column_if_exists's.
+                A::AtDropColumn if !c.missing_ok => AlterKind::DropColumn(DropColumn::new(&c.name, cascade)),
+                _ => AlterKind::Other,
+            };
+            Some((a.relation.clone()?, a.missing_ok, kind))
+        }
+        NodeEnum::RenameStmt(r) if tree::object(r.rename_type) == ObjectType::ObjectTable => {
+            Some((r.relation.clone()?, r.missing_ok, AlterKind::Rename(r.newname.clone())))
+        }
+        // RENAME COLUMN and RENAME CONSTRAINT: the engine's, IF EXISTS answered here.
+        NodeEnum::RenameStmt(r) if tree::object(r.relation_type) == ObjectType::ObjectTable => {
+            Some((r.relation.clone()?, r.missing_ok, AlterKind::Other))
+        }
+        NodeEnum::AlterObjectSchemaStmt(a) if tree::object(a.object_type) == ObjectType::ObjectTable => Some((
+            a.relation.clone()?,
+            a.missing_ok,
+            AlterKind::SetSchema(a.newschema.clone()),
+        )),
+        _ => None,
+    })?;
+    let action = crate::ddl::alter_actions::alter_parts(sql)
+        .and_then(|p| p.actions.first().copied())
+        .unwrap_or("");
+    let unqualified = if relation.schemaname.is_empty() || eq_fold(&relation.schemaname, "public") {
+        relation.relname.clone()
+    } else {
+        [relation.schemaname.as_str(), ".", &relation.relname].concat()
+    };
     Some(AlterTarget {
-        if_exists: m.get(1).is_some(),
-        reference: m.get(2)?.as_str(),
-        action: m.get(3)?.as_str(),
+        if_exists,
+        reference: tree::reference(&relation),
+        unqualified,
+        action,
+        kind,
     })
 }
 
@@ -246,52 +315,55 @@ fn alter_table_handled(sql: &str) -> bool {
     let Some(target) = alter_target(sql) else {
         return false;
     };
-    let f = split_words(target.action);
-    let rest = &f[..];
-    if rest.is_empty() {
-        return false;
-    }
     if has_column_if_exists(sql) {
         return true;
     }
-    match rest[0].to_uppercase().as_str() {
-        "ADD" => {
-            if add_column_computed_default(sql).is_some() {
-                return true;
-            }
-            if adds_unique(sql) {
-                return true;
-            }
-            parse_add_constraint(sql).is_some() || parse_add_exclusion(sql).is_some()
+    match target.kind {
+        AlterKind::Add => {
+            add_column_computed_default(sql).is_some()
+                || adds_unique(sql)
+                || parse_add_constraint(sql).is_some()
+                || parse_add_exclusion(sql).is_some()
         }
-        "ALTER" => true,
-        "DROP" => parse_drop_constraint(sql).is_some() || parse_drop_column(sql).is_some(),
-        "SET" => rest.len() >= 3 && eq_fold(rest[1], "schema"),
-        "RENAME" => rest.len() >= 3 && eq_fold(rest[1], "to"),
-        _ => false,
+        AlterKind::AlterColumn(..)
+        | AlterKind::DropConstraint(_)
+        | AlterKind::DropColumn(_)
+        | AlterKind::SetSchema(_)
+        | AlterKind::Rename(_) => true,
+        AlterKind::Validate(_) | AlterKind::Other => false,
     }
 }
 
-/// Whether an ADD is about a UNIQUE key, by the code of the statement.
+/// The UNIQUE key an ALTER TABLE ... ADD [CONSTRAINT name] UNIQUE (cols) adds: its
+/// name ("" when none is given), and whether its NULLs are not distinct.
+fn added_unique(sql: &str) -> Option<(String, bool)> {
+    use pg_query::protobuf::{AlterTableType as A, ConstrType};
+    tree::read(sql, |n| {
+        let NodeEnum::AlterTableStmt(a) = n else { return None };
+        let Some(NodeEnum::AlterTableCmd(c)) = a.cmds.first()?.node.as_ref() else {
+            return None;
+        };
+        if c.subtype != A::AtAddConstraint as i32 {
+            return None;
+        }
+        match c.def.as_deref()?.node.as_ref()? {
+            NodeEnum::Constraint(k) if k.contype == ConstrType::ConstrUnique as i32 => {
+                Some((k.conname.clone(), k.nulls_not_distinct))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Whether an ADD is about a UNIQUE key.
 fn adds_unique(sql: &str) -> bool {
-    let code = code_only(sql);
-    let words = split_words(&code);
-    has_word(&words, "unique") && !has_word(&words, "primary")
-}
-
-fn has_word<S: AsRef<str>>(toks: &[S], w: &str) -> bool {
-    for t in toks {
-        if eq_fold(trim_end_chars(t.as_ref(), "(),;"), w) {
-            return true;
-        }
-    }
-    false
+    added_unique(sql).is_some()
 }
 
 impl Session {
     /// Turns ADD [CONSTRAINT name] UNIQUE (cols) into a unique index.
     fn alter_add_unique(&mut self, sql: &str, table: &str) -> Result<()> {
-        let Some((mut name, cols)) = parse_add_unique(sql) else {
+        let (Some((mut name, nulls_not_distinct)), Some(cols)) = (added_unique(sql), unique_columns(sql)) else {
             return Err(Error::with_state(SqlState::SYNTAX_ERROR, "syntax error in ADD UNIQUE"));
         };
         if name.is_empty() {
@@ -304,8 +376,7 @@ impl Session {
             + " ("
             + &cols
             + ")";
-        let code = code_only(sql).to_ascii_lowercase();
-        if split_words(&code).windows(3).any(|w| w == ["nulls", "not", "distinct"]) {
+        if nulls_not_distinct {
             index = rewrite(&(index + " NULLS NOT DISTINCT"));
         }
         self.exec(&index, &[])?;
@@ -313,58 +384,31 @@ impl Session {
     }
 }
 
-/// Extracts the optional constraint name and the column list.
-fn parse_add_unique(sql: &str) -> Option<(String, String)> {
-    let low = code_only(sql).to_ascii_lowercase();
-    let mut name = String::new();
-    if let Some(c) = index_word(&low, "constraint") {
-        let after = &sql[c + "constraint".len()..];
-        if let Some(t) = code_tokens(after).first() {
-            name = unquote_ident(&after[t.span.clone()]);
-        }
-    }
-    let u = index_word(&low, "unique")?;
-    let op = sql[u..].find('(')?;
-    let (inner, _) = balanced_paren(sql, u + op);
-    Some((name, inner.trim().to_string()))
+/// The column list of the UNIQUE an ALTER TABLE adds, as written: what is inside the
+/// parentheses after UNIQUE [NULLS [NOT] DISTINCT], as Postgres' scanner finds them.
+fn unique_columns(sql: &str) -> Option<String> {
+    let toks = code_tokens(sql);
+    let u = toks.iter().position(|t| t.depth == 0 && t.is_word(sql, "unique"))?;
+    let open = (u + 1..toks.len()).find(|&k| toks[k].is_punct(sql, "("))?;
+    let close = (open + 1..toks.len()).find(|&k| toks[k].depth == toks[open].depth && toks[k].is_punct(sql, ")"))?;
+    Some(sql[toks[open].span.end..toks[close].span.start].trim().to_string())
 }
 
 impl Session {
     /// Handles ALTER [COLUMN] c { TYPE t | SET/DROP NOT NULL | SET/DROP DEFAULT }
     /// via a table rebuild.
-    fn alter_column(&mut self, sql: &str, table: &str, rest: &[&str]) -> Result<()> {
-        let mut rest = rest;
-        if !rest.is_empty() && eq_fold(rest[0], "column") {
-            rest = &rest[1..];
-        }
-        if rest.len() < 2 {
-            return Err(Error::with_state(
-                SqlState::SYNTAX_ERROR,
-                "syntax error in ALTER COLUMN",
-            ));
-        }
-        let col = unquote_ident(rest[0]);
-        let rest = &rest[1..];
-        let up = |i: usize| -> String {
-            if i < rest.len() {
-                return rest[i].to_uppercase();
-            }
-            String::new()
-        };
-
+    fn alter_column(&mut self, sql: &str, table: &str, col: &str, cmd: &ColumnCmd) -> Result<()> {
+        let col = col.to_string();
         // Identity: ADD GENERATED, DROP IDENTITY [IF EXISTS], SET GENERATED.
-        if up(0) == "ADD" && up(1) == "GENERATED" {
-            return self.alter_add_identity(table, &col, sql);
-        }
-        if up(0) == "DROP" && up(1) == "IDENTITY" {
-            return self.alter_drop_identity(table, &col, up(2) == "IF");
-        }
-        if up(0) == "SET" && up(1) == "GENERATED" {
-            return self.alter_set_generated(table, &col, up(2) == "ALWAYS");
+        match cmd {
+            ColumnCmd::AddIdentity => return self.alter_add_identity(table, &col, sql),
+            ColumnCmd::DropIdentity { if_exists } => return self.alter_drop_identity(table, &col, *if_exists),
+            ColumnCmd::SetGenerated { always } => return self.alter_set_generated(table, &col, *always),
+            _ => {}
         }
         // A new type's modifier, which the rows are made to fit, as Postgres rewrites them.
         let mut fit: Option<String> = None;
-        let edit: ColumnEdit = if up(0) == "TYPE" || (up(0) == "SET" && up(1) == "DATA" && up(2) == "TYPE") {
+        let edit: ColumnEdit = if matches!(cmd, ColumnCmd::Type) {
             let new_type = column_type_arg(sql);
             if new_type.is_empty() {
                 return Err(Error::with_state(
@@ -374,7 +418,7 @@ impl Session {
             }
             // A collation goes as it does in CREATE TABLE ("C" is SQLite's default),
             // and the old one with the old type, as in Postgres.
-            let new_type = rewrite_collate(&retype_numeric(&new_type)).trim().to_string();
+            let new_type = column_type_for_sqlite(&new_type);
             // The type alone, without the collation that comes with a numeric one.
             let bare = new_type
                 .to_ascii_lowercase()
@@ -385,14 +429,14 @@ impl Session {
                 Some((typ, cons)) => join_def(name, &typ, &drop_collate(&cons)),
                 None => join_def(name, &new_type, &drop_collate(cons)),
             })
-        } else if up(0) == "SET" && up(1) == "NOT" && up(2) == "NULL" {
+        } else if matches!(cmd, ColumnCmd::SetNotNull) {
             Box::new(|name, typ, cons| join_def(name, typ, &add_not_null(cons)))
-        } else if up(0) == "DROP" && up(1) == "NOT" && up(2) == "NULL" {
+        } else if matches!(cmd, ColumnCmd::DropNotNull) {
             Box::new(|name, typ, cons| join_def(name, typ, &drop_not_null(cons)))
-        } else if up(0) == "SET" && up(1) == "DEFAULT" {
+        } else if matches!(cmd, ColumnCmd::SetDefault) {
             let def = default_arg(sql);
             Box::new(move |name, typ, cons| join_def(name, typ, &set_default(cons, &default_value(name, typ, &def))))
-        } else if up(0) == "DROP" && up(1) == "DEFAULT" {
+        } else if matches!(cmd, ColumnCmd::DropDefault) {
             Box::new(|name, typ, cons| join_def(name, typ, &drop_default(cons)))
         } else {
             return Err(errf!(
@@ -443,26 +487,48 @@ impl Session {
     }
 }
 
-/// The type after "TYPE" in an ALTER COLUMN ... TYPE, up to an optional USING
-/// clause.
+/// The type after TYPE in an ALTER COLUMN ... [SET DATA] TYPE, up to an optional
+/// USING clause, as written: where Postgres' scanner finds those keywords.
 fn column_type_arg(sql: &str) -> String {
-    let low = sql.to_ascii_lowercase();
-    let Some(t) = index_word(&low, "type") else {
+    let toks = code_tokens(sql);
+    let Some(t) = toks.iter().position(|t| t.depth == 0 && t.is_word(sql, "type")) else {
         return String::new();
     };
-    let mut seg = sql[t + "type".len()..].trim();
-    if let Some(u) = index_word(&seg.to_ascii_lowercase(), "using") {
-        seg = &seg[..u];
-    }
-    trim_end_chars(seg.trim(), ";").to_string()
+    let end = toks[t + 1..]
+        .iter()
+        .find(|k| k.depth == 0 && (k.is_word(sql, "using") || k.is_punct(sql, ";")))
+        .map_or(sql.len(), |k| k.span.start);
+    sql[toks[t].span.end..end].trim().to_string()
 }
 
+/// The expression after SET DEFAULT, as written.
 fn default_arg(sql: &str) -> String {
-    let low = sql.to_ascii_lowercase();
-    let Some(d) = low.find("set default") else {
+    let toks = code_tokens(sql);
+    let Some(d) = (1..toks.len())
+        .find(|&i| toks[i].depth == 0 && toks[i].is_word(sql, "default") && toks[i - 1].is_word(sql, "set"))
+    else {
         return String::new();
     };
-    trim_end_chars(sql[d + "set default".len()..].trim(), ";").to_string()
+    let end = toks[d + 1..]
+        .iter()
+        .find(|k| k.depth == 0 && k.is_punct(sql, ";"))
+        .map_or(sql.len(), |k| k.span.start);
+    sql[toks[d].span.end..end].trim().to_string()
+}
+
+/// A column type as a CREATE TABLE's translation writes it for SQLite (numeric as
+/// DECIMALTEXT with its collation, a collation SQLite has, a citext's NOCASE, an
+/// array's type quoted): what the rebuild declares the column as.
+fn column_type_for_sqlite(typ: &str) -> String {
+    let created = rewrite(&["CREATE TABLE _overlite_type (c ", typ, ")"].concat());
+    created
+        .find("(c ")
+        .zip(created.rfind(')'))
+        .filter(|(open, close)| open + 3 <= *close)
+        .map_or_else(
+            || typ.trim().to_string(),
+            |(open, close)| created[open + 3..close].trim().to_string(),
+        )
 }
 
 // --- rebuild ----------------------------------------------------------------
@@ -856,33 +922,59 @@ fn drop_collate(cons: &str) -> String {
     out.trim().to_string()
 }
 
-/// Removes a DEFAULT clause (value or parenthesized expression).
+/// Removes a DEFAULT clause: its expression runs, as Postgres' grammar reads it, up to
+/// the next of the column's constraints.
 pub(crate) fn drop_default(cons: &str) -> String {
     // A column's own: not one in a literal or a CHECK, or ON DELETE SET DEFAULT.
     let toks = code_tokens(cons);
     let at = (0..toks.len()).find(|&i| {
         toks[i].depth == 0 && toks[i].is_word(cons, "default") && !(i > 0 && toks[i - 1].is_word(cons, "set"))
     });
-    let i = match at {
-        Some(at) => toks[at].span.start,
-        None => return cons.to_string(),
+    let Some(at) = at else {
+        return cons.to_string();
     };
-    let b = cons.as_bytes();
-    let mut j = i + "default".len();
-    while j < b.len() && b[j] == b' ' {
-        j += 1;
-    }
-    if j < b.len() && b[j] == b'(' {
-        let (_, e) = balanced_paren(cons, j);
-        j = e;
-    } else if j < b.len() && b[j] == b'\'' {
-        j = end_of_string_literal(cons, j);
-    } else {
-        while j < b.len() && b[j] != b' ' {
-            j += 1;
+    let starts_constraint = |i: usize| {
+        let t = &toks[i];
+        t.depth == 0
+            && [
+                "not",
+                "null",
+                "constraint",
+                "check",
+                "unique",
+                "primary",
+                "references",
+                "collate",
+                "generated",
+                "default",
+            ]
+            .iter()
+            .any(|w| t.is_word(cons, w))
+    };
+    let end = (at + 2..toks.len())
+        .find(|&i| starts_constraint(i))
+        .map_or(cons.len(), |i| toks[i].span.start);
+    (cons[..toks[at].span.start].to_string() + &cons[end..])
+        .trim()
+        .to_string()
+}
+
+/// A clause without the public qualifiers of its names (`REFERENCES public.u`): in
+/// SQLite a table of public is its bare name. Where Postgres' scanner finds them, so
+/// a literal or a longer name that spells it is not one.
+fn without_public(clause: &str) -> String {
+    let toks = code_tokens(clause);
+    let mut out = String::with_capacity(clause.len());
+    let mut at = 0;
+    for w in toks.windows(2) {
+        let name = &clause[w[0].span.clone()];
+        if (eq_fold(name, "public") || name == "\"public\"") && w[1].is_punct(clause, ".") {
+            out.push_str(&clause[at..w[0].span.start]);
+            at = w[1].span.end;
         }
     }
-    (cons[..i].to_string() + &cons[j..]).trim().to_string()
+    out.push_str(&clause[at..]);
+    out
 }
 
 /// Finds sub in s, case-insensitively.
@@ -947,7 +1039,7 @@ fn parse_add_constraint(sql: &str) -> Option<AddedConstraint> {
     }
     if up.starts_with("PRIMARY KEY") || up.starts_with("CHECK") || up.starts_with("UNIQUE") {
     } else if up.starts_with("FOREIGN KEY") {
-        clause = replace_all(&RE_PUBLIC, &clause, "");
+        clause = without_public(&clause);
     } else {
         return None; // UNIQUE, EXCLUDE, anything else
     }
@@ -955,8 +1047,11 @@ fn parse_add_constraint(sql: &str) -> Option<AddedConstraint> {
     // NOT VALID says "do not check the existing rows". A foreign key is checked as
     // the rebuild copies them anyway; a CHECK keeps the mark, which the copy reads.
     let mut not_valid = false;
-    if let Some(j) = index_word_fold(&code_only(&clause), " NOT VALID") {
-        clause = clause[..j].trim().to_string();
+    let toks = code_tokens(&clause);
+    if let Some(j) = (1..toks.len())
+        .find(|&i| toks[i].depth == 0 && toks[i - 1].is_word(&clause, "not") && toks[i].is_word(&clause, "valid"))
+    {
+        clause = clause[..toks[j - 1].span.start].trim().to_string();
         not_valid = true;
     }
     let check = up.starts_with("CHECK").then_some(not_valid);
@@ -969,14 +1064,19 @@ fn parse_add_constraint(sql: &str) -> Option<AddedConstraint> {
     if !name.is_empty() {
         clause = "CONSTRAINT ".to_string() + &name + " " + &clause;
     }
-    Some(AddedConstraint {
-        clause: mark_key_deferral(&clause),
-        check,
-    })
+    // A key's deferral as the translation of a CREATE TABLE writes it (the comment
+    // the catalog reads); a CHECK has been translated already.
+    let clause = if check.is_some() {
+        clause
+    } else {
+        translate_check(&clause)
+    };
+    Some(AddedConstraint { clause, check })
 }
 
-/// A `CHECK (expr)` in the SQLite form CREATE TABLE would give it: a cast, an
-/// operator or a literal of Postgres' own is translated the same way.
+/// A table constraint in the SQLite form CREATE TABLE would give it: a CHECK's cast,
+/// operator or literal of Postgres' own translated the same way, a key's deferral in
+/// the comment the catalog reads.
 pub(crate) fn translate_check(check: &str) -> String {
     let created = rewrite(&("CREATE TABLE _overlite_check (".to_string() + check + ")"));
     match (created.find('('), created.rfind(')')) {
@@ -1174,7 +1274,7 @@ fn is_computed_default(value: &str) -> bool {
     }
     let b = value.as_bytes();
     let mut i = 0;
-    while i < b.len() && is_word_byte(b[i]) {
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
         i += 1;
     }
     if i == 0 {

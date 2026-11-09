@@ -129,8 +129,9 @@ const BAD_REGEX: usize = 2768;
 /// on them answer now. Since stage 5c of the AST migration, what Postgres' grammar
 /// refuses (a name `"a\"b"`) is refused with Postgres' message, and a json operator over
 /// an array (`a -> 0` of a text[]) with Postgres' 42883, where the old server read the
-/// array's JSON.
-const STATE_BY_KIND: usize = 273;
+/// array's JSON. And ALTER TYPE of a type named only by white space (`" "`), which the
+/// old server took for a type with no name and altered: 42704.
+const STATE_BY_KIND: usize = 275;
 
 /// A `time` column: the old server described it by its text, 25, where Postgres says
 /// 1083. These hold what no time can be, which Postgres would have refused; and as such

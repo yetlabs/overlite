@@ -5,15 +5,15 @@
 //! overlite). currval/lastval are session-scoped, tracked on the session.
 
 use crate::auth::rls::text_or_empty;
-use crate::ddl::truncate::is_truncate;
+use crate::ddl::tree;
 use crate::error::{Result, errf};
-use crate::rewrite::tokens::code_tokens;
 use crate::session::Session;
 use crate::session::utility::first_word_upper;
 use crate::types::to_int64;
-use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted, split_words, trim_chars, trim_end_chars};
+use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted, trim_chars, trim_end_chars};
 use overlite_core::{Command, SqlState, Value};
 use overlite_engine::split_stored_name;
+use pg_query::NodeEnum;
 
 impl Session {
     /// Handles CREATE/ALTER/DROP SEQUENCE and TRUNCATE; None when it is neither.
@@ -23,53 +23,182 @@ impl Session {
         if let Some(r) = self.try_truncate(sql) {
             return Some(r);
         }
-        let f = split_words(sql);
-        if f.len() < 2 || !eq_fold(f[1], "sequence") {
+        if !is_sequence_ddl(sql) {
             return None;
         }
-        match f[0].to_uppercase().as_str() {
-            "CREATE" => Some(self.create_sequence(&f[2..]).map(|()| Command::from("CREATE SEQUENCE"))),
-            "ALTER" => Some(self.alter_sequence(&f[2..]).map(|()| Command::from("ALTER SEQUENCE"))),
-            "DROP" => Some(self.drop_sequence(&f[2..]).map(|()| Command::from("DROP SEQUENCE"))),
-            _ => None,
+        Some(match tree::read(sql, seq_plan)? {
+            SeqPlan::Create {
+                name,
+                if_not_exists,
+                options,
+            } => self
+                .create_sequence(&name, if_not_exists, &options)
+                .map(|()| Command::from("CREATE SEQUENCE")),
+            SeqPlan::Alter { name, alter } => self
+                .alter_sequence(&name, alter)
+                .map(|()| Command::from("ALTER SEQUENCE")),
+            SeqPlan::Drop { names, if_exists } => self
+                .drop_sequence(&names, if_exists)
+                .map(|()| Command::from("DROP SEQUENCE")),
+        })
+    }
+}
+
+/// A sequence's DDL, read from its node. A sequence is kept by its name alone.
+#[derive(Debug, Clone, PartialEq)]
+enum SeqPlan {
+    Create {
+        name: String,
+        if_not_exists: bool,
+        options: SeqOptions,
+    },
+    Alter {
+        name: String,
+        alter: SeqAlter,
+    },
+    Drop {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+}
+
+/// What an ALTER SEQUENCE changes.
+#[derive(Debug, Clone, PartialEq)]
+enum SeqAlter {
+    /// OWNED BY, OWNER TO, RENAME, SET SCHEMA: nothing kept here changes.
+    Nothing,
+    /// RESTART [WITH n]: to n, or to its start.
+    Restart(Option<i64>),
+    /// The options named, of INCREMENT, MINVALUE, MAXVALUE and CYCLE.
+    Options(SeqOptions),
+}
+
+fn seq_plan(n: &NodeEnum) -> Option<SeqPlan> {
+    use pg_query::protobuf::ObjectType;
+    let seq = |t: i32| tree::object(t) == ObjectType::ObjectSequence;
+    let nothing = |name: String| SeqPlan::Alter {
+        name,
+        alter: SeqAlter::Nothing,
+    };
+    Some(match n {
+        NodeEnum::CreateSeqStmt(c) => SeqPlan::Create {
+            name: c.sequence.as_ref()?.relname.clone(),
+            if_not_exists: c.if_not_exists,
+            options: seq_options(&c.options, default_seq_options()),
+        },
+        NodeEnum::AlterSeqStmt(a) => {
+            let name = a.sequence.as_ref()?.relname.clone();
+            if let Some(r) = tree::defs(&a.options).find(|d| d.defname == "restart") {
+                SeqPlan::Alter {
+                    name,
+                    alter: SeqAlter::Restart(tree::def_text(r).and_then(|t| parse_int(&t))),
+                }
+            } else if tree::defs(&a.options).all(|d| d.defname == "owned_by") {
+                nothing(name)
+            } else {
+                SeqPlan::Alter {
+                    name,
+                    alter: SeqAlter::Options(seq_options(&a.options, SeqOptions::default())),
+                }
+            }
         }
+        NodeEnum::AlterTableStmt(a) if seq(a.objtype) => nothing(a.relation.as_ref()?.relname.clone()),
+        NodeEnum::RenameStmt(r) if seq(r.rename_type) => nothing(r.relation.as_ref()?.relname.clone()),
+        NodeEnum::AlterObjectSchemaStmt(a) if seq(a.object_type) => nothing(a.relation.as_ref()?.relname.clone()),
+        NodeEnum::AlterOwnerStmt(a) if seq(a.object_type) => nothing(a.relation.as_ref()?.relname.clone()),
+        NodeEnum::DropStmt(d) if seq(d.remove_type) => SeqPlan::Drop {
+            names: d
+                .objects
+                .iter()
+                .filter_map(|o| match &o.node {
+                    Some(NodeEnum::List(l)) => tree::strings(&l.items).pop(),
+                    _ => None,
+                })
+                .collect(),
+            if_exists: d.missing_ok,
+        },
+        _ => return None,
+    })
+}
+
+/// The settings a sequence's options name, over base: a bare NO MINVALUE or NO
+/// MAXVALUE keeps the default.
+fn seq_options(options: &[pg_query::protobuf::Node], base: SeqOptions) -> SeqOptions {
+    let mut o = base;
+    let int = |d: &pg_query::protobuf::DefElem| tree::def_text(d).and_then(|t| parse_int(&t));
+    for d in tree::defs(options) {
+        match d.defname.as_str() {
+            "start" => {
+                if let Some(n) = int(d) {
+                    o.start = n;
+                    o.start_set = true;
+                }
+            }
+            "increment" => {
+                if let Some(n) = int(d) {
+                    o.increment = n;
+                }
+            }
+            "minvalue" => {
+                if let Some(n) = int(d) {
+                    o.min_value = n;
+                    o.min_set = true;
+                }
+            }
+            "maxvalue" => {
+                if let Some(n) = int(d) {
+                    o.max_value = n;
+                    o.max_set = true;
+                }
+            }
+            "cache" => {
+                if let Some(n) = int(d) {
+                    o.cache = n;
+                }
+            }
+            "cycle" => {
+                o.cycle = tree::def_bool(d);
+                o.cycle_set = true;
+            }
+            _ => {}
+        }
+    }
+    o
+}
+
+/// The options of an identity column's sequence (`START WITH 5 INCREMENT BY 2`), as
+/// CREATE SEQUENCE reads them.
+pub(crate) fn sequence_options_text(options: &str) -> SeqOptions {
+    let sql = ["CREATE SEQUENCE s ", options].concat();
+    match tree::read(&sql, seq_plan) {
+        Some(SeqPlan::Create { options, .. }) => options,
+        _ => default_seq_options(),
     }
 }
 
 /// Reports whether sql is a CREATE/ALTER/DROP SEQUENCE statement (used by the
 /// extended-query path to route it like other utility DDL).
 pub(crate) fn is_sequence_ddl(sql: &str) -> bool {
-    crate::ast::classify::read(sql, crate::ast::classify::sequence_ddl).unwrap_or_else(|| is_sequence_ddl_text(sql))
-}
-
-/// `is_sequence_ddl` by the text, for what Postgres' grammar does not read.
-pub(crate) fn is_sequence_ddl_text(sql: &str) -> bool {
-    if is_truncate(sql) {
-        return true;
-    }
-    let f = split_words(sql);
-    if f.len() < 2 || !eq_fold(f[1], "sequence") {
-        return false;
-    }
-    matches!(f[0].to_uppercase().as_str(), "CREATE" | "ALTER" | "DROP")
+    crate::ast::classify::read(sql, crate::ast::classify::sequence_ddl).unwrap_or_default()
 }
 
 /// The CREATE/ALTER SEQUENCE settings we track.
-#[derive(Clone, Debug, Default)]
-struct SeqOptions {
-    start: i64,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SeqOptions {
+    pub(crate) start: i64,
     increment: i64,
     min_value: i64,
     max_value: i64,
     cache: i64,
     cycle: bool,
 
-    start_set: bool,
+    pub(crate) start_set: bool,
     min_set: bool,
     max_set: bool,
+    cycle_set: bool,
 }
 
-fn default_seq_options() -> SeqOptions {
+pub(crate) fn default_seq_options() -> SeqOptions {
     SeqOptions {
         start: 1,
         increment: 1,
@@ -81,19 +210,8 @@ fn default_seq_options() -> SeqOptions {
 }
 
 impl Session {
-    pub(crate) fn create_sequence(&mut self, rest: &[&str]) -> Result<()> {
-        let mut rest = rest;
-        let mut if_not_exists = false;
-        if rest.len() >= 3 && eq_fold(rest[0], "if") && eq_fold(rest[1], "not") && eq_fold(rest[2], "exists") {
-            if_not_exists = true;
-            rest = &rest[3..];
-        }
-        if rest.is_empty() {
-            return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in CREATE SEQUENCE"));
-        }
-        let name = seq_ref(rest[0]);
-        let mut opts = default_seq_options();
-        parse_seq_options(&rest[1..], &mut opts)?;
+    pub(crate) fn create_sequence(&mut self, name: &str, if_not_exists: bool, opts: &SeqOptions) -> Result<()> {
+        let mut opts = opts.clone();
         // A descending sequence with no explicit MINVALUE defaults to a very low min.
         if opts.increment < 0 && !opts.min_set {
             opts.min_value = -9223372036854775808;
@@ -113,7 +231,7 @@ impl Session {
             + " INTO _overlite_sequences"
             + " (seqname, last_value, increment, min_value, max_value, start_value, cache_size, is_cycled, is_called)"
             + " VALUES ("
-            + &quote_literal(&name)
+            + &quote_literal(name)
             + ", "
             + &int_text(opts.start)
             + ", "
@@ -136,49 +254,31 @@ impl Session {
         Ok(())
     }
 
-    fn alter_sequence(&mut self, rest: &[&str]) -> Result<()> {
-        if rest.is_empty() {
-            return Err(errf!(SqlState::SYNTAX_ERROR, "syntax error in ALTER SEQUENCE"));
-        }
-        let name = seq_ref(rest[0]);
-        let rest = &rest[1..];
-
-        // ALTER SEQUENCE x OWNED BY / OWNER TO ... -- ownership, accepted as a no-op
-        // (pg_dump emits these for serial-owned sequences).
-        if !rest.is_empty() && (eq_fold(rest[0], "owned") || eq_fold(rest[0], "owner")) {
-            return Ok(());
-        }
-
-        // ALTER SEQUENCE x RESTART [WITH n] resets the counter (start unless given).
-        if !rest.is_empty() && eq_fold(rest[0], "restart") {
-            let mut val = "";
-            if rest.len() >= 2 && eq_fold(rest[1], "with") && rest.len() >= 3 {
-                val = rest[2];
-            } else if rest.len() >= 2 {
-                val = rest[1];
-            }
-            if let Some(n) = parse_int(val) {
+    fn alter_sequence(&mut self, name: &str, alter: SeqAlter) -> Result<()> {
+        let opts = match alter {
+            SeqAlter::Nothing => return Ok(()),
+            SeqAlter::Restart(Some(n)) => {
                 self.exec(
                     &("UPDATE _overlite_sequences SET last_value = ".to_string()
                         + &int_text(n)
                         + ", is_called = 0 WHERE seqname = "
-                        + &quote_literal(&name)),
+                        + &quote_literal(name)),
                     &[],
                 )?;
                 return Ok(());
             }
-            self.exec(
-                &("UPDATE _overlite_sequences SET last_value = start_value,".to_string()
-                    + " is_called = 0 WHERE seqname = "
-                    + &quote_literal(&name)),
-                &[],
-            )?;
-            return Ok(());
-        }
-
+            SeqAlter::Restart(None) => {
+                self.exec(
+                    &("UPDATE _overlite_sequences SET last_value = start_value,".to_string()
+                        + " is_called = 0 WHERE seqname = "
+                        + &quote_literal(name)),
+                    &[],
+                )?;
+                return Ok(());
+            }
+            SeqAlter::Options(opts) => opts,
+        };
         // Otherwise apply whatever options were named (INCREMENT/MIN/MAX/CYCLE).
-        let mut opts = SeqOptions::default();
-        parse_seq_options(rest, &mut opts)?;
         let mut set: Vec<String> = Vec::new();
         if opts.increment != 0 {
             set.push("increment = ".to_string() + &int_text(opts.increment));
@@ -189,7 +289,9 @@ impl Session {
         if opts.max_set {
             set.push("max_value = ".to_string() + &int_text(opts.max_value));
         }
-        set.push("is_cycled = ".to_string() + b2i(opts.cycle));
+        if opts.cycle_set {
+            set.push("is_cycled = ".to_string() + b2i(opts.cycle));
+        }
         if set.is_empty() {
             return Ok(());
         }
@@ -197,23 +299,15 @@ impl Session {
             &("UPDATE _overlite_sequences SET ".to_string()
                 + &set.join(", ")
                 + " WHERE seqname = "
-                + &quote_literal(&name)),
+                + &quote_literal(name)),
             &[],
         )?;
         Ok(())
     }
 
-    fn drop_sequence(&mut self, rest: &[&str]) -> Result<()> {
-        let mut rest = rest;
-        let if_exists = rest.len() >= 2 && eq_fold(rest[0], "if") && eq_fold(rest[1], "exists");
-        if if_exists {
-            rest = &rest[2..];
-        }
-        for name in rest.join(" ").split(',') {
-            let name = seq_ref(trim_end_chars(name, ";").trim());
-            if name.is_empty() || eq_fold(&name, "cascade") || eq_fold(&name, "restrict") {
-                continue;
-            }
+    fn drop_sequence(&mut self, names: &[String], if_exists: bool) -> Result<()> {
+        for name in names {
+            let name = name.clone();
             match self.require_sequence(&name) {
                 Err(_) if if_exists => {
                     self.c
@@ -230,73 +324,6 @@ impl Session {
         }
         Ok(())
     }
-}
-
-/// Reads the option keywords shared by CREATE and ALTER SEQUENCE.
-fn parse_seq_options(tokens: &[&str], o: &mut SeqOptions) -> Result<()> {
-    let mut i: usize = 0;
-    while i < tokens.len() {
-        match trim_end_chars(tokens[i], ";").to_uppercase().as_str() {
-            "START" => {
-                if i + 1 < tokens.len() && eq_fold(tokens[i + 1], "with") {
-                    i += 1;
-                }
-                if let Some(n) = next_int(tokens, &mut i) {
-                    o.start = n;
-                    o.start_set = true;
-                }
-            }
-            "INCREMENT" => {
-                if i + 1 < tokens.len() && eq_fold(tokens[i + 1], "by") {
-                    i += 1;
-                }
-                if let Some(n) = next_int(tokens, &mut i) {
-                    o.increment = n;
-                }
-            }
-            "MINVALUE" => {
-                if let Some(n) = next_int(tokens, &mut i) {
-                    o.min_value = n;
-                    o.min_set = true;
-                }
-            }
-            "MAXVALUE" => {
-                if let Some(n) = next_int(tokens, &mut i) {
-                    o.max_value = n;
-                    o.max_set = true;
-                }
-            }
-            "CACHE" => {
-                if let Some(n) = next_int(tokens, &mut i) {
-                    o.cache = n;
-                }
-            }
-            "CYCLE" => o.cycle = true,
-            "NO" => {
-                // NO MINVALUE / NO MAXVALUE / NO CYCLE -- keep defaults / clear cycle.
-                if i + 1 < tokens.len() && eq_fold(tokens[i + 1], "cycle") {
-                    o.cycle = false;
-                }
-                i += 1;
-            }
-            "AS" | "OWNED" => i += 1, // AS <type> / OWNED BY <col> -- accepted, ignored
-            _ => {}
-        }
-        i += 1;
-    }
-    Ok(())
-}
-
-/// Reads the integer token following index *i, advancing *i past it.
-fn next_int(tokens: &[&str], i: &mut usize) -> Option<i64> {
-    if *i + 1 >= tokens.len() {
-        return None;
-    }
-    if let Some(n) = parse_int(tokens[*i + 1]) {
-        *i += 1;
-        return Some(n);
-    }
-    None
 }
 
 // --- nextval/currval/setval/lastval expansion --------------------------------
@@ -402,12 +429,13 @@ impl Session {
     /// each row's setval is the answer. None for any other statement, and for one
     /// whose arguments are already literals.
     fn setval_over_rows(&mut self, sql: &str) -> Result<Option<String>> {
-        let toks = code_tokens(sql);
-        let word = |i: usize, w: &str| toks.get(i).is_some_and(|t| t.is_word(sql, w));
-        if !(word(0, "select") && word(1, "setval") && toks.get(2).is_some_and(|t| t.is_punct(sql, "("))) {
+        let toks = tree::tokens(sql);
+        let text = |i: usize| toks.get(i).map_or("", |t| &sql[t.start..t.end]);
+        let word = |i: usize, w: &str| text(i).eq_ignore_ascii_case(w);
+        if !(word(0, "select") && word(1, "setval") && text(2) == "(") {
             return Ok(None);
         }
-        let Some(close) = (3..toks.len()).find(|&i| toks[i].depth == 0 && toks[i].is_punct(sql, ")")) else {
+        let Some(close) = (3..toks.len()).find(|&i| toks[i].depth == 0 && text(i) == ")") else {
             return Ok(None);
         };
         let mut from = close + 1;
@@ -417,7 +445,7 @@ impl Session {
         if !word(from, "from") || sql.contains('$') {
             return Ok(None);
         }
-        let args = split_top_level(&sql[toks[2].span.end..toks[close].span.start]);
+        let args = split_top_level(&sql[toks[2].end..toks[close].start]);
         let constant = |a: &str| {
             let a = a.trim();
             a.starts_with('\'') || parse_int(a).is_some() || ["null", "true", "false"].iter().any(|w| eq_fold(a, w))
@@ -425,7 +453,7 @@ impl Session {
         if args.len() < 2 || args.len() > 3 || args.iter().all(|a| constant(a)) {
             return Ok(None);
         }
-        let probe = "SELECT ".to_string() + &args.join(", ") + " " + &sql[toks[from].span.start..];
+        let probe = "SELECT ".to_string() + &args.join(", ") + " " + &sql[toks[from].start..];
         let rows = self.exec(&self.rewrite_typed(&probe), &[])?.rows;
         let mut answers = Vec::with_capacity(rows.len());
         for row in &rows {

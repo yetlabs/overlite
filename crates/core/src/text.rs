@@ -337,6 +337,24 @@ pub fn quote_literal(s: &str) -> String {
     ["'", &s.replace('\'', "''"), "'"].concat()
 }
 
+/// The index just past the single-quoted string literal opening at i, its doubled
+/// quotes inside it; the end of sql for one never closed.
+pub fn end_of_string_literal(sql: &str, i: usize) -> usize {
+    let s = sql.as_bytes();
+    let mut j = i + 1;
+    while j < s.len() {
+        if s[j] == b'\'' {
+            if j + 1 < s.len() && s[j + 1] == b'\'' {
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        j += 1;
+    }
+    j
+}
+
 /// `s` as an SQL identifier, always in double quotes with each quote doubled:
 /// `a"b` is `"a""b"`. Postgres' quote_ident(), which leaves a plain lower-case
 /// name bare, is `quote_ident_if_needed` in the engine's catalog.

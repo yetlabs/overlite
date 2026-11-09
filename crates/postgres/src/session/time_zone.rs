@@ -8,10 +8,10 @@
 
 use crate::error::{Result, errf};
 use crate::session::Session;
-use crate::session::utility::unquote_ident;
 use overlite_core::SqlState;
-use overlite_core::text::{eq_fold, split_words, trim_end_chars};
+use overlite_core::text::{eq_fold, split_words};
 use overlite_engine::{session_zone, set_session_zone};
+use pg_query::NodeEnum;
 use std::collections::HashMap;
 
 /// A change of the TimeZone a statement asks for.
@@ -24,75 +24,32 @@ pub(crate) struct ZoneChange {
 }
 
 /// SET [SESSION | LOCAL] TIME ZONE value, SET [SESSION | LOCAL] timezone {TO | =}
-/// value, and RESET timezone. None for any other statement.
+/// value, and RESET timezone, read from the node. None for any other statement.
 pub(crate) fn zone_change(sql: &str) -> Option<ZoneChange> {
-    if !crate::ast::classify::read(sql, crate::ast::classify::time_zone).unwrap_or(true) {
+    if !crate::ast::classify::read(sql, crate::ast::classify::time_zone).unwrap_or(false) {
         return None;
     }
-    zone_change_text(sql)
+    crate::ddl::tree::read(sql, zone_change_of)
 }
 
-/// The change of zone sql asks for, read from its text.
-pub(crate) fn zone_change_text(sql: &str) -> Option<ZoneChange> {
-    let text = trim_end_chars(sql.trim(), ";");
-    let f = split_words(text);
-    let mut i = 1;
-    let head = f.first()?;
-    if eq_fold(head, "reset") {
-        return (f.len() == 2 && eq_fold(f[1], "timezone")).then_some(ZoneChange {
-            local: false,
-            zone: None,
-        });
-    }
-    if !eq_fold(head, "set") {
+fn zone_change_of(n: &NodeEnum) -> Option<ZoneChange> {
+    use pg_query::protobuf::VariableSetKind as K;
+    let NodeEnum::VariableSetStmt(v) = n else {
         return None;
-    }
-    let mut local = false;
-    if f.get(i).is_some_and(|w| eq_fold(w, "session")) {
-        i += 1;
-    } else if f.get(i).is_some_and(|w| eq_fold(w, "local")) {
-        local = true;
-        i += 1;
-    }
-    let word = |k: usize, w: &str| f.get(k).is_some_and(|x| eq_fold(x, w));
-    if word(i, "time") && word(i + 1, "zone") {
-        i += 2;
-    } else if word(i, "timezone") {
-        i += 1;
-        if word(i, "to") || f.get(i).is_some_and(|w| *w == "=") {
-            i += 1;
-        }
-    } else if f.get(i).is_some_and(|w| w.len() > 9 && eq_fold(&w[..9], "timezone=")) {
-        // SET timezone='x', written without spaces.
-        let value = &f[i][9..];
-        return Some(ZoneChange {
-            local,
-            zone: zone_value(&[value]),
-        });
-    } else {
-        return None;
-    }
-    let rest: Vec<&str> = f[i..].to_vec();
-    if rest.is_empty() {
-        return None;
-    }
+    };
+    let zone = match K::try_from(v.kind).ok()? {
+        K::VarSetValue => match v.args.first()?.node.as_ref()? {
+            // An INTERVAL: not a zone this server reads, named as written.
+            NodeEnum::TypeCast(c) => Some(["INTERVAL ", &crate::ddl::tree::arg_text(c.arg.as_deref()?)?].concat()),
+            _ => Some(crate::ddl::tree::arg_text(v.args.first()?)?),
+        },
+        K::VarSetDefault | K::VarReset => None,
+        _ => return None,
+    };
     Some(ZoneChange {
-        local,
-        zone: zone_value(&rest),
+        local: v.is_local,
+        zone,
     })
-}
-
-/// The zone a SET names: a quoted or bare name, or DEFAULT and LOCAL for the default.
-fn zone_value(words: &[&str]) -> Option<String> {
-    let joined = words.join(" ");
-    let v = joined.trim();
-    if eq_fold(v, "default") || eq_fold(v, "local") {
-        return None;
-    }
-    if let Some(inner) = v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
-        return Some(inner.replace("''", "'"));
-    }
-    Some(unquote_ident(v))
 }
 
 /// The zone the startup parameters ask for: TimeZone itself, or `-c TimeZone=x` in

@@ -13,8 +13,8 @@
 use crate::auth::rls::{parse_insert, text_or_empty};
 use crate::ddl::alter::{join_def, parse_col_def};
 use crate::ddl::sequences::split_top_level;
+use crate::ddl::tree::{CodeTokKind, code_tokens};
 use crate::error::{Result, errf};
-use crate::rewrite::tokens::{CodeTokKind, code_tokens};
 use crate::session::Session;
 use crate::session::utility::{first_word_upper, unquote_ident};
 use overlite_core::SqlState;
@@ -151,23 +151,24 @@ impl Session {
     /// Turns the identity columns of a CREATE TABLE into what SQLite can hold,
     /// making the sequences of those that need one.
     pub(crate) fn create_identity_columns<'a>(&mut self, sql: &'a str) -> Cow<'a, str> {
-        if !code_tokens(sql).iter().any(|t| t.is_word(sql, "identity")) {
+        if !sql.to_ascii_lowercase().contains("identity") {
             return Cow::Borrowed(sql);
         }
-        let table = crate::ddl::defaults::create_table_name(sql);
-        let Some(open) = sql.find('(').filter(|_| !table.is_empty()) else {
+        let Some(plan) = crate::ddl::defaults::table_plan(sql) else {
             return Cow::Borrowed(sql);
         };
-        let stored = self.created_table(&table);
-        let (inner, after) = crate::auth::rls::balanced_paren(sql, open);
-        let mut defs = split_top_level(&inner);
-        let mut changed = false;
-        for d in &mut defs {
+        if !plan.items.iter().any(|(_, c)| c.as_ref().is_some_and(|c| c.identity)) {
+            return Cow::Borrowed(sql);
+        }
+        let stored = self.created_table(&plan.table);
+        let mut failed = false;
+        let out = plan.rewrite(sql, |d, column| {
+            if !column.identity || failed {
+                return None;
+            }
             let (name, typ, cons) = parse_col_def(d);
-            let Some(clause) = identity_clause(&cons) else {
-                continue;
-            };
-            let column = unquote_ident(&name);
+            let clause = identity_clause(&cons)?;
+            let column = column.name.clone();
             let rest = [
                 cons[..clause.span.start].trim_end(),
                 cons[clause.span.end..].trim_start(),
@@ -182,7 +183,8 @@ impl Session {
                 join_def(&name, "serial", &(rest + " " + &mark(clause.always, &type_name)))
             } else {
                 if self.identity_sequence(&stored, &column, &clause.options, None).is_err() {
-                    return Cow::Borrowed(sql);
+                    failed = true;
+                    return None;
                 }
                 join_def(
                     &name,
@@ -190,13 +192,12 @@ impl Session {
                     &(with_not_null(&rest) + " " + &mark(clause.always, &type_name)),
                 )
             };
-            *d = " ".to_string() + &def + " ";
-            changed = true;
+            Some(" ".to_string() + &def + " ")
+        });
+        match out {
+            Some(out) if !failed => Cow::Owned(out),
+            _ => Cow::Borrowed(sql),
         }
-        if !changed {
-            return Cow::Borrowed(sql);
-        }
-        Cow::Owned(sql[..=open].to_string() + &defs.join(",") + &sql[after - 1..])
     }
 
     /// Makes `<table>_<column>_seq` with the options given, starting past `after` when
@@ -204,13 +205,12 @@ impl Session {
     fn identity_sequence(&mut self, stored: &str, column: &str, options: &str, after: Option<i64>) -> Result<()> {
         let (_, relation) = split_stored_name(stored);
         let seq = relation + "_" + column + "_seq";
-        let mut tokens: Vec<String> = vec![quote_ident(&seq)];
-        tokens.extend(options.split_whitespace().map(str::to_string));
-        if let Some(after) = after.filter(|_| !options.to_ascii_lowercase().contains("start")) {
-            tokens.extend(["START".to_string(), "WITH".to_string(), (after + 1).to_string()]);
+        let mut opts = crate::ddl::sequences::sequence_options_text(options);
+        if let Some(after) = after.filter(|_| !opts.start_set) {
+            opts.start = after + 1;
+            opts.start_set = true;
         }
-        let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        self.create_sequence(&tokens)?;
+        self.create_sequence(&seq, false, &opts)?;
         let (t, c) = (quote_literal(stored), quote_literal(column));
         self.exec(
             &format!(

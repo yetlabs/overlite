@@ -25,10 +25,13 @@
 //!   one DROP each, its CASCADE, a DROP TRIGGER's table.
 
 use crate::ast::emit::{self, Unsupported, ident};
-use crate::rewrite::ddl_syntax::NULL_KEY;
 use overlite_core::text::quote_literal;
 use pg_query::NodeEnum;
 use pg_query::protobuf::{self as pb, ConstrType, ObjectType, a_const::Val};
+
+/// What a key column of a NULLS NOT DISTINCT index is wrapped in: a NULL becomes a
+/// blob no column holds, so two NULLs are one key, as Postgres has them.
+pub(crate) const NULL_KEY: &str = "x'6f7665726c6974652d6e756c6c'";
 
 /// Whether statements of this kind are this module's.
 pub(crate) fn takes(stmt: &NodeEnum) -> bool {
@@ -442,7 +445,7 @@ pub(crate) fn collation(name: &str) -> String {
     if overlite_engine::collation_known(name) {
         return [" COLLATE \"", &name.replace('"', "\"\""), "\""].concat();
     }
-    if crate::rewrite::operators::collation_is_ci(name) {
+    if crate::ast::emit::collation_is_ci(name) {
         return " COLLATE NOCASE".to_string();
     }
     String::new()

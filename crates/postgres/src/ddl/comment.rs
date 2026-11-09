@@ -8,71 +8,42 @@
 //! proceeds.
 
 use crate::ddl::drop_constraint::has_constraint;
-use crate::ddl::words::{Word, ddl_words, syntax_error_at};
+use crate::ddl::tree;
 use crate::error::{Error, Result};
 use crate::session::Session;
-use overlite_core::text::{eq_fold, quote_literal, split_words};
+use overlite_core::text::quote_literal;
 use overlite_core::{Command, SqlState};
+use pg_query::NodeEnum;
+use pg_query::protobuf::ObjectType;
 
 /// Whether sql is a COMMENT ON statement.
 pub(crate) fn is_comment(sql: &str) -> bool {
-    crate::ast::classify::read(sql, crate::ast::classify::comment).unwrap_or_else(|| is_comment_text(sql))
+    crate::ast::classify::read(sql, crate::ast::classify::comment).unwrap_or_default()
 }
 
-/// `is_comment` by the text, for what Postgres' grammar does not read.
-pub(crate) fn is_comment_text(sql: &str) -> bool {
-    let f = split_words(sql);
-    f.len() >= 2 && eq_fold(f[0], "comment") && eq_fold(f[1], "on")
+/// The kind of an object Postgres takes a comment on: what `_overlite_comments` calls
+/// it, or nothing to keep for one with no catalog.
+fn kind_of(t: ObjectType) -> Kind {
+    use ObjectType as O;
+    match t {
+        O::ObjectTable => Kind::Relation("table", "table", "rp"),
+        O::ObjectForeignTable => Kind::Relation("table", "foreign table", "f"),
+        O::ObjectView => Kind::Relation("view", "view", "v"),
+        O::ObjectMatview => Kind::Relation("view", "materialized view", "m"),
+        O::ObjectIndex => Kind::Relation("index", "index", "iI"),
+        O::ObjectSequence => Kind::Relation("sequence", "sequence", "S"),
+        O::ObjectColumn => Kind::Column,
+        O::ObjectType | O::ObjectDomain => Kind::Type,
+        O::ObjectSchema => Kind::Schema,
+        O::ObjectRole => Kind::Role,
+        O::ObjectTabconstraint => Kind::Constraint,
+        O::ObjectTrigger => Kind::OnTable("trigger", "pg_trigger", "tgname", "tgrelid"),
+        O::ObjectPolicy => Kind::OnTable("policy", "pg_policy", "polname", "polrelid"),
+        O::ObjectFunction => Kind::Routine,
+        O::ObjectDatabase => Kind::Database,
+        _ => Kind::Unmodeled,
+    }
 }
-
-/// The kinds of object Postgres takes a comment on, by the words that name them. Each
-/// is what `_overlite_comments` calls it, or nothing to keep for one with no catalog.
-const KINDS: &[(&[&str], Kind)] = &[
-    (&["table"], Kind::Relation("table", "table", "rp")),
-    (&["foreign", "table"], Kind::Relation("table", "foreign table", "f")),
-    (&["view"], Kind::Relation("view", "view", "v")),
-    (
-        &["materialized", "view"],
-        Kind::Relation("view", "materialized view", "m"),
-    ),
-    (&["index"], Kind::Relation("index", "index", "iI")),
-    (&["sequence"], Kind::Relation("sequence", "sequence", "S")),
-    (&["column"], Kind::Column),
-    (&["type"], Kind::Type),
-    (&["domain"], Kind::Type),
-    (&["schema"], Kind::Schema),
-    (&["role"], Kind::Role),
-    (&["constraint"], Kind::Constraint),
-    (
-        &["trigger"],
-        Kind::OnTable("trigger", "pg_trigger", "tgname", "tgrelid"),
-    ),
-    (&["policy"], Kind::OnTable("policy", "pg_policy", "polname", "polrelid")),
-    (&["function"], Kind::Routine),
-    (&["procedure"], Kind::Unmodeled),
-    (&["routine"], Kind::Unmodeled),
-    (&["aggregate"], Kind::Unmodeled),
-    (&["database"], Kind::Database),
-    (&["extension"], Kind::Unmodeled),
-    (&["access", "method"], Kind::Unmodeled),
-    (&["cast"], Kind::Unmodeled),
-    (&["collation"], Kind::Unmodeled),
-    (&["conversion"], Kind::Unmodeled),
-    (&["event", "trigger"], Kind::Unmodeled),
-    (&["foreign", "data", "wrapper"], Kind::Unmodeled),
-    (&["language"], Kind::Unmodeled),
-    (&["procedural", "language"], Kind::Unmodeled),
-    (&["large", "object"], Kind::Unmodeled),
-    (&["operator"], Kind::Unmodeled),
-    (&["publication"], Kind::Unmodeled),
-    (&["rule"], Kind::Unmodeled),
-    (&["server"], Kind::Unmodeled),
-    (&["statistics"], Kind::Unmodeled),
-    (&["subscription"], Kind::Unmodeled),
-    (&["tablespace"], Kind::Unmodeled),
-    (&["text", "search"], Kind::Unmodeled),
-    (&["transform"], Kind::Unmodeled),
-];
 
 /// How a kind of object is found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,60 +63,34 @@ enum Kind {
     Unmodeled,
 }
 
-/// A statement read: the words before IS, and the comment, None for NULL.
+/// A statement read: the object's name, its parts as Postgres reads them (for a
+/// constraint, trigger or policy the table's, then its own), and the comment, None for
+/// NULL or an empty one, which Postgres takes for NULL.
+#[derive(Debug, PartialEq, Eq)]
 struct CommentOn {
     kind: Kind,
-    target: Vec<Word>,
+    target: Vec<String>,
     text: Option<String>,
 }
 
-fn parse_comment(sql: &str) -> Result<CommentOn> {
-    let mut words = ddl_words(sql)?;
-    if words.last() == Some(&Word::Punct(';')) {
-        words.pop();
-    }
-    let rest = words.get(2..).unwrap_or(&[]);
-    let found = KINDS
-        .iter()
-        .filter(|(kw, _)| kw.len() <= rest.len() && kw.iter().zip(rest).all(|(w, t)| t.is(w)))
-        .max_by_key(|(kw, _)| kw.len());
-    let Some((keywords, kind)) = found else {
-        return Err(syntax_error_at(rest.first()));
+fn comment_plan(n: &NodeEnum) -> Option<CommentOn> {
+    let NodeEnum::CommentStmt(c) = n else {
+        return None;
     };
-    let rest = &rest[keywords.len()..];
-    // The object's name may be IS in quotes, never in words.
-    let Some(is) = rest.iter().rposition(|w| w.is("is")) else {
-        return Err(syntax_error_at(None));
+    let kind = kind_of(tree::object(c.objtype));
+    let object = c.object.as_deref().and_then(|o| o.node.as_ref());
+    let target = match object {
+        Some(NodeEnum::List(l)) => tree::strings(&l.items),
+        Some(NodeEnum::String(s)) => vec![s.sval.clone()],
+        Some(NodeEnum::TypeName(t)) => tree::strings(&t.names),
+        Some(NodeEnum::ObjectWithArgs(f)) => tree::strings(&f.objname),
+        _ => Vec::new(),
     };
-    let text = match rest.get(is + 1) {
-        Some(Word::Str(s)) => Some(s.clone()),
-        Some(w) if w.is("null") => None,
-        other => return Err(syntax_error_at(other)),
-    };
-    if rest.len() > is + 2 {
-        return Err(syntax_error_at(rest.get(is + 2)));
-    }
-    Ok(CommentOn {
-        kind: *kind,
-        target: rest[..is].to_vec(),
-        text,
+    Some(CommentOn {
+        kind,
+        target,
+        text: (!c.comment.is_empty()).then(|| c.comment.clone()),
     })
-}
-
-/// Reads `a.b.c` from words, as many parts as there are.
-fn dotted_name(words: &[Word]) -> Result<Vec<String>> {
-    let mut parts = Vec::new();
-    let mut i = 0;
-    loop {
-        let Some(name) = words.get(i).and_then(Word::name) else {
-            return Err(syntax_error_at(words.get(i)));
-        };
-        parts.push(name.to_string());
-        if words.get(i + 1) != Some(&Word::Punct('.')) {
-            return Ok(parts);
-        }
-        i += 2;
-    }
 }
 
 fn undefined(state: SqlState, message: String) -> Error {
@@ -160,7 +105,7 @@ impl Session {
             return None;
         }
         Some(
-            parse_comment(sql)
+            tree::statement(sql, |n| comment_plan(n).ok_or_else(|| tree::parse_failure(sql)))
                 .and_then(|c| self.run_comment(&c))
                 .map(|()| Command::from("COMMENT")),
         )
@@ -170,7 +115,7 @@ impl Session {
         let (objkind, objname, subname) = match c.kind {
             Kind::Unmodeled => return Ok(()),
             Kind::Relation(stored, what, relkinds) => {
-                let name = dotted_name(&c.target)?;
+                let name = c.target.clone();
                 let relation = self.find_relation(&name)?;
                 if !relkinds.contains(relation.relkind.as_str()) {
                     return Err(undefined(
@@ -181,9 +126,9 @@ impl Session {
                 (stored, relation.name, String::new())
             }
             Kind::Column => {
-                let mut name = dotted_name(&c.target)?;
+                let mut name = c.target.clone();
                 let Some(column) = name.pop().filter(|_| !name.is_empty()) else {
-                    return Err(syntax_error_at(None));
+                    return Err(tree::syntax_error());
                 };
                 let relation = self.find_relation(&name)?;
                 let q = format!(
@@ -200,8 +145,7 @@ impl Session {
                 ("column", relation.name, column)
             }
             Kind::Type => {
-                let name = dotted_name(&c.target)?;
-                let last = name.last().cloned().unwrap_or_default();
+                let last = c.target.last().cloned().unwrap_or_default();
                 self.require_row(
                     &format!(
                         "SELECT 1 FROM pg_type WHERE lower(typname) = lower({})",
@@ -227,11 +171,11 @@ impl Session {
                 ("role", name, String::new())
             }
             Kind::OnTable(what, catalog, name_col, rel_col) => {
-                let Some(on) = c.target.iter().position(|w| w.is("on")) else {
-                    return Err(syntax_error_at(None));
+                let Some((name, table)) = c.target.split_last() else {
+                    return Err(tree::syntax_error());
                 };
-                let name = single_name(&c.target[..on])?;
-                let relation = self.find_relation(&dotted_name(&c.target[on + 1..])?)?;
+                let name = name.clone();
+                let relation = self.find_relation(table)?;
                 self.require_row(
                     &format!(
                         "SELECT 1 FROM {catalog} WHERE {rel_col} = {} AND {name_col} = {}",
@@ -244,11 +188,11 @@ impl Session {
                 (what, relation.name, name)
             }
             Kind::Constraint => {
-                let Some(on) = c.target.iter().position(|w| w.is("on")) else {
-                    return Err(syntax_error_at(None));
+                let Some((name, table)) = c.target.split_last() else {
+                    return Err(tree::syntax_error());
                 };
-                let name = single_name(&c.target[..on])?;
-                let relation = self.find_relation(&dotted_name(&c.target[on + 1..])?)?;
+                let name = name.clone();
+                let relation = self.find_relation(table)?;
                 // The table's definition has them all; pg_constraint not a check.
                 let ddl = self.table_ddl(&relation.name);
                 if !has_constraint(&ddl, &relation.name, &name) {
@@ -260,13 +204,7 @@ impl Session {
                 ("constraint", relation.name, name)
             }
             Kind::Routine => {
-                let open = c
-                    .target
-                    .iter()
-                    .position(|w| *w == Word::Punct('('))
-                    .unwrap_or(c.target.len());
-                let name = dotted_name(&c.target[..open])?;
-                let last = name.last().cloned().unwrap_or_default();
+                let last = c.target.last().cloned().unwrap_or_default();
                 self.require_row(
                     &format!(
                         "SELECT 1 FROM pg_proc WHERE lower(proname) = lower({})",
@@ -341,7 +279,7 @@ impl Session {
                 path.push("public".to_string());
                 (path, relname.clone())
             }
-            _ => return Err(syntax_error_at(None)),
+            _ => return Err(tree::syntax_error()),
         };
         for schema in &schemas {
             let q = format!(
@@ -381,10 +319,9 @@ fn article(what: &str) -> String {
     format!("{a} {what}")
 }
 
-fn single_name(words: &[Word]) -> Result<String> {
-    let name = dotted_name(words)?;
-    match &name[..] {
+fn single_name(name: &[String]) -> Result<String> {
+    match name {
         [one] => Ok(one.clone()),
-        _ => Err(syntax_error_at(None)),
+        _ => Err(tree::syntax_error()),
     }
 }

@@ -12,11 +12,11 @@
 
 use crate::auth::rls::{balanced_paren, parse_insert, text_or_empty, top_level_keyword};
 use crate::ddl::sequences::split_top_level;
-use crate::rewrite::strings::end_of_string_literal;
 use crate::session::Session;
 use crate::session::utility::{first_word_upper, unquote_ident};
 use overlite_core::Value;
 use overlite_core::lazy_regex;
+use overlite_core::text::end_of_string_literal;
 use overlite_core::text::{eq_fold, quote_ident, quote_literal, trim_end_chars, trim_start_chars};
 use overlite_engine::{assign_value, assignment_type, blank_literals, code_only};
 use std::collections::HashMap;

@@ -103,19 +103,7 @@ impl Cursors {
 
 /// Whether a statement is one of a cursor's.
 pub(crate) fn is_cursor_statement(sql: &str) -> bool {
-    crate::ast::classify::read(sql, crate::ast::classify::cursor).unwrap_or_else(|| is_cursor_statement_text(sql))
-}
-
-/// `is_cursor_statement` by the text, for what Postgres' grammar does not read.
-pub(crate) fn is_cursor_statement_text(sql: &str) -> bool {
-    let w = sql
-        .trim_start()
-        .split(|c: char| !c.is_ascii_alphabetic())
-        .next()
-        .unwrap_or("");
-    ["declare", "fetch", "move", "close"]
-        .iter()
-        .any(|k| w.eq_ignore_ascii_case(k))
+    crate::ast::classify::read(sql, crate::ast::classify::cursor).unwrap_or_default()
 }
 
 /// The message Postgres gives a NO SCROLL cursor asked to go back, and its hint.

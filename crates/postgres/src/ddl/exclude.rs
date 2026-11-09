@@ -10,8 +10,8 @@
 //! only refuse sooner than Postgres would, never let a conflict through.
 
 use crate::ddl::alter::translate_check;
+use crate::ddl::tree::{CodeTok, CodeTokKind, code_tokens};
 use crate::error::{Result, errf};
-use crate::rewrite::tokens::{CodeTok, CodeTokKind, code_tokens};
 use crate::session::Session;
 use crate::session::utility::unquote_ident;
 use overlite_core::text::{quote_ident, quote_literal};
@@ -471,14 +471,8 @@ fn create_table_name(sql: &str) -> Option<String> {
 
 /// Whether a CREATE TABLE has an EXCLUDE constraint, which create_with_exclusions runs.
 pub(crate) fn creates_exclusions(sql: &str) -> bool {
-    crate::ast::classify::read(sql, crate::ast::classify::creates_exclusions).unwrap_or(true)
+    crate::ast::classify::read(sql, crate::ast::classify::creates_exclusions).unwrap_or(false)
         && split_create_exclusions(sql).is_some()
-}
-
-/// `creates_exclusions` by the text alone.
-#[cfg(test)]
-pub(crate) fn creates_exclusions_text(sql: &str) -> bool {
-    split_create_exclusions(sql).is_some()
 }
 
 #[cfg(test)]

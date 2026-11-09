@@ -2,87 +2,173 @@
 //! _overlite_roles table (so they succeed and show up in \du / pg_roles).
 
 use crate::auth::scram::build_scram_verifier;
-use crate::ddl::words::{Word, ddl_words, syntax_error_at};
+use crate::ddl::tree::{self, Role};
 use crate::error::{Result, errf};
 use crate::session::Session;
 use overlite_core::Value;
-use overlite_core::text::{eq_fold, quote_literal, split_words, trim_end_chars};
+use overlite_core::text::{eq_fold, quote_literal};
 use overlite_core::{Command, SqlState};
-use std::collections::HashMap;
+use pg_query::NodeEnum;
+use pg_query::protobuf as pb;
 
 /// Whether try_role_ddl takes this statement.
 pub(crate) fn is_role_ddl(sql: &str) -> bool {
-    crate::ast::classify::read(sql, crate::ast::classify::role_ddl).unwrap_or_else(|| is_role_ddl_text(sql))
+    crate::ast::classify::read(sql, crate::ast::classify::role_ddl).unwrap_or_default()
 }
 
-/// `is_role_ddl` by the text, for what Postgres' grammar does not read.
-pub(crate) fn is_role_ddl_text(sql: &str) -> bool {
-    let f = split_words(sql);
-    f.len() >= 2
-        && ["CREATE", "ALTER", "DROP"].iter().any(|v| eq_fold(f[0], v))
-        && ["ROLE", "USER", "GROUP"]
-            .iter()
-            .any(|o| eq_fold(trim_end_chars(f[1], ";"), o))
-        && !f.get(2).is_some_and(|w| eq_fold(w, "mapping"))
+/// A role statement as the session runs it, read from its node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RolePlan {
+    /// CREATE ROLE, USER (LOGIN unless said otherwise) or GROUP.
+    Create {
+        name: Role,
+        user: bool,
+        attrs: Vec<(&'static str, i64)>,
+        password: Option<String>,
+    },
+    /// ALTER ROLE's options, or ALTER ROLE ... SET (no options).
+    Alter {
+        name: Role,
+        attrs: Vec<(&'static str, i64)>,
+        password: Option<String>,
+    },
+    Rename {
+        name: String,
+        to: String,
+    },
+    Drop {
+        names: Vec<Role>,
+        if_exists: bool,
+    },
+    /// ALTER DEFAULT PRIVILEGES: accepted, kept nowhere.
+    DefaultPrivileges,
+}
+
+/// The column of _overlite_roles a role option sets, and to what.
+fn role_attr(d: &pb::DefElem) -> Option<(&'static str, i64)> {
+    let col = match d.defname.as_str() {
+        "superuser" => "rolsuper",
+        "createdb" => "rolcreatedb",
+        "createrole" => "rolcreaterole",
+        "canlogin" => "rolcanlogin",
+        "inherit" => "rolinherit",
+        "isreplication" => "rolreplication",
+        "bypassrls" => "rolbypassrls",
+        _ => return None,
+    };
+    Some((col, i64::from(tree::def_bool(d))))
+}
+
+/// The options' attributes, each once, the last word winning, and the password
+/// (PASSWORD NULL sets none).
+fn role_options(options: &[pb::Node]) -> (Vec<(&'static str, i64)>, Option<String>) {
+    let mut attrs: Vec<(&'static str, i64)> = Vec::new();
+    let mut password = None;
+    for d in tree::defs(options) {
+        if d.defname == "password" {
+            password = tree::def_text(d);
+        } else if let Some((col, v)) = role_attr(d) {
+            attrs.retain(|(c, _)| *c != col);
+            attrs.push((col, v));
+        }
+    }
+    (attrs, password)
+}
+
+/// What a role statement asks for: None for a statement that is none.
+pub(crate) fn role_plan(n: &NodeEnum) -> Option<RolePlan> {
+    use pb::RoleStmtType as T;
+    match n {
+        NodeEnum::CreateRoleStmt(c) => {
+            let (attrs, password) = role_options(&c.options);
+            Some(RolePlan::Create {
+                name: Role::Named(c.role.clone()),
+                user: T::try_from(c.stmt_type) == Ok(T::RolestmtUser),
+                attrs,
+                password,
+            })
+        }
+        NodeEnum::AlterRoleStmt(a) => {
+            let (attrs, password) = role_options(&a.options);
+            Some(RolePlan::Alter {
+                name: tree::role(a.role.as_ref()?),
+                attrs,
+                password,
+            })
+        }
+        NodeEnum::AlterRoleSetStmt(a) => Some(RolePlan::Alter {
+            name: tree::role(a.role.as_ref()?),
+            attrs: Vec::new(),
+            password: None,
+        }),
+        NodeEnum::RenameStmt(r) if tree::object(r.rename_type) == pb::ObjectType::ObjectRole => {
+            Some(RolePlan::Rename {
+                name: r.subname.clone(),
+                to: r.newname.clone(),
+            })
+        }
+        NodeEnum::DropRoleStmt(d) => Some(RolePlan::Drop {
+            names: d.roles.iter().filter_map(tree::role_spec).map(tree::role).collect(),
+            if_exists: d.missing_ok,
+        }),
+        NodeEnum::AlterDefaultPrivilegesStmt(_) => Some(RolePlan::DefaultPrivileges),
+        _ => None,
+    }
 }
 
 impl Session {
-    /// Handles CREATE/ALTER/DROP ROLE|USER|GROUP. GRANT/REVOKE are no-ops handled
-    /// in intercept_utility, since SQLite has no per-object privileges.
+    /// Handles CREATE/ALTER/DROP ROLE|USER|GROUP and ALTER DEFAULT PRIVILEGES (accepted
+    /// as a no-op).
     #[must_use = "the error inside is the answer to the statement"]
     pub(crate) fn try_role_ddl(&mut self, sql: &str) -> Option<Result<Command>> {
-        let fields = split_words(sql);
-        if fields.get(2).is_some_and(|w| eq_fold(w, "mapping")) {
-            return None; // CREATE USER MAPPING: a foreign-data statement
-        }
-        if fields.len() < 2 {
+        if !is_role_ddl(sql)
+            && !crate::ast::classify::read(sql, |n| matches!(n, NodeEnum::AlterDefaultPrivilegesStmt(_)))
+                .unwrap_or(false)
+        {
             return None;
         }
-        let verb = fields[0].to_uppercase();
-        let obj = trim_end_chars(fields[1], ";").to_uppercase();
-        if verb == "ALTER" && obj == "DEFAULT" {
-            // ALTER DEFAULT PRIVILEGES: accept, no-op
-            return Some(Ok(Command::from("ALTER DEFAULT PRIVILEGES")));
-        }
-        if !is_role_ddl(sql) {
-            return None;
-        }
-        Some(self.run_role_ddl(&verb, &obj, sql))
+        Some(
+            tree::statement(sql, |n| role_plan(n).ok_or_else(tree::syntax_error))
+                .and_then(|plan| self.run_role_ddl(plan)),
+        )
     }
 
-    fn run_role_ddl(&mut self, verb: &str, obj: &str, sql: &str) -> Result<Command> {
-        let mut words = ddl_words(sql)?;
-        if words.last() == Some(&Word::Punct(';')) {
-            words.pop();
-        }
-        // After the verb and the object.
-        let words = words.get(2..).unwrap_or(&[]);
-        match verb {
-            "CREATE" => {
-                let name = self.role_name_at(words, 0)?;
+    fn run_role_ddl(&mut self, plan: RolePlan) -> Result<Command> {
+        match plan {
+            RolePlan::DefaultPrivileges => Ok(Command::from("ALTER DEFAULT PRIVILEGES")),
+            RolePlan::Create {
+                name,
+                user,
+                attrs,
+                password,
+            } => {
+                let name = self.role_named(&name)?;
                 self.require_role_admin("CREATE", &name)?;
-                self.create_role(&name, &words[1..], obj)?;
+                self.create_role(&name, attrs, password, user)?;
                 self.grant_creator_admin(&name);
                 Ok(Command::from("CREATE ROLE"))
             }
-            "ALTER" => {
-                let name = self.role_name_at(words, 0)?;
+            RolePlan::Alter { name, attrs, password } => {
+                let name = self.role_named(&name)?;
                 self.require_role_admin("ALTER", &name)?;
-                self.alter_role(&name, &words[1..])?;
+                self.alter_role(&name, attrs, password)?;
                 Ok(Command::from("ALTER ROLE"))
             }
-            _ => {
-                let if_exists = words.len() >= 2 && words[0].is("if") && words[1].is("exists");
-                let names = &words[if if_exists { 2 } else { 0 }..];
-                let mut roles = Vec::new();
-                for at in (0..names.len()).step_by(2) {
-                    roles.push(self.role_name_at(names, at)?);
-                    if names.get(at + 1).is_some_and(|w| *w != Word::Punct(',')) {
-                        return Err(syntax_error_at(names.get(at + 1)));
+            RolePlan::Rename { name, to } => {
+                self.require_role_admin("ALTER", &name)?;
+                if !self.role_exists(&name) {
+                    if name == self.current_role {
+                        return Ok(Command::from("ALTER ROLE"));
                     }
+                    return Err(errf!(SqlState::UNDEFINED_OBJECT, "role \"{name}\" does not exist"));
                 }
-                if roles.is_empty() {
-                    return Err(syntax_error_at(None));
+                self.rename_role(&name, &to)?;
+                Ok(Command::from("ALTER ROLE"))
+            }
+            RolePlan::Drop { names, if_exists } => {
+                let mut roles = Vec::with_capacity(names.len());
+                for n in &names {
+                    roles.push(self.role_named(n)?);
                 }
                 self.require_role_admin("DROP", roles.first().map_or("", String::as_str))?;
                 for role in &roles {
@@ -93,14 +179,16 @@ impl Session {
         }
     }
 
-    /// The role a word names: CURRENT_USER and the like stand for one.
-    fn role_name_at(&self, words: &[Word], at: usize) -> Result<String> {
-        match words.get(at) {
-            Some(w) if w.is("current_user") || w.is("current_role") => Ok(self.current_role.clone()),
-            Some(w) if w.is("session_user") => Ok(self.session_user.clone()),
-            Some(w) => w.name().map(str::to_string).ok_or_else(|| syntax_error_at(Some(w))),
-            None => Err(syntax_error_at(None)),
-        }
+    /// The role a specification names: CURRENT_USER and the like stand for one.
+    fn role_named(&self, r: &Role) -> Result<String> {
+        Ok(match r {
+            Role::Named(n) => n.clone(),
+            Role::Current => self.current_role.clone(),
+            Role::Session => self.session_user.clone(),
+            Role::Public => {
+                return Err(errf!(SqlState::RESERVED_NAME, "role name \"public\" is reserved"));
+            }
+        })
     }
 
     /// Enforces who may manage roles: a superuser or unmanaged role (bypass) or a
@@ -136,24 +224,29 @@ impl Session {
         let _ = self.exec(&q, &[]);
     }
 
-    fn create_role(&mut self, name: &str, options: &[Word], obj: &str) -> Result<()> {
+    fn create_role(
+        &mut self,
+        name: &str,
+        mut attrs: Vec<(&'static str, i64)>,
+        password: Option<String>,
+        user: bool,
+    ) -> Result<()> {
         if name == "public" || name == "none" || name.starts_with("pg_") {
             return Err(errf!(SqlState::RESERVED_NAME, "role name \"{name}\" is reserved"));
         }
-        let mut attrs = parse_role_attrs(options);
-        if !attrs.contains_key("rolcanlogin") && obj == "USER" {
-            attrs.insert("rolcanlogin", 1); // CREATE USER defaults to LOGIN
+        if user && !attrs.iter().any(|(c, _)| *c == "rolcanlogin") {
+            attrs.push(("rolcanlogin", 1)); // CREATE USER defaults to LOGIN
         }
 
         let mut cols: Vec<String> = vec!["rolname".to_string()];
         let mut ph: Vec<String> = vec!["?".to_string()];
         let mut vals: Vec<Value> = vec![Value::Text(name.to_string())];
-        for (col, v) in &attrs {
+        for (col, v) in attrs {
             cols.push(col.to_string());
             ph.push("?".to_string());
-            vals.push(Value::Int(*v));
+            vals.push(Value::Int(v));
         }
-        if let Some(pw) = extract_password(options) {
+        if let Some(pw) = password {
             let verifier = build_scram_verifier(&pw)?;
             cols.push("rolpassword".to_string());
             ph.push("?".to_string());
@@ -171,7 +264,7 @@ impl Session {
         Ok(())
     }
 
-    fn alter_role(&mut self, name: &str, options: &[Word]) -> Result<()> {
+    fn alter_role(&mut self, name: &str, attrs: Vec<(&'static str, i64)>, password: Option<String>) -> Result<()> {
         if !self.role_exists(name) {
             // The role logged in may be one the catalog never held.
             if name == self.current_role {
@@ -180,27 +273,16 @@ impl Session {
             return Err(errf!(SqlState::UNDEFINED_OBJECT, "role \"{name}\" does not exist"));
         }
 
-        // ALTER ROLE x RENAME TO y
-        if options.first().is_some_and(|w| w.is("rename")) {
-            if !options.get(1).is_some_and(|w| w.is("to")) {
-                return Err(syntax_error_at(options.get(1)));
-            }
-            let Some(to) = options.get(2).and_then(Word::name) else {
-                return Err(syntax_error_at(options.get(2)));
-            };
-            return self.rename_role(name, to);
-        }
-
         let mut set: Vec<String> = Vec::with_capacity(2);
         let mut vals: Vec<Value> = Vec::with_capacity(3);
-        if let Some(pw) = extract_password(options) {
+        if let Some(pw) = password {
             let verifier = build_scram_verifier(&pw)?;
             set.push("rolpassword = ?".to_string());
             vals.push(Value::Text(verifier));
         }
-        for (col, v) in &parse_role_attrs(options) {
+        for (col, v) in attrs {
             set.push(format!("{col} = ?"));
-            vals.push(Value::Int(*v));
+            vals.push(Value::Int(v));
         }
         if set.is_empty() {
             return Ok(()); // ALTER ROLE ... SET config / other: accept as no-op
@@ -248,96 +330,40 @@ impl Session {
     }
 }
 
-/// The string after PASSWORD in a role's options. PASSWORD NULL sets none.
-fn extract_password(options: &[Word]) -> Option<String> {
-    let at = options.iter().position(|w| w.is("password"))?;
-    match options.get(at + 1)? {
-        Word::Str(password) => Some(password.clone()),
-        _ => None,
-    }
-}
-
-/// Maps the role option keywords that were explicitly given to their column and
-/// value, so ALTER only touches what was named.
-fn parse_role_attrs(options: &[Word]) -> HashMap<&'static str, i64> {
-    let mut m = HashMap::new();
-    for t in options {
-        let Word::Bare(word) = t else {
-            continue; // quoted, it is a name
-        };
-        match word.to_uppercase().as_str() {
-            "SUPERUSER" => {
-                m.insert("rolsuper", 1);
-            }
-            "NOSUPERUSER" => {
-                m.insert("rolsuper", 0);
-            }
-            "CREATEDB" => {
-                m.insert("rolcreatedb", 1);
-            }
-            "NOCREATEDB" => {
-                m.insert("rolcreatedb", 0);
-            }
-            "CREATEROLE" => {
-                m.insert("rolcreaterole", 1);
-            }
-            "NOCREATEROLE" => {
-                m.insert("rolcreaterole", 0);
-            }
-            "LOGIN" => {
-                m.insert("rolcanlogin", 1);
-            }
-            "NOLOGIN" => {
-                m.insert("rolcanlogin", 0);
-            }
-            "INHERIT" => {
-                m.insert("rolinherit", 1);
-            }
-            "NOINHERIT" => {
-                m.insert("rolinherit", 0);
-            }
-            "REPLICATION" => {
-                m.insert("rolreplication", 1);
-            }
-            "NOREPLICATION" => {
-                m.insert("rolreplication", 0);
-            }
-            "BYPASSRLS" => {
-                m.insert("rolbypassrls", 1);
-            }
-            "NOBYPASSRLS" => {
-                m.insert("rolbypassrls", 0);
-            }
-            _ => {}
-        }
-    }
-    m
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn extract_password_cases() {
-        let password = |sql: &str| extract_password(&ddl_words(sql).unwrap());
-        assert_eq!(
-            password("CREATE ROLE alice LOGIN PASSWORD 'alicepw'").as_deref(),
-            Some("alicepw")
-        );
-        assert_eq!(
-            password("ALTER ROLE bob ENCRYPTED PASSWORD 'it''s me'").as_deref(),
-            Some("it's me")
-        );
-        assert_eq!(password("ALTER ROLE bob CREATEDB"), None);
-        assert_eq!(password("ALTER ROLE bob PASSWORD NULL"), None);
-        assert_eq!(password(r#"CREATE ROLE "password""#), None);
+    fn plan(sql: &str) -> RolePlan {
+        tree::read(sql, role_plan).unwrap()
     }
 
     #[test]
-    fn options_in_quotes_are_names() {
-        let attrs = parse_role_attrs(&ddl_words(r#""login" LOGIN "NOLOGIN""#).unwrap());
-        assert_eq!(attrs.get("rolcanlogin"), Some(&1));
-        assert!(parse_role_attrs(&ddl_words(r#""superuser""#).unwrap()).is_empty());
+    fn passwords_and_options() {
+        let RolePlan::Alter { password, .. } = plan("ALTER ROLE bob ENCRYPTED PASSWORD 'it''s me'") else {
+            panic!()
+        };
+        assert_eq!(password.as_deref(), Some("it's me"));
+        let RolePlan::Alter { password, attrs, .. } = plan("ALTER ROLE bob PASSWORD NULL CREATEDB") else {
+            panic!()
+        };
+        assert_eq!((password, attrs), (None, vec![("rolcreatedb", 1)]));
+        // A quoted word is a name, never an option.
+        assert_eq!(
+            plan(r#"CREATE ROLE "password" NOLOGIN"#),
+            RolePlan::Create {
+                name: Role::Named("password".into()),
+                user: false,
+                attrs: vec![("rolcanlogin", 0)],
+                password: None,
+            }
+        );
+        assert_eq!(
+            plan(r#"DROP USER IF EXISTS "A b", c, CURRENT_USER"#),
+            RolePlan::Drop {
+                names: vec![Role::Named("A b".into()), Role::Named("c".into()), Role::Current],
+                if_exists: true,
+            }
+        );
     }
 }

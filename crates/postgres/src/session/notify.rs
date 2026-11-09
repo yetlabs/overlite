@@ -3,7 +3,6 @@
 //! to the socket only while the session is idle, under `NotifyState::mu`.
 
 use crate::session::Session;
-use crate::session::utility::first_word_upper;
 use crate::wire::{MSG_NOTIFICATION, NetStream, append_cstring, i32_be};
 use overlite_core::Command;
 use overlite_core::sync::MutexExt;
@@ -176,10 +175,5 @@ enum Notice {
 
 /// Whether sql is a LISTEN/UNLISTEN/NOTIFY statement.
 pub(crate) fn is_listen_notify(sql: &str) -> bool {
-    crate::ast::classify::read(sql, crate::ast::classify::listen_notify).unwrap_or_else(|| is_listen_notify_text(sql))
-}
-
-/// `is_listen_notify` by the text, for what Postgres' grammar does not read.
-pub(crate) fn is_listen_notify_text(sql: &str) -> bool {
-    matches!(first_word_upper(sql).as_str(), "LISTEN" | "UNLISTEN" | "NOTIFY")
+    crate::ast::classify::read(sql, crate::ast::classify::listen_notify).unwrap_or_default()
 }

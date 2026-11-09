@@ -2,7 +2,6 @@
 
 use crate::error::{Error, Result};
 use crate::rewrite::blank::{skip_block_comment, skip_line_comment};
-use crate::rewrite::catalog::is_word_byte;
 use crate::rewrite::index_from;
 use overlite_core::SqlState;
 use std::borrow::Cow;
@@ -369,42 +368,8 @@ fn decode_unicode_string(value: &str, escape: char) -> Result<String> {
     Ok(out)
 }
 
-/// Returns the index just past the single-quoted string literal that starts at
-/// i (with '' treated as an escaped quote).
-pub(crate) fn end_of_string_literal(sql: &str, i: usize) -> usize {
-    let s = sql.as_bytes();
-    let mut j = i + 1;
-    while j < s.len() {
-        if s[j] == b'\'' {
-            if j + 1 < s.len() && s[j + 1] == b'\'' {
-                j += 2;
-                continue;
-            }
-            return j + 1;
-        }
-        j += 1;
-    }
-    j
-}
+use overlite_core::text::end_of_string_literal;
 
-/// Applies f to every stretch of sql that lies outside a single-quoted string
-/// literal, copying the literals through verbatim.
-pub(crate) fn map_outside_strings(sql: &str, mut f: impl FnMut(&str) -> String) -> String {
-    let s = sql.as_bytes();
-    let mut b = String::with_capacity(s.len());
-    let mut i = 0;
-    let mut code_start = 0;
-    while i < s.len() {
-        if s[i] == b'\'' {
-            b.push_str(&f(&sql[code_start..i]));
-            let j = end_of_string_literal(sql, i);
-            b.push_str(&sql[i..j]);
-            i = j;
-            code_start = j;
-            continue;
-        }
-        i += 1;
-    }
-    b.push_str(&f(&sql[code_start..]));
-    b
+fn is_word_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
 }

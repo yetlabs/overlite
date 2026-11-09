@@ -13,5 +13,5 @@ pub(crate) mod exclude;
 pub(crate) mod identity;
 pub(crate) mod objects;
 pub(crate) mod sequences;
+pub(crate) mod tree;
 mod truncate;
-pub(crate) mod words;

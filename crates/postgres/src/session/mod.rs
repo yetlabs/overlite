@@ -1535,7 +1535,6 @@ impl<'a> BodyReader<'a> {
 pub(crate) mod tests {
     use super::*;
     use crate::rewrite::needs_no_rewrite;
-    use crate::rewrite::tokens::code_tokens;
     use crate::session::utility::SavepointKind;
     use overlite_engine::blank_literals;
 
@@ -1651,8 +1650,19 @@ pub(crate) mod tests {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
+    /// The tokens of s as Postgres' scanner reads them, comments left out.
     fn tokens(s: &str) -> Vec<String> {
-        code_tokens(s).iter().map(|t| s[t.span.clone()].to_string()).collect()
+        use pg_query::protobuf::Token;
+        pg_query::scan(s).map_or_else(
+            |_| Vec::new(),
+            |r| {
+                r.tokens
+                    .iter()
+                    .filter(|t| !matches!(Token::try_from(t.token), Ok(Token::SqlComment | Token::CComment)))
+                    .map(|t| s[t.start as usize..t.end as usize].to_string())
+                    .collect()
+            },
+        )
     }
 
     /// What each router says of a statement.

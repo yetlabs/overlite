@@ -4,16 +4,14 @@
 
 use crate::error::{Error, Result, errf};
 use crate::session::Session;
-use crate::session::utility::unquote_ident;
 use crate::wire::{
     MSG_COPY_DATA, MSG_COPY_DONE, MSG_COPY_FAIL, MSG_COPY_IN_RESPONSE, MSG_COPY_OUT_RESPONSE, WireConn, append_int16,
 };
 use overlite_core::text::{
-    compile_or_panic, eq_fold, quote_ident, quote_literal, split_words, string_from_cut_utf8, text_from_bytes,
-    trim_end_chars, unescape_vec,
+    quote_ident, quote_literal, string_from_cut_utf8, text_from_bytes, trim_end_chars, unescape_vec,
 };
-use overlite_core::{SqlState, Value, lazy_regex};
-use overlite_engine::blank_literals;
+use overlite_core::{SqlState, Value};
+use pg_query::NodeEnum;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CopyStmt {
@@ -27,66 +25,61 @@ pub(crate) struct CopyStmt {
     header: bool,
 }
 
-lazy_regex!(RE_COPY, r"(?is)^\s*COPY\s+(.*?)\s+(FROM\s+STDIN|TO\s+STDOUT)\s*(.*)$");
-
-/// Parses a COPY statement, or returns None if it isn't one.
+/// A COPY to or from the client (STDIN, STDOUT), read from its node; None for any
+/// other statement, and for a COPY of a file or a program, which the server does not
+/// read or write.
 pub(crate) fn parse_copy(sql: &str) -> Option<CopyStmt> {
-    if !crate::ast::classify::read(sql, crate::ast::classify::copy).unwrap_or(true) {
+    if !crate::ast::classify::read(sql, crate::ast::classify::copy).unwrap_or(false) {
         return None;
     }
-    parse_copy_text(sql)
+    crate::ddl::tree::read(sql, |n| copy_of(sql, n))
 }
 
-/// The COPY sql is, read from its text.
-pub(crate) fn parse_copy_text(sql: &str) -> Option<CopyStmt> {
-    let code = blank_literals(sql);
-    let m = RE_COPY.captures(&code)?;
+fn copy_of(sql: &str, n: &NodeEnum) -> Option<CopyStmt> {
+    use crate::ddl::tree;
+    let NodeEnum::CopyStmt(c) = n else {
+        return None;
+    };
+    if !c.filename.is_empty() || c.is_program {
+        return None;
+    }
     let mut cs = CopyStmt {
-        from_stdin: eq_fold(split_words(&m[2])[0], "from"),
+        from_stdin: c.is_from,
         delimiter: b'\t',
         null: r"\N".to_string(),
         ..Default::default()
     };
-
-    let target = sql[m.get(1)?.range()].trim();
-    if target.starts_with('(') {
-        let t = target.strip_prefix('(').unwrap_or(target);
-        cs.query = t.strip_suffix(')').unwrap_or(t).trim().to_string();
-    } else if let Some(i) = target.find('(') {
-        cs.table = target[..i].trim().to_string();
-        let c = target[i + 1..].trim();
-        let cols = c.strip_suffix(')').unwrap_or(c);
-        for c in cols.split(',') {
-            cs.columns.push(unquote_ident(c.trim()));
-        }
+    if c.query.is_some() {
+        // The query as written, between COPY's parentheses.
+        let toks = tree::tokens(sql);
+        let text = |t: &tree::Token| &sql[t.start..t.end];
+        let open = toks.iter().position(|t| t.depth == 0 && text(t) == "(")?;
+        let close = toks[open + 1..].iter().find(|t| t.depth == 0 && text(t) == ")")?;
+        cs.query = sql[toks[open].end..close.start].trim().to_string();
     } else {
-        cs.table = target.to_string();
+        cs.table = tree::reference(c.relation.as_ref()?);
+        cs.columns = tree::strings(&c.attlist);
     }
-
-    parse_copy_options(&mut cs, &m[3]);
-    Some(cs)
-}
-
-fn parse_copy_options(cs: &mut CopyStmt, opts: &str) {
-    let low = opts.to_lowercase();
-    if low.contains("csv") || regexp_contains(&low, r"format\s+csv") {
-        cs.csv = true;
+    let mut delimiter = None;
+    for d in tree::defs(&c.options) {
+        match d.defname.as_str() {
+            "format" => cs.csv = tree::def_text(d).is_some_and(|f| f.eq_ignore_ascii_case("csv")),
+            "header" => cs.header = tree::def_bool(d),
+            "delimiter" => delimiter = tree::def_text(d).and_then(|t| t.bytes().next()),
+            "null" => cs.null = tree::def_text(d).unwrap_or_default(),
+            _ => {}
+        }
+    }
+    if cs.csv {
         cs.delimiter = b',';
-        cs.null = String::new();
+        if !tree::defs(&c.options).any(|d| d.defname == "null") {
+            cs.null = String::new();
+        }
     }
-    if low.contains("header") {
-        cs.header = true;
+    if let Some(d) = delimiter {
+        cs.delimiter = d;
     }
-    if let Some(m) = compile_or_panic(r"(?i)delimiter\s+'(.)'").captures(opts) {
-        cs.delimiter = m[1].as_bytes()[0];
-    }
-    if let Some(m) = compile_or_panic(r"(?i)null\s+'([^']*)'").captures(opts) {
-        cs.null = m[1].to_string();
-    }
-}
-
-fn regexp_contains(s: &str, pat: &str) -> bool {
-    compile_or_panic(pat).is_match(s)
+    Some(cs)
 }
 
 impl Session {
