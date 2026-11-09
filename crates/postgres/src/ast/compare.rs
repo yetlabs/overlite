@@ -806,6 +806,25 @@ type Intended = (&'static str, fn(&[String], &[String]) -> bool);
 
 const INTENDED: &[Intended] = &[
     (
+        "a TEMP or UNLOGGED table's columns are typed as any table's (numeric as DECIMALTEXT, citext with \
+         NOCASE), and UNLOGGED goes: the text passes looked for TABLE as the second word",
+        |old, new| {
+            old.len() > 2
+                && old[0] == "create"
+                && matches!(old[1].as_str(), "temp" | "temporary" | "unlogged")
+                && (new.iter().any(|x| x == "decimaltext" || x == "nocase") || new[1] == "table")
+        },
+    ),
+    (
+        "a column called tablespace is a column: the text pass took the word for the clause and cut it out with \
+         the type after it",
+        |old, new| {
+            old.first().is_some_and(|x| x == "create")
+                && old.windows(2).any(|w| w[0] == "(" && w[1] == ",")
+                && new.iter().any(|x| x == "tablespace")
+        },
+    ),
+    (
         "a serial key is the rowid with AUTOINCREMENT whatever stands between serial and PRIMARY KEY (`serial \
          NOT NULL PRIMARY KEY`, as Django writes it), so that its values are never used again, as a sequence's \
          are not: the text pass gave AUTOINCREMENT only to `serial PRIMARY KEY` written together",
