@@ -79,6 +79,12 @@ impl Session {
     /// Updates the session identity for a SET/RESET ROLE / SESSION AUTHORIZATION
     /// statement.
     pub(crate) fn apply_set_role(&mut self, sql: &str) -> Result<()> {
+        let done = self.switch_role(sql);
+        overlite_engine::set_session_role(&self.current_role);
+        done
+    }
+
+    fn switch_role(&mut self, sql: &str) -> Result<()> {
         let f = split_words(sql);
         let reset = eq_fold(f[0], "reset");
 

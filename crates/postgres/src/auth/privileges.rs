@@ -9,9 +9,13 @@
 //!     DROP/ALTER it.
 //!   - Otherwise the role needs a matching GRANT (to itself or to PUBLIC).
 //!
-//! The table extraction is statement-level (best effort): the primary target of
-//! a DML statement and its FROM/JOIN tables.
+//! What a SELECT, INSERT, UPDATE or DELETE touches is read from its parse tree,
+//! column by column (columns.rs), so column privileges hold. Any other statement,
+//! and one that reader does not follow, is read from its text (best effort: the
+//! primary target of a DML statement and its FROM/JOIN tables) and held to
+//! table-level grants alone.
 
+use crate::auth::columns::{Access, Cols, Relations, accesses};
 use crate::ddl::sequences::{is_ident_part, is_ident_start};
 use crate::error::{Result, errf};
 use crate::rewrite::strings::end_of_string_literal;
@@ -69,11 +73,19 @@ pub(crate) fn lowercase(s: &str) -> Cow<'_, str> {
 impl Session {
     /// Rejects the statement if the session's current role lacks a required
     /// privilege. Ok for bypassing roles and table-less statements.
+    ///
+    /// The columns a statement reads and writes come from its parse tree
+    /// (columns.rs). A statement that reader does not follow is held to the tables
+    /// the text names and to table-level grants, so column privileges alone never
+    /// let it run.
     pub(crate) fn check_privileges(&mut self, sql: &str) -> Result<()> {
-        let reqs = required_privileges(sql);
-        if reqs.is_empty() || self.priv_bypass() {
+        if self.priv_bypass() {
             return Ok(());
         }
+        if let Some(accesses) = accesses(sql, &mut StoredRelations(self)) {
+            return self.check_accesses(&accesses);
+        }
+        let reqs = required_privileges(sql);
         for r in &reqs {
             let table = self.stored_name(r.table);
             if !self.has_privilege(&table, r.privilege) {
@@ -84,6 +96,88 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Holds each table to what the statement needs of it, as Postgres' executor does
+    /// (ExecCheckOneRelPerms): the owner may do anything; else a privilege granted on
+    /// the table covers all its columns, and without one each column needed must have
+    /// it granted, or, when none is named, any column. DELETE has no column form.
+    fn check_accesses(&mut self, accesses: &[Access]) -> Result<()> {
+        if accesses.is_empty() {
+            return Ok(());
+        }
+        let mut roles = self.effective_roles();
+        for a in accesses {
+            if self.owns_table(&a.table, &roles) {
+                continue;
+            }
+            roles.push("public".to_string());
+            let granted = [
+                (Privilege::Select, &a.select),
+                (Privilege::Insert, &a.insert),
+                (Privilege::Update, &a.update),
+            ]
+            .into_iter()
+            .all(|(p, cols)| cols.as_ref().is_none_or(|c| self.columns_granted(a, p, c, &roles)))
+                && (!a.delete || self.table_granted(&a.table, Privilege::Delete, &roles));
+            roles.pop();
+            if !granted {
+                return Err(errf!(
+                    SqlState::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for table {}",
+                    a.table
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether grantees hold privilege on the columns of a that cols asks for.
+    fn columns_granted(&mut self, a: &Access, privilege: Privilege, cols: &Cols, grantees: &[String]) -> bool {
+        if self.table_granted(&a.table, privilege, grantees) {
+            return true;
+        }
+        // Columns that cannot be read cannot be matched to column grants.
+        let Some(all) = &a.columns else { return false };
+        let held = self.granted_columns(&a.table, privilege, grantees);
+        if cols.all {
+            all.iter().all(|c| held.contains(&c.to_lowercase()))
+        } else if cols.names.is_empty() {
+            !held.is_empty()
+        } else {
+            cols.names.iter().all(|c| held.contains(c))
+        }
+    }
+
+    /// Whether grantees hold privilege on the table itself.
+    fn table_granted(&mut self, table: &str, privilege: Privilege, grantees: &[String]) -> bool {
+        let q = format!(
+            "SELECT 1 FROM _overlite_grants WHERE lower(tablename) = lower({}) AND upper(privilege) IN (upper({}), 'ALL') AND lower(grantee) IN ({}) LIMIT 1",
+            quote_literal(table),
+            quote_literal(privilege.as_str()),
+            in_list(grantees)
+        );
+        matches!(self.exec(&q, &[]), Ok(rs) if !rs.rows.is_empty())
+    }
+
+    /// The columns of table on which grantees hold privilege, lower-cased.
+    fn granted_columns(&mut self, table: &str, privilege: Privilege, grantees: &[String]) -> HashSet<String> {
+        let q = format!(
+            "SELECT DISTINCT lower(columnname) FROM _overlite_column_grants WHERE tablename = {} AND privilege = {} AND lower(grantee) IN ({})",
+            quote_literal(table),
+            quote_literal(privilege.as_str()),
+            in_list(grantees)
+        );
+        let Ok(rs) = self.exec(&q, &[]) else {
+            return HashSet::new();
+        };
+        rs.rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The owner check of an ALTER TABLE, which has to come before any of its routes:
@@ -174,14 +268,7 @@ impl Session {
             return false; // only the owner (or a role that inherits it) qualifies
         }
         roles.push("public".to_string());
-        let grantees = in_list(&roles);
-        let q = format!(
-            "SELECT 1 FROM _overlite_grants WHERE lower(tablename) = lower({}) AND upper(privilege) IN (upper({}), 'ALL') AND lower(grantee) IN ({}) LIMIT 1",
-            quote_literal(table),
-            quote_literal(privilege.as_str()),
-            grantees
-        );
-        matches!(self.exec(&q, &[]), Ok(rs) if !rs.rows.is_empty())
+        self.table_granted(table, privilege, &roles)
     }
 
     pub(crate) fn owns_table(&mut self, table: &str, roles: &[String]) -> bool {
@@ -221,6 +308,39 @@ impl Session {
             }
         }
         roles
+    }
+}
+
+/// The tables of a statement as this session finds them: by the search_path, under
+/// their stored names.
+struct StoredRelations<'a>(&'a mut Session);
+
+impl Relations for StoredRelations<'_> {
+    fn relation(&mut self, schema: &str, name: &str) -> (String, Option<Vec<String>>) {
+        let quote = |s: &str| ["\"", &s.replace('"', "\"\""), "\""].concat();
+        let reference = if schema.is_empty() {
+            quote(name)
+        } else {
+            [quote(schema), ".".to_string(), quote(name)].concat()
+        };
+        let table = self.0.stored_name(&reference);
+        let q = format!(
+            "SELECT name FROM pragma_table_xinfo({}) WHERE hidden <> 1 ORDER BY cid",
+            quote_literal(&table)
+        );
+        let columns = match self.0.exec(&q, &[]) {
+            Ok(rs) if !rs.rows.is_empty() => Some(
+                rs.rows
+                    .iter()
+                    .map(|r| match &r[0] {
+                        Value::Text(s) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
+        (table, columns)
     }
 }
 

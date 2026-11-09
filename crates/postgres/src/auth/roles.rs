@@ -216,6 +216,7 @@ impl Session {
             "UPDATE _overlite_memberships SET member = ?1 WHERE member = ?2",
             "UPDATE _overlite_memberships SET roleof = ?1 WHERE roleof = ?2",
             "UPDATE _overlite_grants SET grantee = ?1 WHERE grantee = ?2",
+            "UPDATE _overlite_column_grants SET grantee = ?1 WHERE grantee = ?2",
             "UPDATE _overlite_owners SET owner = ?1 WHERE owner = ?2",
         ] {
             self.exec(q, &[Value::from(to), Value::from(name)])?;

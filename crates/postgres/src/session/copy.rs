@@ -10,7 +10,8 @@ use crate::wire::{
     MSG_COPY_DATA, MSG_COPY_DONE, MSG_COPY_FAIL, MSG_COPY_IN_RESPONSE, MSG_COPY_OUT_RESPONSE, WireConn, append_int16,
 };
 use overlite_core::text::{
-    compile_or_panic, eq_fold, split_words, string_from_cut_utf8, text_from_bytes, trim_end_chars, unescape_vec,
+    compile_or_panic, eq_fold, quote_ident, quote_literal, split_words, string_from_cut_utf8, text_from_bytes,
+    trim_end_chars, unescape_vec,
 };
 use overlite_core::{SqlState, Value, lazy_regex};
 use overlite_engine::blank_literals;
@@ -84,10 +85,36 @@ fn regexp_contains(s: &str, pat: &str) -> bool {
 impl Session {
     /// Runs a COPY statement, driving the copy sub-protocol on the wire.
     pub(crate) fn handle_copy(&mut self, cs: &CopyStmt) -> Result<()> {
-        // Held to what the same read or write would need sent directly.
+        // Held to what the same read or write would need sent directly, column by
+        // column: a COPY with no list reads or writes them all.
+        let listed = || cs.columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
         let needs = match (cs.from_stdin, cs.query.is_empty()) {
-            (true, _) => "INSERT INTO ".to_string() + &cs.table,
-            (false, true) => "SELECT * FROM ".to_string() + &cs.table,
+            (true, _) => {
+                let width = if cs.columns.is_empty() {
+                    let table = self.stored_name(&cs.table);
+                    let q = "SELECT count(*) FROM pragma_table_info(".to_string() + &quote_literal(&table) + ")";
+                    match self
+                        .exec(&q, &[])
+                        .ok()
+                        .and_then(|rs| rs.rows.first().map(|r| r[0].clone()))
+                    {
+                        Some(Value::Int(n)) => usize::try_from(n).unwrap_or(0),
+                        _ => 0,
+                    }
+                } else {
+                    cs.columns.len()
+                };
+                let mut sql = "INSERT INTO ".to_string() + &cs.table;
+                if width > 0 {
+                    if !cs.columns.is_empty() {
+                        sql += &[" (", &listed(), ")"].concat();
+                    }
+                    sql += &[" VALUES (", &vec!["NULL"; width].join(", "), ")"].concat();
+                }
+                sql
+            }
+            (false, true) if cs.columns.is_empty() => "SELECT * FROM ".to_string() + &cs.table,
+            (false, true) => ["SELECT ", &listed(), " FROM ", &cs.table].concat(),
             (false, false) => cs.query.clone(),
         };
         if let Err(e) = self.check_privileges(&needs) {

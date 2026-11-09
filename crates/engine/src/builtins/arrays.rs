@@ -159,6 +159,33 @@ pub(crate) fn array_lower(v: &Value) -> Value {
     Value::Int(1)
 }
 
+/// array_to_string(array, sep [, null]) over an array literal (`{a,"b c"}`, as
+/// pg_attribute.attacl reads, which psql's \dp joins): its elements joined by sep, a
+/// NULL left out or written as null when that is given. Anything else, the JSON the
+/// engine stores an array as included, is '' as it always was here. An
+/// array(SELECT ...) argument never gets here: the rewrite makes that a group_concat.
+pub(crate) fn array_to_string(a: &[Value]) -> Value {
+    let (Some(arr), Some(Value::Text(sep))) = (a.first(), a.get(1)) else {
+        return Value::Text(String::new());
+    };
+    let null = match a.get(2) {
+        Some(Value::Text(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let s = arg_str(arr);
+    let Some(inner) = s.trim().strip_prefix('{').and_then(|x| x.strip_suffix('}')) else {
+        return Value::Text(String::new());
+    };
+    if inner.trim().is_empty() {
+        return Value::Text(String::new());
+    }
+    let Some(items) = array_items(inner) else {
+        return Value::Text(String::new());
+    };
+    let parts: Vec<&str> = items.iter().filter_map(|(i, _)| i.as_deref().or(null)).collect();
+    Value::Text(parts.join(sep))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

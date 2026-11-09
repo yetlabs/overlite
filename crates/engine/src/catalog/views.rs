@@ -152,6 +152,13 @@ pub(crate) fn dynamic_catalog_views(refs: &[SchemaRef], db_name: &str, enum_base
             enum_base,
         ),
         union(
+            r#""information_schema.column_privileges""#,
+            refs,
+            INFO_COLUMN_PRIVILEGES_TMPL,
+            db_name,
+            enum_base,
+        ),
+        union(
             r#""information_schema.table_constraints""#,
             refs,
             INFO_TABLE_CONSTRAINTS_TMPL,
@@ -442,10 +449,45 @@ const PG_ATTRIBUTE_TMPL: &str = r#"SELECT CAST(m.rowid + @OFF@ AS INTEGER) AS at
  0 AS attinhcount,
  COALESCE((SELECT co.oid FROM pg_collation co WHERE co.collname = overlite_column_collation(m.sql, ti.name)),
    CASE WHEN overlite_type_oid(ti.type) IN (25, 1043, 1042) THEN 100 ELSE 0 END) AS attcollation,
- NULL AS attacl, NULL AS attoptions,
+ (SELECT '{' || group_concat(item, ',') || '}' FROM (
+   SELECT overlite_aclitem(g.grantee, group_concat(g.privilege), COALESCE(
+     (SELECT o.owner FROM _overlite_owners o WHERE o.tablename = g.tablename), @ROLE@)) AS item
+   FROM _overlite_column_grants g
+   WHERE g.tablename = (CASE WHEN '@PG@' = 'public' THEN m.name ELSE '@PG@.' || substr(m.name, @PLEN@) END)
+     AND g.columnname = ti.name
+   GROUP BY lower(g.grantee) ORDER BY min(g.rowid))) AS attacl, NULL AS attoptions,
  '' AS attcompression, NULL AS attmissingval, 0 AS attispartkey, 0 AS attstorage2
 FROM @MASTER@ m JOIN pragma_table_xinfo(m.name,'@DB@') ti
 WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' AND m.name NOT GLOB '_overlite_*'"#;
+
+/// Each column privilege someone holds: those granted on the column, those granted on
+/// its table (which cover every column), and the owner's, which are all of them and
+/// grantable, as Postgres reports a table whose ACL is the default. The grantor is
+/// the owner. A row shows when the current role acts as its grantor or grantee, or
+/// the grantee is PUBLIC, as in Postgres.
+const INFO_COLUMN_PRIVILEGES_TMPL: &str = r#"SELECT grantor, grantee, table_catalog, table_schema, table_name,
+ column_name, privilege_type, is_grantable FROM (
+SELECT DISTINCT COALESCE(o.owner, @ROLE@) AS grantor,
+ CASE WHEN lower(p.grantee) = 'public' THEN 'PUBLIC' ELSE p.grantee END AS grantee,
+ @DBNAME@ AS table_catalog, '@PG@' AS table_schema, substr(m.name, @PLEN@) AS table_name,
+ ti.name AS column_name, p.privilege AS privilege_type, p.grantable AS is_grantable
+FROM @MASTER@ m JOIN pragma_table_xinfo(m.name,'@DB@') ti
+JOIN (
+  SELECT tablename, columnname, grantee, upper(privilege) AS privilege, 'NO' AS grantable
+    FROM _overlite_column_grants
+  UNION ALL
+  SELECT g.tablename, NULL, g.grantee, k.p, 'NO' FROM _overlite_grants g
+    JOIN (SELECT 'SELECT' AS p UNION ALL SELECT 'INSERT' UNION ALL SELECT 'UPDATE' UNION ALL SELECT 'REFERENCES') k
+      ON upper(g.privilege) IN (k.p, 'ALL')
+  UNION ALL
+  SELECT ow.tablename, NULL, ow.owner, k.p, 'YES' FROM _overlite_owners ow
+    JOIN (SELECT 'SELECT' AS p UNION ALL SELECT 'INSERT' UNION ALL SELECT 'UPDATE' UNION ALL SELECT 'REFERENCES') k
+) p ON p.tablename = (CASE WHEN '@PG@' = 'public' THEN m.name ELSE '@PG@.' || substr(m.name, @PLEN@) END)
+   AND (p.columnname IS NULL OR p.columnname = ti.name)
+LEFT JOIN _overlite_owners o ON o.tablename = p.tablename
+WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' AND m.name NOT GLOB '_overlite_*'
+  AND ti.hidden <> 1
+) WHERE grantee = 'PUBLIC' OR overlite_role_visible(grantee) OR overlite_role_visible(grantor)"#;
 
 const PG_ATTRDEF_TMPL: &str = r#"SELECT CAST(m.rowid * 1000 + ti.cid + @OFF@ AS INTEGER) AS oid,
  CAST(m.rowid + @OFF@ AS INTEGER) AS adrelid, ti.cid + 1 AS adnum, ti.dflt_value AS adbin

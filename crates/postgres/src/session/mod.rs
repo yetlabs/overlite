@@ -234,6 +234,9 @@ impl Session {
         database: String,
     ) -> Session {
         let user = if user.is_empty() { "postgres" } else { user };
+        // The catalog's privilege functions answer for the role of the session this
+        // thread serves.
+        overlite_engine::set_session_role(user);
         let notify = NotifyState::new(c.sink.clone());
         Session {
             c,

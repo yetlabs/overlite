@@ -37,6 +37,7 @@ mod catalogbool;
 mod cli;
 mod cluster;
 mod collate;
+mod column_privileges;
 mod columnifexists;
 mod comment;
 mod comments;

@@ -19,6 +19,7 @@ impl SqlState {
     pub const PROTOCOL_VIOLATION: SqlState = SqlState("08P01");
     pub const CONNECTION_FAILURE: SqlState = SqlState("08006");
     pub const FEATURE_NOT_SUPPORTED: SqlState = SqlState("0A000");
+    pub const INVALID_GRANT_OPERATION: SqlState = SqlState("0LP01");
     pub const EXTERNAL_ROUTINE_INVOCATION_EXCEPTION: SqlState = SqlState("39000");
     pub const STRING_DATA_RIGHT_TRUNCATION: SqlState = SqlState("22001");
     pub const DATA_EXCEPTION: SqlState = SqlState("22000");

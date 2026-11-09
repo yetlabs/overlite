@@ -7,9 +7,11 @@ use crate::ddl::sequences::is_ident_part;
 use crate::error::{Result, errf};
 use crate::session::Session;
 use crate::session::utility::first_word_upper;
-use overlite_core::text::{eq_fold, quote_literal, quoted, split_words, trim_chars, trim_end_chars};
-use overlite_core::{Command, SqlState};
-use overlite_engine::{code_only, forget_table_rows_sql, stored_table_name};
+use overlite_core::text::{eq_fold, quote_ident, quote_literal, quoted, split_words, trim_chars, trim_end_chars};
+use overlite_core::{Command, SqlState, Value};
+use overlite_engine::{code_only, forget_table_rows_sql, split_stored_name, stored_table_name};
+use pg_query::NodeEnum;
+use pg_query::protobuf as pb;
 
 /// Whether sql is a GRANT or REVOKE statement.
 pub(crate) fn is_grant(sql: &str) -> bool {
@@ -56,10 +58,45 @@ impl Session {
             }
         }
 
+        // The columns named, checked on every table before anything is written.
+        let mut columns: Vec<Vec<(String, Vec<String>)>> = Vec::with_capacity(tables.len());
         for tbl in &tables {
+            let mut per_priv = Vec::new();
+            for p in &privs {
+                let Some(cols) = &p.columns else { continue };
+                let kinds = column_privileges(&p.name)?;
+                let found = self.grant_columns(tbl, cols)?;
+                for k in kinds {
+                    per_priv.push((k.to_string(), found.clone()));
+                }
+            }
+            columns.push(per_priv);
+        }
+
+        for (tbl, per_priv) in tables.iter().zip(&columns) {
             for who in &grantees {
-                for priv_ in &privs {
+                for (priv_, cols) in per_priv {
+                    for col in cols {
+                        self.exec(
+                            "DELETE FROM _overlite_column_grants WHERE lower(grantee) = lower(?1) AND tablename = ?2 AND columnname = ?3 AND privilege = ?4",
+                            &[Value::from(who.as_str()), Value::from(tbl.as_str()), Value::from(col.as_str()), Value::from(priv_.as_str())],
+                        )?;
+                        if !revoke {
+                            self.exec(
+                                "INSERT INTO _overlite_column_grants (grantee, tablename, columnname, privilege) VALUES (?1, ?2, ?3, ?4)",
+                                &[Value::from(who.as_str()), Value::from(tbl.as_str()), Value::from(col.as_str()), Value::from(priv_.as_str())],
+                            )?;
+                        }
+                    }
+                }
+                for p in privs.iter().filter(|p| p.columns.is_none()) {
+                    let priv_ = &p.name;
                     if revoke {
+                        // As in Postgres, revoking on the table revokes it on every column.
+                        self.exec(
+                            "DELETE FROM _overlite_column_grants WHERE lower(grantee) = lower(?1) AND tablename = ?2 AND (upper(privilege) = upper(?3) OR upper(?3) = 'ALL')",
+                            &[Value::from(who.as_str()), Value::from(tbl.as_str()), Value::from(priv_.as_str())],
+                        )?;
                         let q = format!(
                             "DELETE FROM _overlite_grants WHERE lower(grantee)=lower({}) AND lower(tablename)=lower({}) AND (upper(privilege)=upper({}) OR upper({})='ALL')",
                             quote_literal(who),
@@ -89,6 +126,43 @@ impl Session {
             }
         }
         Ok(tag)
+    }
+
+    /// The columns of table a GRANT names, as the table spells them: 42703 for one it
+    /// does not have. A quoted name must match exactly, an unquoted one in any case.
+    fn grant_columns(&mut self, table: &str, cols: &[GrantColumn]) -> Result<Vec<String>> {
+        let q = "SELECT name FROM pragma_table_xinfo(".to_string() + &quote_literal(table) + ") WHERE hidden <> 1";
+        let have: Vec<String> = self
+            .exec(&q, &[])?
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::with_capacity(cols.len());
+        for c in cols {
+            let found = have.iter().find(|h| *h == &c.name).or_else(|| {
+                if c.quoted {
+                    None
+                } else {
+                    have.iter().find(|h| eq_fold(h, &c.name))
+                }
+            });
+            let Some(found) = found else {
+                let (_, relation) = split_stored_name(table);
+                return Err(errf!(
+                    SqlState::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{relation}\" does not exist",
+                    c.name
+                ));
+            };
+            if !out.contains(found) {
+                out.push(found.clone());
+            }
+        }
+        Ok(out)
     }
 
     fn is_view(&mut self, name: &str) -> bool {
@@ -198,7 +272,63 @@ impl Session {
                 }
             }
             self.rls_changed();
+        } else if eq_fold(f[0], "alter") {
+            self.follow_columns(sql);
         }
+    }
+
+    /// Keeps column grants on their columns after an ALTER TABLE run by the engine:
+    /// a renamed column takes them along, and a dropped one takes them away, so that
+    /// a column added later by that name starts with none.
+    fn follow_columns(&mut self, sql: &str) {
+        let Ok(parsed) = crate::ast::parse::parse(sql) else {
+            return;
+        };
+        let stored = |s: &mut Self, r: &pb::RangeVar| {
+            let reference = if r.schemaname.is_empty() {
+                quote_ident(&r.relname)
+            } else {
+                quote_ident(&r.schemaname) + "." + &quote_ident(&r.relname)
+            };
+            s.stored_name(&reference)
+        };
+        for raw in &parsed.stmts {
+            match raw.stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                Some(NodeEnum::RenameStmt(r)) if r.rename_type == pb::ObjectType::ObjectColumn as i32 => {
+                    let Some(rel) = &r.relation else { continue };
+                    let table = stored(self, rel);
+                    let _ = self.exec(
+                        "UPDATE _overlite_column_grants SET columnname = ?1 WHERE tablename = ?2 AND columnname = ?3",
+                        &[
+                            Value::from(r.newname.as_str()),
+                            Value::from(table.as_str()),
+                            Value::from(r.subname.as_str()),
+                        ],
+                    );
+                }
+                Some(NodeEnum::AlterTableStmt(a)) => {
+                    let Some(rel) = &a.relation else { continue };
+                    let table = stored(self, rel);
+                    for cmd in &a.cmds {
+                        if let Some(NodeEnum::AlterTableCmd(c)) = cmd.node.as_ref()
+                            && c.subtype == pb::AlterTableType::AtDropColumn as i32
+                        {
+                            self.forget_column_grants(&table, &c.name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Drops the grants on a column that is gone.
+    pub(crate) fn forget_column_grants(&mut self, table: &str, column: &str) {
+        let _ = self.exec(
+            "DELETE FROM _overlite_column_grants WHERE tablename = ?1 AND columnname = ?2 \
+             AND NOT EXISTS (SELECT 1 FROM pragma_table_xinfo(?1) WHERE name = ?2)",
+            &[Value::from(table), Value::from(column)],
+        );
     }
 
     /// The stored names a reference may have meant, for after the statement has
@@ -277,10 +407,42 @@ fn parse_role_grant(sql: &str, revoke: bool) -> Option<RoleGrant> {
     Some(rg)
 }
 
+/// A column a GRANT names: folded to lower case unless quoted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GrantColumn {
+    name: String,
+    quoted: bool,
+}
+
+/// One privilege of a GRANT: SELECT, ALL, ..., with the columns it is limited to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PrivSpec {
+    name: String,
+    columns: Option<Vec<GrantColumn>>,
+}
+
+/// The privileges a column form of name stands for: 0LP01 for one with no column
+/// form, as in Postgres.
+fn column_privileges(name: &str) -> Result<&'static [&'static str]> {
+    Ok(match name {
+        "ALL" => &["SELECT", "INSERT", "UPDATE", "REFERENCES"],
+        "SELECT" => &["SELECT"],
+        "INSERT" => &["INSERT"],
+        "UPDATE" => &["UPDATE"],
+        "REFERENCES" => &["REFERENCES"],
+        other => {
+            return Err(errf!(
+                SqlState::INVALID_GRANT_OPERATION,
+                "invalid privilege type {other} for column"
+            ));
+        }
+    })
+}
+
 /// Extracts the privileges, tables, and grantees from a table GRANT/REVOKE. None
 /// for forms it doesn't model (e.g. GRANT <role> TO, GRANT ... ON
 /// SCHEMA/SEQUENCE/DATABASE, GRANT ... ON ALL TABLES IN SCHEMA).
-fn parse_grant(sql: &str, revoke: bool) -> Option<(Vec<String>, Vec<String>, Vec<String>)> {
+fn parse_grant(sql: &str, revoke: bool) -> Option<(Vec<PrivSpec>, Vec<String>, Vec<String>)> {
     let low = code_only(sql).to_ascii_lowercase();
     let on = index_word(&low, "on")?;
     let sep = if revoke { "from" } else { "to" };
@@ -320,23 +482,77 @@ fn parse_grant(sql: &str, revoke: bool) -> Option<(Vec<String>, Vec<String>, Vec
     Some((privs, tables, grantees))
 }
 
-/// Turns "SELECT, INSERT" / "ALL" / "ALL PRIVILEGES" into a list.
-fn split_privs(spec: &str) -> Vec<String> {
-    let l = spec.trim().to_lowercase();
-    if l == "all" || l == "all privileges" || l.is_empty() {
-        return vec!["ALL".to_string()];
-    }
+/// Turns "SELECT, INSERT" / "ALL" / "ALL PRIVILEGES" / "SELECT (a, \"B\"), UPDATE (c)"
+/// into a list. A comma inside a column list does not end a privilege.
+fn split_privs(spec: &str) -> Vec<PrivSpec> {
     let mut out = Vec::new();
-    for p in spec.split(',') {
-        let mut p = p.trim().to_uppercase();
-        if let Some(i) = p.find('(') {
-            // column-list priv -> drop columns
-            p = p[..i].trim().to_string();
-        }
-        if !p.is_empty() {
-            out.push(p);
+    let b = spec.as_bytes();
+    let (mut depth, mut quoted, mut start) = (0_i32, false, 0);
+    let mut items = Vec::new();
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'"' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            b',' if !quoted && depth == 0 => {
+                items.push(&spec[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
     }
+    items.push(&spec[start..]);
+    for item in items {
+        let item = item.trim();
+        let (word, columns) = match item.find('(') {
+            Some(i) => {
+                let inner = item[i + 1..].trim_end();
+                let inner = inner.strip_suffix(')').unwrap_or(inner);
+                (item[..i].trim(), Some(split_grant_columns(inner)))
+            }
+            None => (item, None),
+        };
+        let mut name = word.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+        if name == "ALL PRIVILEGES" || (name.is_empty() && columns.is_none()) {
+            name = "ALL".to_string();
+        }
+        if !name.is_empty() {
+            out.push(PrivSpec { name, columns });
+        }
+    }
+    out
+}
+
+/// The names of a column list: "a, \"B\"".
+fn split_grant_columns(spec: &str) -> Vec<GrantColumn> {
+    let mut out = Vec::new();
+    let b = spec.as_bytes();
+    let (mut quoted, mut start) = (false, 0);
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+            out.push(GrantColumn {
+                name: inner.replace("\"\"", "\""),
+                quoted: true,
+            });
+        } else if !s.is_empty() {
+            out.push(GrantColumn {
+                name: s.to_lowercase(),
+                quoted: false,
+            });
+        }
+    };
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                push(&spec[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push(&spec[start..]);
     out
 }
 

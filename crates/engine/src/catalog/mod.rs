@@ -254,6 +254,37 @@ where
     Ok(())
 }
 
+/// Registers a function that reads the database its statement runs in, which f gets
+/// as its first argument. Never a constant: what it reads may change.
+fn reading<F>(conn: &Connection, name: &str, f: F) -> Result<()>
+where
+    F: Fn(&Connection, &[Value]) -> Result<Value> + Send + 'static,
+{
+    conn.create_scalar_function(name, -1, FunctionFlags::SQLITE_UTF8, move |ctx: &Context<'_>| {
+        // SAFETY: the handle is the connection stepping this statement, on this
+        // thread; db is used within this call only and never leaves the thread.
+        let db = unsafe { ctx.get_connection() }?;
+        let mut args = Vec::with_capacity(ctx.len());
+        for i in 0..ctx.len() {
+            args.push(arg_value(ctx.get_raw(i)));
+        }
+        match f(&db, &args) {
+            Ok(v) => Ok(sql_value(v)),
+            Err(e) => {
+                if let ErrorKind::State(state) = e.kind() {
+                    set_function_state(state);
+                }
+                Err(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(ffi::SQLITE_ERROR),
+                    Some(e.into_message()),
+                ))
+            }
+        }
+    })
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 /// Registers a function SQLite may treat as a constant of its arguments.
 pub(crate) fn scalar<F>(conn: &Connection, name: &str, n_arg: i32, f: F) -> Result<()>
 where
@@ -844,7 +875,9 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         scalar(conn, name, -1, null)?;
     }
     scalar(conn, "pg_encoding_to_char", 1, |_| text("UTF8"))?;
-    scalar(conn, "array_to_string", -1, empty)?;
+    scalar(conn, "array_to_string", -1, |a| {
+        Ok(crate::builtins::arrays::array_to_string(a))
+    })?;
     scalar(conn, "pg_get_functiondef", -1, fn_field(|f| f.src.clone()))?;
     scalar(conn, "pg_get_function_arguments", -1, fn_field(|f| f.args.clone()))?;
     scalar(conn, "pg_get_function_result", -1, fn_field(|f| f.rettype.clone()))?;
@@ -963,14 +996,17 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     // with it); it builds a Postgres array literal {a,b,c}.
     aggregate(conn, "array_agg", -1, || Box::<ArrayAgg>::default())?;
 
-    // Access-privilege checks: DBeaver filters the object tree with these; we
-    // grant everything (single trusted user).
+    // Table and column privileges answer from the grants, for the session's role.
+    reading(conn, "has_table_privilege", grants::has_table_privilege)?;
+    reading(conn, "has_column_privilege", grants::has_column_privilege)?;
+    reading(conn, "has_any_column_privilege", grants::has_any_column_privilege)?;
+    reading(conn, "overlite_role_visible", grants::role_visible)?;
+    scalar(conn, "overlite_aclitem", 3, grants::aclitem)?;
+    // The other access-privilege checks: DBeaver filters the object tree with these;
+    // objects other than tables have no grants here, so everything is granted.
     for name in [
         "has_schema_privilege",
         "has_database_privilege",
-        "has_table_privilege",
-        "has_column_privilege",
-        "has_any_column_privilege",
         "has_sequence_privilege",
         "has_function_privilege",
         "has_type_privilege",

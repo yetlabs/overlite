@@ -8,8 +8,8 @@ use crate::catalog::enums::{
     COMPOSITE_TYPES_TABLE_DDL, ENUM_LABELS_TABLE_DDL, ENUM_TYPES_TABLE_DDL, refresh_enum_names,
 };
 use crate::catalog::grants::{
-    GRANTS_TABLE_DDL, MEMBERSHIPS_ADD_ADMIN_DDL, MEMBERSHIPS_TABLE_DDL, OWNERS_TABLE_DDL, forget_table_rows_sql,
-    move_table_rows_sql,
+    COLUMN_GRANTS_TABLE_DDL, GRANTS_TABLE_DDL, MEMBERSHIPS_ADD_ADMIN_DDL, MEMBERSHIPS_TABLE_DDL, OWNERS_TABLE_DDL,
+    forget_table_rows_sql, move_table_rows_sql,
 };
 use crate::catalog::rls::{POLICIES_TABLE_DDL, RLS_STORED_NAMES_MARK, RLS_STORED_NAMES_UPGRADE, RLS_TABLE_DDL};
 use crate::catalog::roles::{ROLES_ADD_PASSWORD_DDL, ROLES_TABLE_DDL, seed_default_role_sql};
@@ -334,6 +334,7 @@ fn setup_connection_with(
     // The internal privilege tables (GRANT/REVOKE storage + table ownership),
     // consulted by the protocol before running a statement.
     create(GRANTS_TABLE_DDL)?;
+    create(COLUMN_GRANTS_TABLE_DDL)?;
     create(OWNERS_TABLE_DDL)?;
     create(MEMBERSHIPS_TABLE_DDL)?;
     add_column(MEMBERSHIPS_ADD_ADMIN_DDL);

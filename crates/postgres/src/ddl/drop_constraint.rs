@@ -671,8 +671,9 @@ impl Session {
         done
     }
 
-    /// A nextval default of the column goes with it.
+    /// A nextval default of the column goes with it, and its grants.
     fn forget_column_default(&mut self, table: &str, col: &str) -> Result<()> {
+        self.forget_column_grants(table, col);
         let forget = "DELETE FROM _overlite_defaults WHERE lower(tablename) = lower(".to_string()
             + &quote_literal(table)
             + ") AND lower(colname) = lower("

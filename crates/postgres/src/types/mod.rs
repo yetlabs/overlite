@@ -203,6 +203,10 @@ pub(crate) static BOOL_CATALOG_COLUMNS: LazyLock<HashSet<&'static str>> = LazyLo
         "pg_try_advisory_xact_lock_shared",
         "pg_advisory_unlock",
         "pg_advisory_unlock_shared",
+        // The privilege checks that answer from the grants.
+        "has_table_privilege",
+        "has_column_privilege",
+        "has_any_column_privilege",
         // pg_tables / pg_indexes summaries.
         "hasindexes",
         "hasrules",

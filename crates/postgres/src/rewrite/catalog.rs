@@ -62,9 +62,9 @@ lazy_regex!(
     concat!(
         r#"(?:(?i:\binformation_schema)|"information_schema")\."#,
         r#"(?:(?i:(?:tables|columns|table_constraints|key_column_usage|referential_constraints|"#,
-        r#"constraint_column_usage|check_constraints|views|schemata|sequences|routines)\b)"#,
+        r#"constraint_column_usage|check_constraints|views|schemata|sequences|routines|column_privileges)\b)"#,
         r#"|"(?:tables|columns|table_constraints|key_column_usage|referential_constraints|"#,
-        r#"constraint_column_usage|check_constraints|views|schemata|sequences|routines)")"#
+        r#"constraint_column_usage|check_constraints|views|schemata|sequences|routines|column_privileges)")"#
     )
 );
 

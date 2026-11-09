@@ -46,7 +46,7 @@ pub use builtins::json::{Json, json_decode_first, json_marshal, json_unmarshal};
 pub use builtins::temporal::mark_transaction_start;
 pub use catalog::constraints::{Identity, NOT_VALID_MARK, identity_columns, relation_name, unquote_sql_ident};
 pub use catalog::declared_typmod;
-pub use catalog::grants::{forget_table_rows_sql, move_table_rows_sql};
+pub use catalog::grants::{forget_table_rows_sql, move_table_rows_sql, set_session_role};
 pub use catalog::schema::stored_table_name;
 pub use cluster::{Cluster, DEFAULT_MAX_OPEN_DATABASES, open_cluster, single};
 pub use error::{Error, ErrorKind, Result};
