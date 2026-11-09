@@ -15,11 +15,6 @@ Types used here: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
 The body is optional but valued: explain why the change is needed and what it
 fixes, not what the diff already shows.
 
-**Never add AI attribution trailers.** No `Co-Authored-By:` naming Claude, no
-`Claude-Session:` line, no "Generated with Claude Code" footer — in commit
-messages, PR descriptions, or code comments. The commit is authored by whoever
-runs git.
-
 ## Verifying a change
 
 `make check` runs exactly what CI runs, over the whole workspace: formatting,
