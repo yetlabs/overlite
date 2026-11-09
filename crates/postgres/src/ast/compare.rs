@@ -1033,8 +1033,13 @@ const INTENDED: &[Intended] = &[
                 }
             }
             let o = without_parens(old);
+            let folded = n.len() < new.len();
             let n = without_parens(&n);
-            n.len() < without_parens(new).len()
+            let cut = o
+                .iter()
+                .zip(&n)
+                .any(|(o, x)| o != x && o.starts_with('\'') && o.contains('"'));
+            (folded || cut)
                 && n.len() == o.len()
                 && o.iter()
                     .zip(&n)
