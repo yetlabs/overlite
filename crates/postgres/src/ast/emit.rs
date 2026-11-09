@@ -2368,6 +2368,9 @@ impl Emitter<'_> {
     /// ctid, the row's identifier, which a table calls rowid in SQLite: None for a
     /// reference to another column.
     fn ctid(&mut self, fields: &[pb::Node]) -> Result<Option<String>, Unsupported> {
+        if !matches!(fields.last().map(string), Some(Ok("ctid"))) {
+            return Ok(None);
+        }
         let parts: Vec<&str> = match fields.iter().map(string).collect::<Result<Vec<_>, _>>() {
             Ok(p) if p.last() == Some(&"ctid") => p,
             _ => return Ok(None),
