@@ -2,12 +2,13 @@
 //! one the connection is using, so they are handled here rather than reaching the
 //! engine. A server holding a single file has no set to act on and says so.
 
-use crate::ddl::words::{Word, ddl_words, syntax_error_at};
+use crate::ddl::tree;
 use crate::error::{Error, Result};
 use crate::session::Session;
 use crate::session::utility::{first_word_upper, second_word_upper};
 use overlite_core::text::quote_literal;
 use overlite_core::{Command, SqlState};
+use pg_query::NodeEnum;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Whether sql is a CREATE/DROP/ALTER DATABASE.
@@ -38,51 +39,27 @@ enum DatabaseDdl {
     Alter(String),
 }
 
-fn name_at(words: &[Word], at: usize) -> Result<String> {
-    match words.get(at).and_then(Word::name) {
-        Some(name) => Ok(name.to_string()),
-        None => Err(syntax_error_at(words.get(at))),
-    }
-}
-
-/// Reads a statement is_database_ddl took, whose name Postgres' grammar puts in one
-/// place, so an option or a quoted name is never taken for it.
-fn parse_database_ddl(sql: &str) -> Result<DatabaseDdl> {
-    let mut words = ddl_words(sql)?;
-    if words.last() == Some(&Word::Punct(';')) {
-        words.pop();
-    }
-    match words.first() {
-        Some(w) if w.is("create") => {
-            // The grammar has no IF NOT EXISTS here, and `if` is a good name.
-            if words.get(3).is_some_and(|w| w.is("not")) {
-                return Err(syntax_error_at(words.get(3)));
-            }
-            Ok(DatabaseDdl::Create(name_at(&words, 2)?))
+/// What a database statement's node asks for.
+fn database_plan(n: &NodeEnum) -> Option<DatabaseDdl> {
+    use pg_query::protobuf::ObjectType;
+    Some(match n {
+        NodeEnum::CreatedbStmt(c) => DatabaseDdl::Create(c.dbname.clone()),
+        NodeEnum::DropdbStmt(d) => DatabaseDdl::Drop {
+            name: d.dbname.clone(),
+            if_exists: d.missing_ok,
+        },
+        NodeEnum::RenameStmt(r) if tree::object(r.rename_type) == ObjectType::ObjectDatabase => DatabaseDdl::Rename {
+            name: r.subname.clone(),
+            to: r.newname.clone(),
+        },
+        NodeEnum::AlterDatabaseStmt(a) => DatabaseDdl::Alter(a.dbname.clone()),
+        NodeEnum::AlterDatabaseSetStmt(a) => DatabaseDdl::Alter(a.dbname.clone()),
+        NodeEnum::AlterDatabaseRefreshCollStmt(a) => DatabaseDdl::Alter(a.dbname.clone()),
+        NodeEnum::AlterOwnerStmt(a) if tree::object(a.object_type) == ObjectType::ObjectDatabase => {
+            DatabaseDdl::Alter(tree::string(a.object.as_deref()?)?.to_string())
         }
-        Some(w) if w.is("drop") => {
-            let if_exists = words.get(2).is_some_and(|w| w.is("if")) && words.get(3).is_some_and(|w| w.is("exists"));
-            let at = if if_exists { 4 } else { 2 };
-            Ok(DatabaseDdl::Drop {
-                name: name_at(&words, at)?,
-                if_exists,
-            })
-        }
-        _ => {
-            let name = name_at(&words, 2)?;
-            if words.get(3).is_some_and(|w| w.is("rename")) {
-                if !words.get(4).is_some_and(|w| w.is("to")) {
-                    return Err(syntax_error_at(words.get(4)));
-                }
-                let to = name_at(&words, 5)?;
-                return Ok(DatabaseDdl::Rename { name, to });
-            }
-            if words.len() < 4 {
-                return Err(syntax_error_at(None));
-            }
-            Ok(DatabaseDdl::Alter(name))
-        }
-    }
+        _ => return None,
+    })
 }
 
 /// Bumped when the set of databases changes, for the sessions already open.
@@ -100,7 +77,8 @@ impl Session {
         if !is_database_ddl(sql) {
             return None;
         }
-        let r = parse_database_ddl(sql).and_then(|ddl| self.run_database_ddl(ddl));
+        let r = tree::statement(sql, |n| database_plan(n).ok_or_else(|| tree::parse_failure(sql)))
+            .and_then(|ddl| self.run_database_ddl(ddl));
         if r.is_ok() {
             DATABASE_GENERATION.fetch_add(1, Ordering::AcqRel);
         }
@@ -245,7 +223,7 @@ mod tests {
                 Ok(DatabaseDdl::Alter("a b".to_string())),
             ),
         ] {
-            assert_eq!(parse_database_ddl(sql).map_err(|_| ()), want, "{sql}");
+            assert_eq!(tree::read(sql, database_plan).ok_or(()), want, "{sql}");
         }
     }
 }

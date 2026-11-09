@@ -15,4 +15,3 @@ pub(crate) mod objects;
 pub(crate) mod sequences;
 pub(crate) mod tree;
 mod truncate;
-pub(crate) mod words;

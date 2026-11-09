@@ -45,3 +45,35 @@ fn a_prepared_statement_name_is_folded_unless_quoted() {
     must_exec(&conn, "DEALLOCATE byid");
     assert_eq!(conn.exec("EXECUTE byId (1, 'x')", &[]).unwrap_err().code(), "26000");
 }
+
+// COMMENT ON names its object as Postgres reads it, and an empty comment drops the
+// comment, as NULL does: the text reader stored an empty one.
+#[test]
+fn comment_on_reads_its_object_and_drops_an_empty_comment() {
+    let conn = connect(&start_server());
+    must_exec(
+        &conn,
+        r#"CREATE TABLE "My T" (id int, CONSTRAINT "c 1" CHECK (id > 0))"#,
+    );
+    must_exec(&conn, r#"COMMENT ON TABLE "My T" IS 'a table'"#);
+    must_exec(&conn, r#"COMMENT ON COLUMN "My T".id IS 'the id'"#);
+    let described = |q: &str| query_column(&conn, q, 0);
+    assert_eq!(
+        described(r#"SELECT obj_description('"My T"'::regclass, 'pg_class')"#),
+        ["a table"]
+    );
+    assert_eq!(
+        described(r#"SELECT col_description('"My T"'::regclass, 1)"#),
+        ["the id"]
+    );
+    must_exec(&conn, r#"COMMENT ON TABLE "My T" IS ''"#);
+    assert_eq!(
+        described(r#"SELECT coalesce(obj_description('"My T"'::regclass, 'pg_class'), 'none')"#),
+        ["none"]
+    );
+    must_exec(&conn, r#"COMMENT ON CONSTRAINT "c 1" ON "My T" IS 'positive'"#);
+    let err = conn
+        .exec(r#"COMMENT ON CONSTRAINT nope ON "My T" IS 'x'"#, &[])
+        .unwrap_err();
+    assert_eq!(err.code(), "42704");
+}

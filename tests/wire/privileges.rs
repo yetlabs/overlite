@@ -239,10 +239,7 @@ fn sql_execute_checks_privileges() {
     must_exec(&admin, "INSERT INTO secret VALUES (1)");
 
     let alice = connect_as(&addr, "alice", "a");
-    for (name, sql) in [
-        ("q", "SELECT * FROM secret"),
-        ("w", "INSERT INTO secret VALUES (2)"),
-    ] {
+    for (name, sql) in [("q", "SELECT * FROM secret"), ("w", "INSERT INTO secret VALUES (2)")] {
         must_exec(&alice, &format!("PREPARE {name} AS {sql}"));
         let err = alice.exec(&format!("EXECUTE {name}"), &[]).unwrap_err();
         assert_sqlstate(&err, "42501");
