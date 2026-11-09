@@ -10,7 +10,7 @@
   <a href="https://hub.docker.com/r/yetlabs/overlite"><img src="https://img.shields.io/docker/v/yetlabs/overlite?label=docker&sort=semver" alt="docker"></a>
 </p>
 
-**Speak PostgreSQL, store SQLite.** overlite is a lightweight server that talks
+**Speak PostgreSQL, store SQLite.** Overlite is a lightweight server that talks
 the PostgreSQL wire protocol on the front and keeps all your data in a single
 SQLite file on the back.
 
@@ -18,7 +18,7 @@ SQLite file on the back.
 
 SQLite is a fantastic storage engine, but it isn't a server: no network access,
 brittle locking over network filesystems, and you have to use SQLite-specific
-tooling. overlite puts a PostgreSQL-speaking server in front of it so you get:
+tooling. Overlite puts a PostgreSQL-speaking server in front of it so you get:
 
 - **Real network access & concurrency** — one process owns the file and
   serializes access, so the multi-access and network-lock problems disappear.
@@ -26,6 +26,90 @@ tooling. overlite puts a PostgreSQL-speaking server in front of it so you get:
   and any PostgreSQL driver (pgx, JDBC, …). `\dt`, `\d`, `\copy` all work.
 - **Dead simple to run** — a single static binary (SQLite linked in), no
   server to provision, no data directory. Point it at a file and go.
+
+## Performance
+
+Point lookups on a 73.8M-row table, one machine (16 cores). PostgreSQL 14 has
+the table warm in memory; SQLite is the same file opened in-process, with no
+network and the statement prepared once, which is the ceiling a server over it
+can reach.
+
+| | Overlite | PostgreSQL | SQLite in-process |
+|---|--:|--:|--:|
+| 1 client | 27k q/s | 23k q/s | 267k q/s |
+| 8 clients | 129k q/s | 126k q/s | 142k q/s |
+| 16 clients | 151k q/s | 163k q/s | 132k q/s |
+| 64 clients | 139k q/s | 170k q/s | 106k q/s |
+| new connection | 7.4 ms | 5.6 ms | 0.24 ms |
+| concurrent writes (8 clients) | 29k q/s | 117k q/s | 124k q/s |
+| `LIKE '%…%'` over every row | 5.3 s | 9.2 s | 6.5 s |
+
+With one client a server pays a network round trip per query that SQLite in a
+process does not. From 8 clients on, Overlite answers about as many lookups as
+SQLite opened directly. Concurrent writes are where it stays behind both.
+
+## Compatibility
+
+Overlite is a Rust server. It is tested end to end with real clients and real
+applications, and held to PostgreSQL 17's answers rather than to SQLite's.
+
+| Evidence | Result |
+|---|---|
+| ✅ Django 6.0 test suite (postgresql backend) | 98.5% of the tests that pass on PostgreSQL 17 also pass (17,912 of 18,179) |
+| ✅ Wagtail `bakerydemo` | 255 migrations, fixtures, admin edit/publish/revert, dump and reload: same as PostgreSQL |
+| ✅ Gitea | install, users, orgs, repos, push, issues, pull requests with review and merge, releases, wiki, search, repository deletion: same as PostgreSQL |
+| ✅ Prisma | `migrate deploy`, `migrate status`, `db pull` |
+| ✅ Clients | `psql`, `pg_dump`, pgx, psycopg 3, node-postgres, Prisma, gorm, pgbench |
+| ✅ This repository | about 530 wire tests that drive the real binary as a client, plus unit tests and a differential test of the SQL translation |
+
+SQL is being moved from text rewriting to a translation from PostgreSQL's own
+parse tree ([ADR 0001](docs/adr/0001-sql-ast.md)); both routes run side by side
+until the move is done.
+
+## Limitations
+
+🟡 works, with a difference · ⬜ not implemented. The full list, with the
+reasons, is in [NOTES.md](NOTES.md#limits). The ones a client is most likely to
+meet:
+
+### Answers that differ without an error
+
+- 🟡 **Arrays**: `ARRAY_AGG` with `FILTER`, a window or `ORDER BY` goes out as text,
+  and `<`/`>` between arrays compare their text.
+- 🟡 **Ranges**: a range value goes out as text, and `lower()`/`upper()` of date and
+  timestamp ranges are text.
+- 🟡 **Types the translation cannot see**: an expression whose type is not known
+  (a function it does not know, some subqueries) compares by SQLite's rules, e.g. a
+  date against a timestamp column, or a numeric out of an unknown function against
+  a number.
+- 🟡 **Identity and serial keys** are SQLite rowids: the next id follows the highest
+  row, even one inserted with an explicit id.
+- 🟡 **Transactions**: a transaction reads like READ COMMITTED until it first writes;
+  every row lock is the database's write lock, so `SKIP LOCKED` skips nothing.
+- 🟡 **Full-text search** knows the `simple` and `english` configurations only.
+- 🟡 **Role names** compare without case.
+
+### Accepted where PostgreSQL refuses
+
+- 🟡 SQLite's typing still decides some expressions: `SELECT 1/0` is NULL, and a column
+  can hold a value of another type (`'abc'` in an integer column).
+- 🟡 `CREATE INDEX ... USING gin|gist|brin` makes a btree index; the method is only
+  reported.
+
+### Not implemented
+
+- ⬜ **PL/pgSQL**: `CREATE FUNCTION ... LANGUAGE plpgsql` and trigger functions are
+  accepted but not run (`LANGUAGE sql` functions are).
+- ⬜ **Deferred `UNIQUE`** constraints are checked at each statement (deferred foreign
+  keys are checked at commit).
+- ⬜ **Composite and geometric types**, planner statistics, `ts_headline`, table
+  partitioning and foreign data wrappers (the last two answer with an error).
+
+### Reported differently
+
+- 🟡 Integer columns go out as `int8` whatever their width.
+- 🟡 `EXPLAIN` gives SQLite's plan in PostgreSQL's shape, with all costs at 0.
+- 🟡 Error codes are PostgreSQL's; the text of errors that come from SQLite is SQLite's.
 
 ## Quick start
 
@@ -76,7 +160,7 @@ $ docker compose up
 
 ## Configuration
 
-overlite follows PostgreSQL conventions, so it drops into the same tooling and
+Overlite follows PostgreSQL conventions, so it drops into the same tooling and
 container setups.
 
 | Flag | Env | Default | Description |
@@ -175,82 +259,5 @@ schemas. The file stays plain-SQLite readable (`sales.orders` is a table named
 `"sales.orders"`).
 
 For physical isolation between tenants, give each one a *database* rather than a
-schema: `CREATE DATABASE shop` writes `shop.db` beside the file overlite was
+schema: `CREATE DATABASE shop` writes `shop.db` beside the file Overlite was
 started with, and a connection to it can only ever see that file. See [Many databases](#many-databases).
-
-## Status
-
-overlite is a Rust server. It is tested end to end with real clients and real
-applications, and held to PostgreSQL 17's answers rather than to SQLite's.
-
-| Evidence | Result |
-|---|---|
-| Django 6.0 test suite (postgresql backend) | 98.5% of the tests that pass on PostgreSQL 17 also pass (17,912 of 18,179) |
-| Wagtail `bakerydemo` | 255 migrations, fixtures, admin edit/publish/revert, dump and reload: same as PostgreSQL |
-| Gitea | install, users, orgs, repos, push, issues, pull requests with review and merge, releases, wiki, search, repository deletion: same as PostgreSQL |
-| Prisma | `migrate deploy`, `migrate status`, `db pull` |
-| Clients | `psql`, `pg_dump`, pgx, psycopg 3, node-postgres, Prisma, gorm, pgbench |
-| This repository | about 530 wire tests that drive the real binary as a client, plus unit tests and a differential test of the SQL translation |
-
-Point lookups on a 73.8M-row table, one machine (16 cores), against PostgreSQL 14
-with the table warm in memory:
-
-| | overlite | PostgreSQL |
-|---|--:|--:|
-| 1 client | 27k q/s | 23k q/s |
-| 8 clients | 129k q/s | 126k q/s |
-| 16 clients | 151k q/s | 163k q/s |
-| 64 clients | 139k q/s | 170k q/s |
-| new connection | 7.4 ms | 5.6 ms |
-| concurrent writes | 29k q/s | 117k q/s |
-
-Writes go through SQLite's single writer, so many concurrent writers is where
-PostgreSQL stays ahead.
-
-SQL is being moved from text rewriting to a translation from PostgreSQL's own
-parse tree ([ADR 0001](docs/adr/0001-sql-ast.md)); both routes run side by side
-until the move is done.
-
-## Limitations
-
-The full list, with the reasons, is in [NOTES.md](NOTES.md#limits). The ones a
-client is most likely to meet:
-
-### Answers that differ without an error
-
-- **Arrays**: `ARRAY_AGG` with `FILTER`, a window or `ORDER BY` goes out as text,
-  and `<`/`>` between arrays compare their text.
-- **Ranges**: a range value goes out as text, and `lower()`/`upper()` of date and
-  timestamp ranges are text.
-- **Types the translation cannot see**: an expression whose type is not known
-  (a function it does not know, some subqueries) compares by SQLite's rules, e.g. a
-  date against a timestamp column, or a numeric out of an unknown function against
-  a number.
-- **Identity and serial keys** are SQLite rowids: the next id follows the highest
-  row, even one inserted with an explicit id.
-- **Transactions**: a transaction reads like READ COMMITTED until it first writes;
-  every row lock is the database's write lock, so `SKIP LOCKED` skips nothing.
-- **Full-text search** knows the `simple` and `english` configurations only.
-- **Role names** compare without case.
-
-### Accepted where PostgreSQL refuses
-
-- SQLite's typing still decides some expressions: `SELECT 1/0` is NULL, and a column
-  can hold a value of another type (`'abc'` in an integer column).
-- `CREATE INDEX ... USING gin|gist|brin` makes a btree index; the method is only
-  reported.
-
-### Not implemented
-
-- **PL/pgSQL**: `CREATE FUNCTION ... LANGUAGE plpgsql` and trigger functions are
-  accepted but not run (`LANGUAGE sql` functions are).
-- **Deferred `UNIQUE`** constraints are checked at each statement (deferred foreign
-  keys are checked at commit).
-- **Composite and geometric types**, planner statistics, `ts_headline`, table
-  partitioning and foreign data wrappers (the last two answer with an error).
-
-### Reported differently
-
-- Integer columns go out as `int8` whatever their width.
-- `EXPLAIN` gives SQLite's plan in PostgreSQL's shape, with all costs at 0.
-- Error codes are PostgreSQL's; the text of errors that come from SQLite is SQLite's.
