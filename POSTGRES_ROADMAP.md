@@ -1,39 +1,45 @@
-# overlite vs PostgreSQL — what you get, what you won't
+# Overlite vs PostgreSQL: what you get, what you won't
 
-This document exists so you can decide **before** you migrate. It is organized by
-decision, not by feature: every major PostgreSQL subsystem is listed with an
-honest verdict and, where the answer is "no", the reason and the workaround.
+This document is for deciding **before** you migrate. It goes through PostgreSQL
+subsystem by subsystem and says, for each, what Overlite gives you, what is planned,
+and what it will never have because the data lives in SQLite.
 
-The goal is for you to be able to say: *"I won't have X, Y and Z with overlite —
-and that's fine for what I'm building."*
+Each table uses five words:
 
-Legend: ✅ **have it** · 🔜 **planned** · 🤔 **open question** · ❌ **never**
-(architectural — follows from storing in SQLite)
+- **yes**: there, and held to PostgreSQL's answers by the test suite
+- **partial**: there, with the differences named next to it
+- **planned**: a known gap with work recorded against it (NOTES.md, ADR 0001)
+- **no**: not there and not planned, though nothing in SQLite rules it out
+- **never**: ruled out by SQLite's architecture
 
-## The one-paragraph answer
+The full list of differences, with the reasons, is in [NOTES.md](NOTES.md#limits).
+The README's [Limitations](README.md#limitations) has the short version.
 
-overlite speaks the PostgreSQL wire protocol over a SQLite file. Everything that
-is *language and protocol* — SQL, types, catalog, auth, tooling — can be
-emulated, and mostly is. Everything that is *storage engine and process
-architecture* — MVCC, planner, replication, extensions — belongs to SQLite and
-will never be PostgreSQL's. If your app is a CRUD service talking to an ORM,
-you'll likely never notice. If you depend on PL/pgSQL, PostGIS, read replicas or
-partitioned tables, overlite is the wrong tool and always will be.
+## The short answer
 
-## Coverage, three ways
+Overlite speaks the PostgreSQL wire protocol over SQLite files. What is *language
+and protocol* (SQL, types, catalogs, auth, client tooling) is emulated, and for
+what applications send it is close: Django's own test suite, Wagtail and Gitea
+behave as they do on PostgreSQL. What is *storage engine and process
+architecture* (concurrent writers, row locks, replication, C extensions, planner
+statistics) belongs to SQLite and will never be PostgreSQL's.
 
-One number is misleading, so here are three:
+If your application talks to the database through an ORM, it is likely to work.
+If it depends on PL/pgSQL, PostgreSQL-style triggers, PostGIS or pgvector, read
+replicas, partitioned tables or many processes writing at once, Overlite is the
+wrong tool.
 
-| Measure | Coverage |
-|---|--:|
-| The feature matrix this project tracks (see README Status) | **~90%** |
-| A typical CRUD app through an ORM (Rails / Django / Prisma / pgx / JDBC) | **~85%** |
-| PostgreSQL's actual surface (types, functions, DDL, PL, operational) | **~35–45%** |
+## What has been measured
 
-The third number is low on purpose and isn't a defect: PostgreSQL has ~700
-built-in functions, a procedural language, an extension ecosystem, and a
-replication stack. overlite implements the part an application uses, not the
-part a DBA operates.
+| Evidence | Result |
+|---|---|
+| Django 6.0 test suite (postgresql backend) | 98.5% of the tests that pass on PostgreSQL 17 also pass (17,912 of 18,179) |
+| Wagtail `bakerydemo` | full scenario behaves as on PostgreSQL |
+| Gitea | full scenario behaves as on PostgreSQL |
+| Prisma | `migrate deploy`, `migrate status` and `db pull` work |
+
+Throughput against PostgreSQL is in the README's [Performance](README.md#performance)
+table: reads keep pace, concurrent writes do not.
 
 ---
 
@@ -41,314 +47,298 @@ part a DBA operates.
 
 | Feature | State |
 |---|---|
-| ACID transactions, `BEGIN`/`COMMIT`/`ROLLBACK`, savepoints | ✅ |
-| Readers never block writers (SQLite WAL) | ✅ |
-| Multiple concurrent writers | ❌ |
-| `SELECT … FOR UPDATE` / `FOR SHARE` (row locks) | ❌ real semantics · 🔜 accepted as no-op |
-| Configurable isolation levels | ❌ (accepted, no effect) |
-| Advisory locks (`pg_advisory_lock` and family, session and transaction level) | ✅ |
-| Deadlock detection | ❌ (nothing to deadlock — writes serialize) |
+| Transactions, `BEGIN`/`COMMIT`/`ROLLBACK`, savepoints | yes |
+| Readers do not block the writer (SQLite WAL) | yes |
+| Advisory locks (`pg_advisory_lock` and family) | yes, held by the server across connections |
+| `LISTEN` / `NOTIFY` | yes, between sessions of one server |
+| `SELECT ... FOR UPDATE / SHARE`, `NOWAIT`, `SKIP LOCKED` | partial: every row lock is the database's write lock |
+| Isolation levels | partial: accepted; a transaction reads like READ COMMITTED until it first writes |
+| Deferred foreign keys, `SET CONSTRAINTS` | yes |
+| Deferred `UNIQUE` / `PRIMARY KEY` | partial: recorded, but checked at each statement |
+| More than one writer at a time | never |
+| Row-level locks | never |
 
-**Why.** SQLite in WAL mode allows one writer at a time with any number of
-concurrent readers, each reading a consistent snapshot. overlite serializes
-writes behind that (100 max connections, 5s busy timeout). This is stronger than
-PostgreSQL's default isolation in one sense — write skew can't happen — and much
-weaker in another: a write-heavy workload queues instead of proceeding in
-parallel.
+**How it works.** Each client gets its own thread and SQLite connection (100 at
+most). `BEGIN` takes no lock; a transaction's first write takes SQLite's single
+write lock and holds it until commit. A second writer waits, and after the busy
+timeout (30 s) fails with `55P03`, as a PostgreSQL writer waiting on a row lock
+would. Write skew cannot happen, because writes are serialized.
 
-**What you lose.** Throughput under concurrent writes. If you have dozens of
-processes writing constantly, you want PostgreSQL. Row-level pessimistic locking
-(`SELECT … FOR UPDATE`, Django's `select_for_update`, Rails' `lock!`) has no
-equivalent — though with a single writer the guarantee it buys you is largely
-implicit already.
+**What you lose.** Throughput under many concurrent writers: the benchmark in the
+README shows 29k against PostgreSQL's 117k writes per second. `FOR UPDATE` on one
+row waits for any writer, and `SKIP LOCKED` returns no rows while another
+transaction holds the lock, so job queues built on `SKIP LOCKED` run one consumer at
+a time.
 
-## Planner, optimizer, statistics
-
-| Feature | State |
-|---|---|
-| Cost-based planner, index selection, joins | ✅ (SQLite's) |
-| `EXPLAIN` | ✅ (SQLite's output shape, not PostgreSQL's) |
-| `ANALYZE` collecting statistics | ✅ (`sqlite_stat1`) |
-| `pg_statistic` / `pg_statistic_ext` populated | ❌ |
-| `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` | ❌ |
-| Parallel query, JIT compilation | ❌ |
-| Bitmap index scans, index-only scans over visibility map | ❌ |
-
-**Why.** The planner is the storage engine's. SQLite's is good, simple, and
-deliberately less adaptive: it leans on indexes and doesn't parallelize.
-Emulating PostgreSQL's plan output would be a lie about what actually runs.
-
-**What you lose.** Query-plan tooling and analytics performance. A large
-aggregation that PostgreSQL splits across 8 workers runs on one core here. Plans
-you tuned against PostgreSQL don't transfer — retune against SQLite's `EXPLAIN
-QUERY PLAN`.
-
-## Procedural languages — the big open question
+## Planner, statistics, EXPLAIN
 
 | Feature | State |
 |---|---|
-| `CREATE FUNCTION … LANGUAGE sql` (executed, `\df`, `\sf`, dumped) | ✅ |
-| `LANGUAGE plpgsql` functions | 🤔 accepted, **body never runs** |
-| `CREATE TRIGGER` with a PL/pgSQL function | 🤔 accepted, **never fires** |
-| `CREATE PROCEDURE` / `CALL`, custom aggregates | 🤔 accepted, no-op |
-| PL/Python, PL/Perl, PL/v8 | ❌ |
+| Index selection, joins of every kind | yes (SQLite's planner) |
+| `EXPLAIN`, `EXPLAIN ANALYZE`, `FORMAT TEXT/JSON/XML/YAML` | partial: SQLite's plan in PostgreSQL's shape, all costs and estimated rows 0 |
+| `ANALYZE` | partial: accepted and does nothing |
+| `VACUUM`, `REINDEX` | yes (SQLite's) |
+| `pg_statistic` populated, cost estimates | never |
+| Parallel query | never |
 
-**Why it's marked 🤔 and not ❌.** A PL/pgSQL subset interpreter —
-`DECLARE`/`BEGIN`/`IF`/`LOOP`/`RETURN`/`RAISE`, assignment, embedded queries,
-`NEW`/`OLD` in triggers — is a large but bounded project (weeks, not months) and
-it's the single change that would move overlite from "app database" to
-"migration-compatible database". Triggers are coupled to it: audit tables and
-`updated_at` maintenance are the most common real use, and they silently do
-nothing today.
+**Why.** The planner is the storage engine's. SQLite does not keep statistics in
+PostgreSQL's shape or estimate costs, and it runs a query on one thread. Plans tuned
+against PostgreSQL do not transfer; a large aggregation runs on one core.
 
-**This is the sharpest edge in the whole product.** Your migration runs green, a
-trigger is created, and no row is ever audited. If you rely on PL/pgSQL, do not
-migrate until this lands or is declared ❌.
-
-## Replication, HA, backup
+## Procedural code and triggers
 
 | Feature | State |
 |---|---|
-| Physical / streaming replication, hot standby | ❌ |
-| Logical replication, `CREATE PUBLICATION`/`SUBSCRIPTION`, WAL decoding | ❌ |
-| CDC via logical slots (Debezium et al.) | ❌ |
-| Point-in-time recovery | ❌ (at the PostgreSQL layer) |
-| Backup | ✅ copy the file, or `pg_dump` |
+| `CREATE FUNCTION ... LANGUAGE sql` (run, listed by `\df`, shown by `\sf`) | yes |
+| `LANGUAGE plpgsql` functions | no: accepted, never run; calling one fails |
+| `CREATE TRIGGER ... EXECUTE FUNCTION` | no: refused with a syntax error |
+| SQLite-syntax triggers (`CREATE TRIGGER ... BEGIN ... END`) | yes |
+| `CREATE PROCEDURE`, `CREATE AGGREGATE` | no: accepted without effect; `CALL` is a syntax error |
+| `SECURITY DEFINER` | no: accepted; the body runs with the caller's privileges |
+| PL/Python, PL/Perl, PL/v8 | never (they are extensions) |
 
-**Why.** These are WAL-format-level features. SQLite's WAL is a different format
-with a different lifecycle; there is nothing to decode into PostgreSQL's
-protocol.
+**This is the sharpest edge.** A migration that creates a PL/pgSQL function
+succeeds, and the function does nothing. A PostgreSQL trigger fails loudly at
+`CREATE TRIGGER`, so you will find it before production, not after. Audit tables
+and `updated_at` maintenance have to move into the application or into a SQLite
+trigger. There is no plan to run PL/pgSQL.
 
-**The workaround is genuinely good.** Replicate at the SQLite layer:
-[Litestream](https://litestream.io) (continuous S3 streaming + PITR), LiteFS
-(FUSE-level replication), or rqlite. You lose PostgreSQL-shaped tooling, not the
-capability itself. CDC has no equivalent — poll a table or write events at the
-application layer.
+## Replication, high availability, backup
+
+| Feature | State |
+|---|---|
+| Streaming replication, hot standby | never |
+| Logical replication, publications, CDC through replication slots | never |
+| Point-in-time recovery at the PostgreSQL layer | never |
+| `pg_dump` | yes |
+| Backup at the SQLite layer | yes: the database is a SQLite file |
+
+**Why.** These features read PostgreSQL's WAL, and SQLite's WAL is a different
+format with nothing to decode into PostgreSQL's protocol.
+
+**Instead.** Back up with `pg_dump`, or with SQLite's own tools on the file (its
+online backup). A copy of the bare file is only complete with the server stopped,
+because recent commits sit in the `-wal` file beside it until a checkpoint.
+Replication tools for SQLite exist (Litestream, LiteFS); Overlite's tests do not
+cover them. For change data capture, poll a table or emit events from the
+application.
 
 ## Extensions
 
 | Feature | State |
 |---|---|
-| `CREATE EXTENSION` accepted so migrations run | ✅ (no-op) |
-| Functions the common extensions provide (`gen_random_uuid`, …) | ✅ built in directly |
-| PostGIS, pgvector, TimescaleDB, pg_stat_statements, pg_cron, … | ❌ |
-| Surfacing SQLite's own engines under PostgreSQL names | 🤔 |
+| `pgcrypto`, `uuid-ossp`, `hstore`, `citext`, `unaccent`, `pg_trgm` | yes, built in; `CREATE EXTENSION` lists them in `pg_extension` |
+| `btree_gin`, `btree_gist`, `bloom` | partial: accepted; their indexes are btree |
+| Any other extension (PostGIS, pgvector, TimescaleDB, pg_cron, ...) | never: refused with `0A000` |
 
-**Why.** PostgreSQL extensions are C shared objects compiled against its
-internals. overlite is a single binary with SQLite linked in — there is
-no socket to plug them into, by design.
+**Why.** PostgreSQL extensions are C shared objects compiled against PostgreSQL's
+internals; there is nothing in SQLite to load them into. What Overlite provides of
+the common ones is reimplemented. `CREATE EXTENSION` refuses the rest, so a
+migration that needs PostGIS fails at once instead of half working.
 
-**What's interesting.** SQLite has its own answers — FTS5 (full-text), R\*Tree
-(spatial), sqlite-vec (vectors). Presenting those under PostgreSQL-facing names
-is real work but plausible; see full-text search below.
-
-## Partitioning and table inheritance
+## Partitioning, inheritance, tablespaces
 
 | Feature | State |
 |---|---|
-| `CREATE TABLE … PARTITION BY RANGE/LIST/HASH` | ❌ |
-| Partition pruning, attach/detach partition | ❌ |
-| `INHERITS`, `UNLOGGED`, tablespaces | ❌ |
-| Per-tenant physical isolation | ✅ different mechanism |
+| `PARTITION BY`, `PARTITION OF` | no: refused with `0A000` |
+| `INHERITS`, `UNLOGGED` tables | no: syntax error |
+| Foreign data wrappers | no: refused with `0A000` |
+| `CREATE TABLESPACE` | never (the `TABLESPACE` clause of `CREATE INDEX` is accepted and ignored) |
+| Per-tenant physical isolation | yes, by another route |
 
-**Why.** SQLite has no partitioned tables and no planner hook to prune them.
+**Instead.** `CREATE DATABASE` writes a new SQLite file next to the first, and a
+connection to it can only see that file, which covers the per-tenant case, the most
+common real reason for partitioning. Dropping a month's partition for retention has
+no equivalent; use `DELETE`.
 
-**The workaround.** `OVERLITE_MULTITENANT_SCHEMA=true` gives each schema its own
-attached file (`shop.db` + `shop.sales.db`), which covers the per-tenant
-isolation case — the most common real reason people reach for partitioning.
-Time-series partitioning for retention (drop last month's partition) has no
-equivalent; use `DELETE` + `VACUUM`.
-
-## Type system
+## Types
 
 | Feature | State |
 |---|---|
-| int / text / bool / bytea / uuid / json / jsonb / arrays / timestamps | ✅ |
-| `numeric` storage, ordering, `sum`/`avg` exact | ✅ |
-| `numeric` infix `+ - * /` exact | 🤔 uses float (SQLite can't override operators) |
-| Ranges, `hstore`, enums, composite types | 🔜 partial — see README Limitations |
-| `interval` as a first-class value | 🔜 partial (arithmetic and `age()` work) |
-| `CREATE DOMAIN` | 🔜 |
-| `GENERATED … AS IDENTITY` | 🔜 (`SERIAL` works today) |
-| Geometric (`point`, `box`), network (`inet`, `cidr`, `macaddr`) | ❌ not modeled |
-| XML type and functions | ❌ |
-| Integer OIDs reported exactly (`int4` vs `int8`) | 🤔 everything advertises `int8` |
+| integers, text, `varchar(n)`, `char(n)`, boolean, bytea, uuid | yes |
+| `numeric` with exact arithmetic at PostgreSQL's scale | yes |
+| date, time, timestamp, timestamptz with the session's time zone, `interval` | yes |
+| json, jsonb and their operators | yes |
+| arrays | partial: `array_agg` with `FILTER`, a window or `ORDER BY` goes out as text, and `<` / `>` compare text (planned) |
+| enums, `hstore` | yes |
+| ranges | partial: values go out as text, some operators missing (planned) |
+| identity columns, serial, sequences, generated stored columns | partial: a key's next id follows the highest row |
+| `tsvector`, `tsquery` | yes (see full-text search) |
+| `inet`, `cidr`, `point` and other geometric types | partial: stored as text; the network functions exist, operators do not |
+| composite types | no: `CREATE TYPE ... AS (...)` is recorded, values cannot be built |
+| `CREATE DOMAIN`, XML | no |
+| Integer result columns reported at their width | no: they go out as `int8`; the catalogs have the declared width |
 
-**The silent one.** `'(1,2)'::point` and `'10.0.0.1'::inet` are *accepted* — the
-value is stored as text — but the operators of those types don't exist. The cast
-succeeding gives false confidence.
+**The ones to watch.** Where the translation cannot tell an expression's type (a
+function it does not know, some subqueries), SQLite's typing decides: `SELECT 1/0`
+is NULL, and a column can hold a value of another type. A network operator such as
+`'10.0.0.1'::inet << '10.0.0.0/8'` gives a number, not an error.
 
 ## Indexes
 
 | Feature | State |
 |---|---|
-| B-tree, unique, partial, expression indexes | ✅ |
-| `CREATE INDEX … USING gin / gist / brin / hash` | 🤔 accepted, **becomes a B-tree** |
-| Covering indexes (`INCLUDE`) | ❌ |
-| `CREATE INDEX CONCURRENTLY` | 🔜 errors today; will be accepted as a plain `CREATE INDEX` |
+| btree, unique, partial and expression indexes | yes |
+| Operator classes (`varchar_pattern_ops`), `NULLS NOT DISTINCT` | yes |
+| `CREATE INDEX CONCURRENTLY` | yes, as a plain index |
+| `INCLUDE` | partial: recorded and reported, not stored in the index |
+| `USING gin / gist / spgist / brin / bloom` | partial: becomes a btree; the method is only reported |
 
-**What you lose.** GIN is what makes `jsonb @> …` and array containment fast in
-PostgreSQL. Here those queries work but scan. Index an extracted expression
-(`CREATE INDEX ON t ((profile->>'role'))`) instead.
+**What you lose.** GIN is what makes `jsonb @>`, array containment and `@@` fast in
+PostgreSQL. Here those queries are right but read every row. Index an extracted
+expression (`CREATE INDEX ON t ((profile->>'role'))`) where it matters.
 
 ## Full-text search
 
 | Feature | State |
 |---|---|
-| `tsvector`, `tsquery`, `to_tsvector`, `@@`, `ts_rank` | 🔜 |
-| Dictionaries, stemming, custom search configurations | 🤔 |
+| `to_tsvector`, the four query builders, `@@`, `setweight`, `ts_rank`, `ts_rank_cd` | yes, held to PostgreSQL 17 on 1,190 texts |
+| `simple` and `english` configurations | yes |
+| Other languages, custom dictionaries, `ts_headline`, `ts_debug` | no |
+| tsquery `&&`, `||`, `!!` | planned |
 
-Nothing today — `to_tsvector` doesn't exist. SQLite's FTS5 is a strong engine and
-mapping the common surface onto it is the single highest-value planned item after
-collation. Full parity (configurable dictionaries, `ts_rank_cd`, weights) is
-unlikely.
+A call without a configuration uses `english`, whatever `default_text_search_config`
+says.
 
-## Collation and locale
+## Collation and pattern matching
 
 | Feature | State |
 |---|---|
-| Case-insensitive collations | ✅ (mapped to `NOCASE`) |
-| `COLLATE "pt_BR"` / ICU locale ordering | 🔜 **currently dropped silently** |
-| `LIKE`, regex operators | ✅ |
-| `ILIKE` / `NOT ILIKE` / `~~*` | 🔜 **not implemented — syntax error** |
+| Default text ordering | partial: byte order, as PostgreSQL's `C` collation (`\l` reports `C`) |
+| Language collations (`"sv-x-icu"`, `sv_SE.utf8`, `CREATE COLLATION`) | partial: the Unicode Collation Algorithm in broad lines, held to PostgreSQL for Latin-script letters |
+| `LIKE`, regular expressions (`~`, `~*`, `regexp_*`) | yes |
+| `ILIKE` | partial: folds ASCII letters only, so `'ÉCOLE' ILIKE 'école'` is false |
 
-**Read this if you store non-English text.** A locale collation clause is
-currently *removed* from the query (`rewrite_collate` in `rewrite/operators.rs`), so `ORDER BY nome COLLATE
-"pt_BR"` sorts by byte order — "Ávila" lands after "Zeta", with no error. The
-driver supports registering custom collations, so this is fixable with
-`x/text/collate` and is a correctness priority, not a nicety.
+If you store non-English text, give the columns or the `ORDER BY` a language
+collation; without one, "Ávila" sorts after "zeta".
 
 ## Security and access control
 
 | Feature | State |
 |---|---|
-| Roles, `CREATE ROLE`, membership, per-role passwords (SCRAM) | ✅ |
-| `GRANT`/`REVOKE` **enforced** before statements run | ✅ |
-| Row-level security — policies enforced by expression injection | ✅ |
-| `pg_hba.conf` / `pg_hba.yaml`, TLS, SCRAM / md5 / trust / reject | ✅ |
-| `SECURITY DEFINER` functions | ❌ |
-| Column-level privileges | ❌ |
+| Roles, membership, per-role passwords (SCRAM) | yes |
+| `GRANT` / `REVOKE` on tables, checked before a statement runs | yes |
+| Row-level security policies | yes, `COPY` included |
+| `pg_hba.conf` / `pg_hba.yaml`, TLS, scram-sha-256 / md5 / password / trust / reject | yes |
+| Column-level `GRANT` | no: accepted, and grants the whole table |
+| Role names | partial: compared without case |
 
-This area is closer to parity than most people expect: privileges and RLS are not
-decorative, they're checked at the protocol layer.
+Privileges and RLS are enforced, not decorative. The column-level gap widens
+access rather than narrowing it: `GRANT SELECT (a) ON t` lets the role read every
+column of `t`.
 
 ## Observability and operations
 
 | Feature | State |
 |---|---|
-| `pg_settings`, `SHOW`, `current_setting` | ✅ |
-| `pg_stat_activity`, `pg_locks` | 🔜 |
-| `pg_stat_user_tables`, `pg_stat_statements`, `pg_stat_bgwriter` | ❌ |
-| `pg_size_pretty`, `pg_database_size`, `pg_sleep` | 🔜 |
-| `VACUUM`, `ANALYZE`, `REINDEX` | ✅ (SQLite semantics) |
-| Autovacuum, bloat, transaction-ID wraparound | ❌ — and you don't want them |
+| `SHOW`, `current_setting`, `SET` | partial: settings Overlite does not use read as empty |
+| `pg_settings` | no: empty |
+| `pg_stat_activity`, `pg_locks`, `pg_stat_*` | no |
+| `pg_size_pretty`, `pg_database_size`, `pg_typeof` | no |
+| Cancel requests | yes |
+| Autovacuum, bloat, transaction-ID wraparound | never, and you don't want them |
 
-**What you lose.** Monitoring dashboards and GUI "activity" panes are blind.
-**What you gain.** An entire class of operational work disappears: no vacuum
-tuning, no wraparound emergencies, no connection pooler, no `shared_buffers`.
+**What you lose.** Monitoring dashboards and the activity panes of GUI tools see
+nothing. **What you gain.** No vacuum tuning, no wraparound, no connection pooler,
+no data directory: one binary and one file per database.
 
-## Queries and SQL surface
-
-| Feature | State |
-|---|---|
-| Joins incl. `FULL OUTER`, CTEs incl. `RECURSIVE`, window functions | ✅ |
-| `ON CONFLICT`, `RETURNING`, `DISTINCT ON`, `generate_series` | ✅ |
-| `string_agg`, `array_agg(… ORDER BY …)`, `json_agg`, `LISTEN`/`NOTIFY`, `COPY` | ✅ |
-| `ILIKE` | 🔜 **not implemented — syntax error** |
-| Generated stored columns, `PREPARE`/`EXECUTE`, extended protocol, portals | ✅ |
-| SQL cursors (`DECLARE … CURSOR`, `FETCH`, `MOVE`) | 🔜 |
-| Materialized views (`CREATE MATERIALIZED VIEW`, `REFRESH`) | 🔜 |
-| `GROUPING SETS` / `ROLLUP` / `CUBE` | 🔜 |
-| Ordered-set aggregates (`percentile_cont … WITHIN GROUP`) | 🔜 |
-| Whole-row reference (`row_to_json(t)`, `SELECT t FROM t`) | 🔜 |
-| `LATERAL` correlated to the left side | ❌ (SQLite limit) |
-| `TABLESAMPLE` | ❌ |
-
-## Catalog and tooling
+## Queries and SQL
 
 | Feature | State |
 |---|---|
-| `psql` — `\dt \d \df \sf \dT+ \du \dn \l \copy` | ✅ |
-| `pg_dump` / restore round-trip | ✅ |
-| pgx, JDBC, node-postgres, psycopg, ActiveRecord, Django, Prisma | ✅ |
-| `pg_class`, `pg_attribute`, `pg_type`, `pg_proc`, `pg_index`, `pg_constraint`, … | ✅ |
-| `information_schema` (11 views) | ✅ mostly — `check_constraints` is empty |
-| DBeaver / pgAdmin browsing | ✅ browse and read; full validation ongoing |
+| Joins incl. `FULL OUTER`, CTEs incl. `RECURSIVE`, window functions, set operations | yes |
+| `ON CONFLICT`, `RETURNING`, `DISTINCT ON`, `DELETE ... USING`, `UPDATE ... FROM` | yes |
+| `string_agg`, `array_agg`, `json_agg`, statistics aggregates, `generate_series`, `unnest` | yes |
+| `COPY` in and out, `\copy` | yes |
+| `PREPARE` / `EXECUTE`, extended protocol, binary format | yes |
+| SQL cursors (`DECLARE`, `FETCH`, `MOVE`, `WITH HOLD`, `SCROLL`) | yes |
+| Materialized views (`CREATE`, `REFRESH`) | yes |
+| `TRUNCATE` with `RESTART IDENTITY` and `CASCADE` | yes |
+| `EXCLUDE` constraints | partial: `=`, `<>`, `&&`, `-|-` only, checked by scanning the table |
+| `LATERAL` over set-returning functions | yes |
+| `LATERAL` subqueries that read the left side | no |
+| `GROUPING SETS`, `ROLLUP` | no |
+| Ordered-set aggregates (`percentile_cont ... WITHIN GROUP`) | no |
+| Whole-row references (`row_to_json(t)`, `SELECT t FROM t`) | no |
+| SQL/JSON path (`jsonb_path_query`) | no |
+| `TABLESAMPLE` | no |
+
+## Catalogs and tooling
+
+| Feature | State |
+|---|---|
+| `psql`: `\dt`, `\d`, `\df`, `\sf`, `\du`, `\dn`, `\l`, `\copy` | yes |
+| Clients: pgx, psycopg 3, node-postgres, Prisma, gorm, pgbench, `pg_dump` | yes |
+| ORMs: Django, Prisma, xorm (Gitea) | yes (see measurements above) |
+| `pg_class`, `pg_attribute`, `pg_type`, `pg_proc`, `pg_index`, `pg_constraint`, `pg_depend`, ... | yes |
+| `information_schema` (11 views) | partial: `check_constraints` is empty |
+| `server_version` | reports 16 |
 
 ---
 
-## Silent differences — the list to actually worry about
+## Silent differences: the list to actually worry about
 
-Errors are cheap: you see them and fix them. These are accepted without
-complaint and behave differently, which is worse. Read this list twice.
+Errors are cheap: you see them and fix them. These are accepted without complaint
+and behave differently.
 
-1. **PL/pgSQL function bodies never execute** — the function exists, calls
-   return nothing useful.
-2. **Triggers never fire** — `CREATE TRIGGER` succeeds; your audit table stays
-   empty.
-3. **`COLLATE "<locale>"` is dropped** — accented text sorts by byte order.
-4. **`USING gin`/`gist` becomes a B-tree** — the query is correct, the
-   performance isn't what you sized for.
-5. **`numeric` infix arithmetic goes through float** — storage, ordering and
-   `sum`/`avg` are exact; `a * b` in a `SELECT` is not. Use `dec_mul`/`dec_add`
-   where exactness is contractual (money totals).
-6. **`ALTER TABLE ADD CONSTRAINT`** rebuilds the table to apply the constraint,
-   so adding one to a large table costs a copy — and an existing row that
-   violates it makes the statement fail rather than pass silently.
-7. **Isolation level clauses** are accepted with no effect.
-8. **`CREATE EXTENSION`** is a no-op — succeeds even for PostGIS.
-9. **`::point` / `::inet` casts** succeed; the operators don't exist.
-10. **`information_schema.check_constraints`** is empty.
+1. **PL/pgSQL functions are created but never run.**
+2. **`USING gin / gist` builds a btree.** Answers are right; performance is not
+   what you sized for.
+3. **Row locks are the database's write lock.** `SKIP LOCKED` skips nothing while
+   another transaction writes.
+4. **Text sorts by byte order** unless you name a language collation; `ILIKE`
+   folds ASCII only.
+5. **SQLite's typing decides where the translation cannot see a type**: `1/0` is
+   NULL, `'abc'` fits in an integer column.
+6. **A column-level `GRANT` grants the whole table.**
+7. **`ANALYZE`, `SECURITY DEFINER` and isolation levels are accepted** and change
+   nothing.
+8. **Identity and serial keys follow the highest row**, so an explicit id moves
+   the next one on.
+9. **Network and geometric values are text**: their operators give answers, not
+   errors.
+10. **Arrays and ranges go out as text** in some places, and compare as text with
+    `<` and `>`.
 
-**Planned:** an `OVERLITE_STRICT=true` mode that turns every silent acceptance in
-this list into an error. If you're evaluating a migration, that flag is the
-honest way to find out what you actually depend on.
+NOTES.md lists the rest, each held to PostgreSQL 17's answer in the wire tests.
 
 ---
 
-## Should you use overlite?
+## Planned
+
+Only what has work recorded against it:
+
+- **The SQL translation moves to PostgreSQL's parse tree** ([ADR
+  0001](docs/adr/0001-sql-ast.md)). Stages 0 and 1 are on main. Next: result
+  labels and parameter typing (stage 2); operators chosen by operand type for json,
+  arrays, ranges, full-text search and time zones (stage 3); query shapes such as
+  `DISTINCT ON`, `LATERAL` and row locks (stage 4); catalog names and DDL (stage
+  5). The point is fewer wrong answers where text rewriting loses types; the
+  "types the translation cannot see" differences above are the ones it targets.
+- **What Django's test suite found and is not done yet** (NOTES.md): array
+  aggregates going out as text and array comparisons; range output, `lower()` /
+  `upper()` of date ranges and the missing range operators; tsquery `&&`, `||` and
+  `!!`; a few jsonb cases; `DISTINCT ON` with `LIMIT` and `OFFSET`; a bytea column
+  default; catalog details (smallserial, serial `column_default`, reloptions);
+  `DATE_TRUNC` and `EXTRACT` in a non-UTC session.
+
+PL/pgSQL, PostgreSQL-style triggers, `GROUPING SETS` and the monitoring views are
+not planned.
+
+## Should you use Overlite?
 
 **Good fit**
-- CRUD apps and internal tools behind an ORM
-- Single-node SaaS; per-tenant isolation via the multi-tenant schema mode
-- Dev/test/CI environments that need to look like production PostgreSQL
-- Edge and embedded deployments where running PostgreSQL isn't practical
-- Replacing SQLite in an app that has outgrown "no network access"
+- CRUD applications and internal tools behind an ORM
+- Single-node services, with a database file per tenant if you need isolation
+- Development, test and CI environments that should answer like PostgreSQL
+- Edge and embedded deployments where running PostgreSQL is not practical
+- An application on SQLite that now needs network access
 
 **Bad fit**
-- Anything depending on PL/pgSQL, triggers, or stored procedures
-- PostGIS, pgvector, TimescaleDB, or any extension
-- Read replicas, HA/failover, or CDC into a data pipeline
-- Write-heavy concurrency (many processes writing simultaneously)
-- Analytics needing parallel query over large tables
-- Full-text search today
-- Partitioned time-series with retention by partition drop
-
-**Decide with the strict-mode question in mind:** if the ten silent differences
-above would all be errors, would your app still start? If yes, migrate. If no,
-you now know exactly which X, Y and Z you'd be giving up.
-
----
-
-## Planned order of work
-
-Ranked by (unblocks real integrations) ÷ (effort):
-
-1. **`ILIKE`** — extremely common, and SQLite's `LIKE` is already ASCII
-   case-insensitive: a dialect rewrite away
-2. **Locale collations** — correctness bug, non-English data sorts wrong silently
-3. **`OVERLITE_STRICT` mode** — makes every other gap discoverable before deploy
-4. **Advisory locks** — unblocks Rails and Flyway migration locking
-5. **`GENERATED … AS IDENTITY`** — what modern ORMs emit instead of `SERIAL`
-6. **`FOR UPDATE`/`FOR SHARE` accepted as no-op** — unblocks pessimistic-locking code paths
-7. **`CREATE INDEX CONCURRENTLY`** accepted as a plain index
-8. **`pg_stat_activity` / `pg_locks`** — GUIs and monitoring stop being blind
-9. **SQL cursors** — the extended-protocol portal machinery already does the hard part
-10. **Materialized views**, **`CREATE DOMAIN`**, **whole-row references**
-11. **Full-text search over FTS5** — the largest planned item
-12. **`GROUPING SETS`**, ordered-set aggregates
-
-**Open question, decided by demand:** the PL/pgSQL subset interpreter. It is the
-difference between "app database" and "migration-compatible database". Until it
-lands, triggers and procedural functions are the honest reason to stay on
-PostgreSQL.
+- Anything that depends on PL/pgSQL, PostgreSQL triggers or stored procedures
+- PostGIS, pgvector, TimescaleDB or any extension not listed above
+- Read replicas, failover or CDC into a data pipeline
+- Many processes writing at the same time
+- Analytics that need parallel query over large tables
+- Partitioned time series with retention by dropping partitions
+- Full-text search in languages other than English
