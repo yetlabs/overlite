@@ -2786,18 +2786,12 @@ impl<'a> Emitter<'a> {
         let nodes: Vec<&NodeEnum> = args.iter().map(node).collect::<Result<_, _>>()?;
         let tys: Vec<Ty> = nodes.iter().map(|n| self.ty(n)).collect();
         let common = types::common(&tys);
-        for (i, (n, t)) in nodes.iter().zip(&tys).enumerate() {
+        for (i, n) in nodes.iter().enumerate() {
             if i > 0 {
                 self.push(", ");
             }
             self.note_param(n, common);
-            if common.is(Base::Timestamptz) && (t.is(Base::Timestamp) || t.is(Base::Date)) {
-                self.push("overlite_tz_in(");
-                self.expr(n, Prec::Or)?;
-                self.push(")");
-            } else {
-                self.value(n, common, Prec::Or)?;
-            }
+            self.value(n, common, Prec::Or)?;
         }
         Ok(())
     }
@@ -2909,16 +2903,29 @@ impl<'a> Emitter<'a> {
     fn value(&mut self, n: &NodeEnum, target: Ty, min: Prec) -> Out {
         let is_lit = matches!(n, NodeEnum::AConst(k) if !k.isnull && matches!(k.val, Some(Val::Sval(_))));
         let is_param = matches!(n, NodeEnum::ParamRef(_));
-        if !self.typed() || !(is_lit || is_param) {
+        if !self.typed() {
             return self.expr(n, min);
+        }
+        if !(is_lit || is_param) {
+            // What Postgres converts on its own where a value meets a wider type: a date
+            // or a timestamp meeting a timestamptz, a date meeting a timestamp.
+            let from = self.ty(n);
+            return match target {
+                t if t.is(Base::Timestamptz) && (from.is(Base::Timestamp) || from.is(Base::Date)) => {
+                    self.as_timestamptz(n)
+                }
+                t if t.is(Base::Timestamp) && from.is(Base::Date) => {
+                    self.push("overlite_cast(");
+                    self.expr(n, Prec::Or)?;
+                    self.push(", 'timestamp')");
+                    Ok(())
+                }
+                _ => self.expr(n, min),
+            };
         }
         self.note_param(n, target);
         match target {
-            t if t.is(Base::Timestamptz) => {
-                self.push("overlite_tz_in(");
-                self.expr(n, Prec::Or)?;
-                self.push(")");
-            }
+            t if t.is(Base::Timestamptz) => self.as_timestamptz(n)?,
             t if t.is(Base::Timestamp) || t.is(Base::Date) => {
                 self.push("overlite_cast(");
                 self.expr(n, Prec::Or)?;
@@ -2956,6 +2963,20 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// n as a timestamptz, where it is not one: the one conversion of a timestamp, a
+    /// date or text to a timestamptz, a wall clock in the session's zone read when the
+    /// statement runs (overlite_tz_in, which reads each element of an array so too), as
+    /// Postgres converts it in the session's TimeZone. A timestamptz goes as it is.
+    fn as_timestamptz(&mut self, n: &NodeEnum) -> Out {
+        if self.typed() && self.ty(n).base == Base::Timestamptz {
+            return self.expr(n, Prec::Or);
+        }
+        self.push("overlite_tz_in(");
+        self.expr(n, Prec::Or)?;
+        self.push(")");
+        Ok(())
+    }
+
     /// A cast: to text SQLite's own CAST, to boolean the engine's boolin, to any other
     /// type the engine knows the engine's input function. With the environment, a
     /// timestamptz cast to text, a date or a time is read in the session's zone, and a
@@ -2974,11 +2995,16 @@ impl<'a> Emitter<'a> {
             let mut elem = ty.clone();
             elem.array_bounds.clear();
             let name = cast_type(&elem)?.replace(", ", ",");
+            let target = types::of_type_name(ty);
             if self.typed() {
-                self.note_param(arg, types::of_type_name(ty));
+                self.note_param(arg, target);
             }
             self.push("overlite_assign(");
-            self.expr(arg, Prec::Or)?;
+            if self.typed() && target.base == Base::Timestamptz {
+                self.as_timestamptz(arg)?;
+            } else {
+                self.expr(arg, Prec::Or)?;
+            }
             self.push(", ");
             self.push(&quote_literal(&[name.as_str(), "[]"].concat()));
             self.push(")");
@@ -3014,9 +3040,9 @@ impl<'a> Emitter<'a> {
                     _ => {}
                 }
             } else if target.is(Base::Timestamptz) {
-                self.push("overlite_cast(overlite_tz_in(");
-                self.expr(arg, Prec::Or)?;
-                self.push("), ");
+                self.push("overlite_cast(");
+                self.as_timestamptz(arg)?;
+                self.push(", ");
                 self.push(&quote_literal(&name));
                 self.push(")");
                 return Ok(());
@@ -4036,49 +4062,12 @@ impl<'a> Emitter<'a> {
             self.push(" 0");
             return Ok(());
         }
-        let stamp = |t: Ty| t.is(Base::Timestamp) || t.is(Base::Timestamptz);
-        if tl.is(Base::Date) && stamp(tr) {
-            self.widen(l, tr)?;
-            self.push(" ");
-            self.push(op);
-            self.push(" ");
-            return self.expr(r, next(p));
-        }
-        if stamp(tl) && tr.is(Base::Date) {
-            self.expr(l, p)?;
-            self.push(" ");
-            self.push(op);
-            self.push(" ");
-            return self.widen(r, tl);
-        }
-        if tl.is(Base::Timestamp) && tr.is(Base::Timestamptz) {
-            self.widen(l, tr)?;
-        } else {
-            self.value(l, tr, p)?;
-        }
+        // A date or a timestamp meeting a wider type is made one (`value`).
+        self.value(l, tr, p)?;
         self.push(" ");
         self.push(op);
         self.push(" ");
-        if tr.is(Base::Timestamp) && tl.is(Base::Timestamptz) {
-            self.widen(r, tl)
-        } else {
-            self.value(r, tl, next(p))
-        }
-    }
-
-    /// A date or a timestamp made the timestamp or timestamptz it is compared with:
-    /// its midnight, a wall clock in the session's zone.
-    fn widen(&mut self, n: &NodeEnum, to: Ty) -> Out {
-        if to.is(Base::Timestamptz) {
-            self.push("overlite_cast(overlite_tz_in(");
-            self.expr(n, Prec::Or)?;
-            self.push("), 'timestamptz')");
-        } else {
-            self.push("overlite_cast(");
-            self.expr(n, Prec::Or)?;
-            self.push(", 'timestamp')");
-        }
-        Ok(())
+        self.value(r, tl, next(p))
     }
 
     /// The type an untyped literal compared with other is taken for: other's, or where
@@ -4661,12 +4650,17 @@ impl<'a> Emitter<'a> {
         let (to_ty, from) = (Ty::of_decl(&to.sval), self.ty(x));
         let low = to.sval.to_ascii_lowercase();
         let wall = to_ty.is(Base::Date) || to_ty.is(Base::Time) || to_ty.is(Base::Timestamp);
+        if from.base != Base::Timestamptz && to_ty.base == Base::Timestamptz {
+            self.push(name);
+            self.push("(");
+            self.as_timestamptz(x)?;
+            self.push(", ");
+            self.expr(target, Prec::Or)?;
+            self.push(")");
+            return Ok(());
+        }
         let (pre, post) = if !from.is(Base::Timestamptz) {
-            if to_ty.is(Base::Timestamptz) {
-                ("overlite_tz_in(", ")")
-            } else {
-                ("", "")
-            }
+            ("", "")
         } else if matches!(low.as_str(), "text" | "varchar" | "character varying") {
             self.push("overlite_tz_text(");
             self.expr(x, Prec::Or)?;

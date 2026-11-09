@@ -230,6 +230,33 @@ pub(crate) fn canonical_array(v: &Value, element: &str) -> Result<Value> {
     item_json(&item, element).map(Value::Text)
 }
 
+/// An array whose elements are read as timestamptz_in reads a client's text: a wall
+/// clock without a zone of its own in the session's TimeZone. What overlite_tz_in makes
+/// of a timestamp[] or of an array's text meeting a timestamptz[].
+///
+/// # Errors
+///
+/// What canonical_array answers for what is no array, and an element's own error.
+pub(crate) fn zoned_timestamptz_array(v: &Value) -> Result<Value> {
+    fn zoned(j: Json) -> Result<Json> {
+        Ok(match j {
+            Json::Arr(items) => Json::Arr(items.into_iter().map(zoned).collect::<Result<_>>()?),
+            Json::Str(s) => match crate::builtins::casts::timestamptz_in_session(&Value::Text(s), None)? {
+                Value::Text(t) => Json::Str(t),
+                _ => Json::Null,
+            },
+            other => other,
+        })
+    }
+    let Value::Text(text) = canonical_array(v, "text")? else {
+        return Ok(v.clone());
+    };
+    let Some(json) = json_decode_first(&text) else {
+        return Err(malformed(&text));
+    };
+    Ok(Value::Text(crate::builtins::json::json_marshal(&zoned(json)?)))
+}
+
 fn hstore_error(text: &str, at: usize) -> Error {
     match text[at..].chars().next() {
         None => Error::with_state(

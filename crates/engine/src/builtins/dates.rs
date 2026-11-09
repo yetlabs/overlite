@@ -2018,7 +2018,7 @@ pub(crate) fn session_wall_to_utc(wall: &chrono::NaiveDateTime) -> Option<chrono
     }
     let zone = session_zone();
     let s = from_time_zone(&wall.format("%Y-%m-%d %H:%M:%S%.f").to_string(), &zone)?;
-    chrono::NaiveDateTime::parse_from_str(s.trim_end_matches("+00"), "%Y-%m-%d %H:%M:%S%.f").ok()
+    crate::builtins::casts::naive_stamp(s.trim_end_matches("+00"))
 }
 
 /// Today in the session's zone, as CURRENT_DATE gives it.
@@ -2033,12 +2033,14 @@ pub(crate) fn session_today() -> String {
 /// session's zone: its wall clock there and the offset, `2011-09-01 13:20:30+03`.
 pub(crate) fn session_tz_text(stored: &str) -> Option<String> {
     let t = stored.trim().trim_end_matches("+00").replacen('T', " ", 1);
-    let utc = chrono::NaiveDateTime::parse_from_str(&t, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDate::parse_from_str(&t, "%Y-%m-%d").map(|d| d.and_time(chrono::NaiveTime::MIN)))
-        .ok()?;
+    let utc = crate::builtins::casts::naive_stamp(&t).or_else(|| {
+        chrono::NaiveDate::parse_from_str(&t, "%Y-%m-%d")
+            .ok()
+            .map(|d| d.and_time(chrono::NaiveTime::MIN))
+    })?;
     let off = session_offset_at(&utc);
     let wall = utc + chrono::Duration::seconds(off);
-    let mut out = wall.format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut out = crate::builtins::casts::format_stamp(chrono::Timelike::with_nanosecond(&wall, 0)?, None);
     let micros = wall.and_utc().timestamp_subsec_micros();
     if micros != 0 {
         out.push_str(format!(".{micros:06}").trim_end_matches('0'));

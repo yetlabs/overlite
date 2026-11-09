@@ -145,7 +145,7 @@ fn read(v: &Value, k: Kind) -> Result<Value> {
 }
 
 fn stamp(s: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok()
+    crate::builtins::casts::naive_stamp(s)
 }
 
 fn date(s: &str) -> Option<NaiveDate> {
@@ -177,6 +177,23 @@ fn shift(t: NaiveDateTime, i: &Interval) -> Option<NaiveDateTime> {
         t.checked_sub_months(Months::new(u32::try_from(-i.months).ok()?))?
     };
     t.checked_add_signed(Duration::days(i.days))?
+        .checked_add_signed(Duration::microseconds(i.micros))
+}
+
+/// A timestamptz (UTC) moved by an interval as Postgres moves one: its months and days
+/// on its wall clock in the session's zone, so that a day across a change of offset is
+/// a calendar day, then its time as elapsed time.
+fn shift_zoned(t: NaiveDateTime, i: &Interval) -> Option<NaiveDateTime> {
+    if (i.months == 0 && i.days == 0) || crate::builtins::dates::session_is_utc() {
+        return shift(t, i);
+    }
+    let wall = t + Duration::seconds(crate::builtins::dates::session_offset_at(&t));
+    let calendar = Interval {
+        months: i.months,
+        days: i.days,
+        micros: 0,
+    };
+    crate::builtins::dates::session_wall_to_utc(&shift(wall, &calendar)?)?
         .checked_add_signed(Duration::microseconds(i.micros))
 }
 
@@ -239,7 +256,13 @@ pub(crate) fn temporal_op(args: &[Value], sub: bool) -> Result<Value> {
             let (t, i) = if ka == Kind::Interval { (&vb, &va) } else { (&va, &vb) };
             let i = interval(i).ok_or_else(bad)?;
             let i = if sub { negate(i) } else { i };
-            text(shift(stamp(t).ok_or_else(bad)?, &i).ok_or_else(bad)?)
+            let t = stamp(t).ok_or_else(bad)?;
+            let moved = if Kind::TimestampTz == if ka == Kind::Interval { kb } else { ka } {
+                shift_zoned(t, &i)
+            } else {
+                shift(t, &i)
+            };
+            text(moved.ok_or_else(bad)?)
         }
         (Kind::Date, Kind::Interval) | (Kind::Interval, Kind::Date) => {
             let (d, i) = if ka == Kind::Interval { (&vb, &va) } else { (&va, &vb) };

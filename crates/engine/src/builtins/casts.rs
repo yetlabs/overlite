@@ -706,7 +706,7 @@ impl Stamp {
         }
         if let Some(zone) = &self.zone {
             let converted = from_time_zone(&wall.format("%Y-%m-%d %H:%M:%S%.f").to_string(), zone)
-                .and_then(|s| NaiveDateTime::parse_from_str(s.trim_end_matches("+00"), "%Y-%m-%d %H:%M:%S%.f").ok());
+                .and_then(|s| naive_stamp(s.trim_end_matches("+00")));
             return converted.ok_or_else(|| {
                 Error::with_state(
                     SqlState::INVALID_PARAMETER_VALUE,
@@ -1107,7 +1107,22 @@ fn round_micros(micros: u32, precision: Option<u32>) -> i64 {
 
 pub(crate) fn format_stamp(t: NaiveDateTime, precision: Option<u32>) -> String {
     let t = t + Duration::microseconds(round_micros(t.nanosecond() / 1000, precision));
-    t.format("%Y-%m-%d %H:%M:%S").to_string() + &fraction(t.nanosecond() / 1000)
+    // chrono writes a year past 9999 with a sign, which Postgres does not.
+    let text = t.format("%Y-%m-%d %H:%M:%S").to_string();
+    text.strip_prefix('+').unwrap_or(&text).to_string() + &fraction(t.nanosecond() / 1000)
+}
+
+/// A timestamp's stored text (`YYYY-MM-DD HH:MM:SS[.f]`) as chrono reads it, a year
+/// past 9999 included, which chrono reads only with a sign.
+pub(crate) fn naive_stamp(s: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .or_else(|| {
+            let year = s.bytes().take_while(u8::is_ascii_digit).count();
+            (year > 4)
+                .then(|| NaiveDateTime::parse_from_str(&["+", s].concat(), "%Y-%m-%d %H:%M:%S%.f").ok())
+                .flatten()
+        })
 }
 
 pub(crate) fn format_time(t: NaiveTime, precision: Option<u32>) -> String {

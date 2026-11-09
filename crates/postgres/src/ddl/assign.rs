@@ -81,13 +81,15 @@ impl Columns {
         self.keys.iter().find(|k| k.column == name)
     }
 
+    /// value made to fit column: a key's as any other's, and then refused when NULL.
     fn fit(&self, column: &str, value: &str) -> String {
-        if let Some(key) = self.key_column(column) {
-            return key.checked(value);
-        }
-        match self.assign.get(&Self::key(column)) {
+        let fitted = match self.assign.get(&Self::key(column)) {
             Some(ty) => ["overlite_assign(", value.trim(), ", ", &quote_literal(ty), ")"].concat(),
             None => value.trim().to_string(),
+        };
+        match self.key_column(column) {
+            Some(key) => key.checked(&fitted),
+            None => fitted,
         }
     }
 

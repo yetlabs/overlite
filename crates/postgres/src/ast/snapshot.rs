@@ -217,7 +217,7 @@ fn the_typed_printer_writes_from_the_catalog() {
         (
             "SELECT ts + interval '1 day' FROM t WHERE d < tz AND ts >= '2024-01-01'",
             "SELECT overlite_tadd(ts, overlite_cast('1 day', 'interval'), 'TIMESTAMP', 'INTERVAL') AS \"?column?\" \
-             FROM t WHERE overlite_cast(overlite_tz_in(d), 'timestamptz') < tz AND ts >= \
+             FROM t WHERE overlite_tz_in(d) < tz AND ts >= \
              overlite_cast('2024-01-01', 'timestamp')",
         ),
         // A boolean column met by a string, a tsvector's length, `%` on text.

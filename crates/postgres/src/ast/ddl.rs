@@ -617,13 +617,16 @@ fn kept(src: &Src, a: usize, b: usize, printed: String) -> String {
 }
 
 /// A column's DEFAULT as SQLite takes it: a literal bare, anything else in the
-/// parentheses SQLite requires; a cast of a literal the literal it makes, and the text
-/// of a timestamp with an offset, for a timestamptz column, that instant in UTC.
+/// parentheses SQLite requires; a cast of a literal the literal it makes, and, for a
+/// timestamptz column, the text of a timestamp (a literal, or one cast to a timestamp, a
+/// timestamptz or a date) that instant in UTC, read as Postgres reads it when the
+/// statement runs: without an offset of its own in the session's TimeZone. Rows the
+/// column is added to and rows written later both hold that instant.
 fn default_expr(expr: &NodeEnum, col_type: &str) -> Result<String, Unsupported> {
-    if let NodeEnum::AConst(k) = expr
-        && let Some(Val::Sval(s)) = &k.val
-        && crate::types::timestamptz::is_timestamptz_decl(col_type)
-        && let Some(utc) = crate::types::timestamptz::utc_default(&s.sval)
+    if crate::types::timestamptz::is_timestamptz_decl(col_type)
+        && let Some(text) = stamp_literal(expr)
+        && let Ok(overlite_core::Value::Text(utc)) =
+            overlite_engine::timestamptz_in_session(&overlite_core::Value::Text(text.to_string()), None)
     {
         return Ok(quote_literal(&utc));
     }
@@ -632,6 +635,28 @@ fn default_expr(expr: &NodeEnum, col_type: &str) -> Result<String, Unsupported> 
         return Ok(out);
     }
     Ok(["(", &out, ")"].concat())
+}
+
+/// The text of a string literal, bare or cast to a timestamp, a timestamptz or a date.
+fn stamp_literal(expr: &NodeEnum) -> Option<&str> {
+    match expr {
+        NodeEnum::AConst(k) => match &k.val {
+            Some(Val::Sval(s)) => Some(&s.sval),
+            _ => None,
+        },
+        NodeEnum::TypeCast(t) => {
+            let ty = t.type_name.as_ref()?;
+            let name = ty.names.last().and_then(|n| match &n.node {
+                Some(NodeEnum::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })?;
+            if !ty.array_bounds.is_empty() || !matches!(name, "timestamp" | "timestamptz" | "date") {
+                return None;
+            }
+            stamp_literal(t.arg.as_deref()?.node.as_ref()?)
+        }
+        _ => None,
+    }
 }
 
 /// Whether sql is one literal, which SQLite takes as a default without parentheses:

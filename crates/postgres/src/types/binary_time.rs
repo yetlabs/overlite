@@ -139,11 +139,13 @@ fn parse_time_wall(l: &TimeLayout, s: &[u8]) -> Option<(NaiveDateTime, i32)> {
     let mut v = s;
     let (mut year, mut month, mut day) = (0i32, 1u32, 1u32);
     if l.date {
-        if v.len() < 4 || !v[..4].iter().all(u8::is_ascii_digit) {
+        // Four digits, or up to six past 9999, as Postgres writes such a year.
+        let digits = v.iter().take_while(|c| c.is_ascii_digit()).count();
+        if !(4..=6).contains(&digits) {
             return None;
         }
-        year = v[..4].iter().fold(0, |n, c| n * 10 + (*c - b'0') as i32);
-        v = skip_byte(&v[4..], b'-')?;
+        year = v[..digits].iter().fold(0, |n, c| n * 10 + (*c - b'0') as i32);
+        v = skip_byte(&v[digits..], b'-')?;
         (month, v) = getnum(v, true)?;
         if !(1..=12).contains(&month) {
             return None;

@@ -1426,8 +1426,13 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     })?;
     // A timestamptz a client gives as text, read in the session's zone: resolve/temporal.rs
     // writes it around what a cast or a write to timestamptz takes, but a timestamptz.
-    scalar(conn, "overlite_tz_in", 1, |a| {
-        crate::builtins::casts::timestamptz_in_session(&a[0], None)
+    // An array's elements so too: a timestamp[] or an array's text meeting a
+    // timestamptz[] (a JSON array or `{...}`, which no timestamp's text starts with).
+    scalar(conn, "overlite_tz_in", 1, |a| match &a[0] {
+        Value::Text(t) if t.trim_start().starts_with(['[', '{']) => {
+            crate::builtins::canonical::zoned_timestamptz_array(&a[0])
+        }
+        v => crate::builtins::casts::timestamptz_in_session(v, None),
     })?;
     // CURRENT_DATE in the session's zone, which resolve/temporal.rs writes for it.
     scalar_nd(conn, "overlite_current_date", 0, |_| {
