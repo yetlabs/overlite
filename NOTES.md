@@ -630,6 +630,26 @@ hold:
   classes themselves; bloom's access method has an oid below FirstNormalObjectId, so it
   is not dumped as CREATE ACCESS METHOD.
 
+- pg_db_role_setting (empty: no ALTER DATABASE/ROLE ... SET is kept), which pg_dump -Fc
+  reads first, pg_authid, and pg_auth_members' inherit_option and set_option exist.
+  pg_authid holds no password, as every role may read it here, so a dump of roles
+  carries none.
+
+Still not done: pg_dumpall stops at pg_parameter_acl (and whatever global catalog it
+reads after it), so only pg_dump per database works. The reverse direction (a dump
+from Postgres 18 restored here) and pgbench -i were not checked again in this round.
+psql 18 meta-commands answer but for `\dx` (its query reads a function with a column
+list: 0A000), `\dd` (pg_opfamily_is_visible is missing) and `\drds`, which now finds
+pg_db_role_setting; `\dconfig server_version*` lists nothing, as pg_settings does not
+hold server_version; `\dp` shows no table privileges (relacl is NULL); `\da` lists
+no built-in aggregate; `\sf` prints the CREATE FUNCTION as written. pg_typeof() is
+missing, and so are pg_get_acl, has_largeobject_privilege and gamma/lgamma of 18.
+RETURNING OLD/NEW (18) is refused: the parser reads `old.v` as a table that is not
+there. Overlite still reports server_version 16.0: psql and pg_dump 18 then use their
+queries for 16, which the catalogs answer; reporting 18 would have them read 18's
+columns (pg_constraint's NOT NULL rows, conenforced and the like) that are not here, so
+it was left at 16. A nested `ARRAY[[1,2],[3,4]]` literal is not typed as an array.
+
 Still lost or different in a dump: GRANTs on tables (pg_class.relacl is NULL), a
 CHECK and a default in the translation's spelling where that differs from the
 client's (`CAST(a AS text)` for `a::text`), jsonb's spacing, a numeric generated

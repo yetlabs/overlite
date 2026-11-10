@@ -128,6 +128,19 @@ fn meta_catalog_views(db_name: &str) -> Vec<String> {
 		 FROM _overlite_roles"#,
         ]
         .concat(),
+        // pg_authid is pg_roles as pg_dumpall reads it. Postgres keeps it from all but a
+        // superuser; here every role may read it, so it holds no password: pg_dumpall
+        // writes the roles without theirs.
+        [
+            r#"CREATE TEMP VIEW pg_authid AS SELECT
+		 CASE WHEN rolname = "#,
+            &role,
+            r#" COLLATE NOCASE THEN 10 ELSE rowid + 16384 END AS oid,
+		 rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication,
+		 rolbypassrls, -1 AS rolconnlimit, NULL AS rolpassword, NULL AS rolvaliduntil, 1260 AS tableoid
+		 FROM _overlite_roles"#,
+        ]
+        .concat(),
         [
             r#"CREATE TEMP VIEW pg_sequences AS SELECT 'public' AS schemaname, seqname AS sequencename,
 		 "#,

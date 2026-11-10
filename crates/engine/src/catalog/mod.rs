@@ -2064,7 +2064,7 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
     // resolved through pg_roles (so psql's \du "Member of" works).
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_auth_members AS
 	 SELECT m.rowid AS oid, ro.oid AS roleid, mo.oid AS member,
-	        10 AS grantor, m.admin_option AS admin_option
+	        10 AS grantor, m.admin_option AS admin_option, 1 AS inherit_option, 1 AS set_option
 	 FROM _overlite_memberships m
 	 JOIN pg_roles ro ON lower(ro.rolname) = lower(m.roleof)
 	 JOIN pg_roles mo ON lower(mo.rolname) = lower(m.member)"#,
@@ -2201,6 +2201,9 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 JOIN pg_namespace n ON n.oid = c.relnamespace AND lower(o.tablename) =
 	      lower(CASE n.nspname WHEN 'public' THEN c.relname ELSE n.nspname || '.' || c.relname END)
 	 JOIN pg_roles r ON lower(r.rolname) = lower(o.owner)"#,
+    // Settings of ALTER DATABASE ... SET and ALTER ROLE ... SET: none are kept.
+    r#"CREATE TEMP VIEW IF NOT EXISTS pg_db_role_setting AS
+	 SELECT 0 AS setdatabase, 0 AS setrole, NULL AS setconfig WHERE 0"#,
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_default_acl AS
 	 SELECT 0 AS oid, 0 AS defaclrole, 2200 AS defaclnamespace, 'r' AS defaclobjtype, NULL AS defaclacl
 	 WHERE 0"#,

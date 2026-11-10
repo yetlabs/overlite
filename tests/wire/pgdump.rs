@@ -243,3 +243,33 @@ fn pg_dump_restores_into_a_new_database() {
     copy.exec("INSERT INTO authors (name) VALUES ('')", &[])
         .expect_err("the CHECK came back");
 }
+
+// The catalogs pg_dump -Fc and pg_dumpall read before any object: a database's
+// settings, the roles (without their passwords: every role may read pg_authid here)
+// and each membership's options, as Postgres 16 has them.
+#[test]
+fn catalogs_of_pg_dump_fc_and_pg_dumpall() {
+    let conn = connect(&start_server());
+    must_exec(&conn, "CREATE ROLE readers");
+    must_exec(&conn, "CREATE ROLE app LOGIN PASSWORD 'secret'");
+    must_exec(&conn, "GRANT readers TO app");
+    assert_eq!(
+        scan_str(&conn, "SELECT count(*) FROM pg_db_role_setting WHERE setrole = 0"),
+        "0"
+    );
+    assert_eq!(
+        scan_str(
+            &conn,
+            "SELECT string_agg(rolname || ':' || coalesce(rolpassword, '-'), ',' ORDER BY rolname) FROM pg_authid WHERE rolname IN ('app', 'readers')"
+        ),
+        "app:-,readers:-"
+    );
+    assert_eq!(
+        scan_str(
+            &conn,
+            "SELECT ur.rolname || '>' || um.rolname || ':' || a.inherit_option::int || a.set_option::int FROM pg_auth_members a \
+             JOIN pg_authid ur ON ur.oid = a.roleid JOIN pg_authid um ON um.oid = a.member"
+        ),
+        "readers>app:11"
+    );
+}
