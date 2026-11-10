@@ -460,7 +460,7 @@ pub(crate) fn retype_serial_key(typ: &str, cons: &str, new_type: &str) -> Option
     match integer_type(new_type) {
         Some("integer") => Some(("INTEGER".to_string(), bare + " /*overlite int4*/")),
         Some("smallint") => Some(("INTEGER".to_string(), bare + " /*overlite int2*/")),
-        Some(_) => Some(("INTEGER".to_string(), bare)),
+        Some(_) => Some(("INTEGER".to_string(), bare + " /*overlite int8*/")),
         None => Some((new_type.to_string(), without_autoincrement(&bare))),
     }
 }
@@ -468,7 +468,7 @@ pub(crate) fn retype_serial_key(typ: &str, cons: &str, new_type: &str) -> Option
 /// The constraints without a serial key's width comment.
 fn without_width(cons: &str) -> String {
     let mut out = cons.to_string();
-    for m in ["/*overlite int4*/", "/*overlite int2*/"] {
+    for m in ["/*overlite int4*/", "/*overlite int2*/", "/*overlite int8*/"] {
         out = out.replace(m, "");
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")

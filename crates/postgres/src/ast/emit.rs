@@ -404,9 +404,9 @@ struct Emitter<'a> {
     /// schema: a cast there is SQLite's CAST (`table_ddl_cast`).
     table_ddl: bool,
     /// Writing an expression of a DDL statement, which SQLite runs without the
-    /// session (a default, a check, an index's key): the clock is SQLite's own
-    /// `datetime('now')` and CURRENT_TIMESTAMP its keyword, as the text passes wrote
-    /// them and the catalog reads them back.
+    /// session (a default, a check, an index's key): the clock is SQLite's own, read
+    /// to the millisecond by strftime, which the catalog reads back as now() or
+    /// CURRENT_TIMESTAMP.
     ddl: bool,
     /// A column being written as a whole item of a select list or RETURNING: a boolean
     /// holding text is left as it is there, its declared type reads it on the way out.
@@ -2667,7 +2667,7 @@ impl<'a> Emitter<'a> {
                 // left of them is the engine's functions (rewrite_niladic_funcs).
                 match O::try_from(f.op) {
                     Ok(O::SvfopCurrentDate) if self.ddl => self.push("CURRENT_DATE"),
-                    Ok(O::SvfopCurrentTimestamp) if self.ddl => self.push("CURRENT_TIMESTAMP"),
+                    Ok(O::SvfopCurrentTimestamp) if self.ddl => self.push("strftime('%Y-%m-%d %H:%M:%f')"),
                     Ok(O::SvfopCurrentTime) if self.ddl => self.push("CURRENT_TIME"),
                     Ok(O::SvfopCurrentDate) if self.typed() => self.push("overlite_current_date()"),
                     Ok(O::SvfopCurrentTimestamp) if self.typed() => self.push("overlite_now(julianday('now'))"),
@@ -4393,9 +4393,9 @@ impl<'a> Emitter<'a> {
                 "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
             )
         {
-            // SQLite's clock, which runs without the session, as rewrite_now wrote it in
-            // a table's DDL and the catalog reads it back.
-            self.push("datetime('now')");
+            // SQLite's clock, which runs without the session, to the millisecond:
+            // overlite_default_expr reads it back as now().
+            self.push("strftime('%Y-%m-%d %H:%M:%f', 'now')");
             return Ok(());
         }
         if self.typed() && f.args.is_empty() && f.over.is_none() && f.agg_filter.is_none() {
@@ -4459,6 +4459,7 @@ impl<'a> Emitter<'a> {
                 ("col_description", [o, n]) => return self.description(node(o)?, Some(node(n)?)),
                 ("pg_get_indexdef", [o, ..]) => return self.indexdef(node(o)?),
                 ("pg_get_constraintdef", [o, ..]) => return self.constraintdef(node(o)?),
+                ("pg_get_viewdef", [o, ..]) => return self.viewdef(node(o)?),
                 ("pg_partition_ancestors" | "pg_partition_tree" | "pg_partition_root", _) => {
                     self.push("(SELECT NULL AS ");
                     self.push(name);
@@ -4716,8 +4717,20 @@ impl<'a> Emitter<'a> {
             "(SELECT 'CREATE ' || CASE WHEN ix._u THEN 'UNIQUE ' ELSE '' END || 'INDEX ' || (SELECT relname FROM \
              pg_class WHERE oid = ix._i) || ' ON ' || (SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN \
              pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = ix._r) || ' USING btree (' || ix._c || ')' \
-             FROM (SELECT indexrelid AS _i, indrelid AS _r, indisunique AS _u, ov_cols AS _c FROM pg_index) ix \
+             || COALESCE(' WHERE ' || ix._w, '') \
+             FROM (SELECT indexrelid AS _i, indrelid AS _r, indisunique AS _u, ov_cols AS _c, ov_pred AS _w FROM pg_index) ix \
              WHERE ix._i = ",
+        );
+        self.expr(oid, Prec::Compare)?;
+        self.push(")");
+        Ok(())
+    }
+
+    /// pg_get_viewdef: the view's query, as pg_views has it, found by the view's oid.
+    fn viewdef(&mut self, oid: &NodeEnum) -> Out {
+        self.push(
+            "(SELECT v.definition FROM pg_views v JOIN pg_class c ON c.relname = v.viewname AND c.relkind = 'v' \
+             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = v.schemaname WHERE c.oid = ",
         );
         self.expr(oid, Prec::Compare)?;
         self.push(")");

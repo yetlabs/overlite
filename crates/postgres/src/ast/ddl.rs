@@ -371,6 +371,7 @@ fn column_def(
     {
         Some(n) if serial && (n == "serial" || n == "serial4") => " AUTOINCREMENT /*overlite int4*/",
         Some(n) if serial && (n == "smallserial" || n == "serial2") => " AUTOINCREMENT /*overlite int2*/",
+        Some(n) if serial && (n == "bigserial" || n == "serial8") => " AUTOINCREMENT /*overlite int8*/",
         _ => " AUTOINCREMENT",
     };
     let col_type = src.span(ts, te);

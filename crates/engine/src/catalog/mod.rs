@@ -579,6 +579,121 @@ fn int(b: bool) -> Result<Value> {
     Ok(Value::Int(bool_int(b)))
 }
 
+/// The `(expr)` of a column definition's GENERATED ALWAYS AS (expr): None for a column
+/// that is not generated.
+fn generated_expr(def: &str) -> Option<String> {
+    let lower = def.to_ascii_lowercase();
+    let at = lower.find("generated always as")? + "generated always as".len();
+    let open = at + def[at..].find('(')?;
+    let mut depth = 0;
+    let b = def.as_bytes();
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(def[open..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The query of a `CREATE [TEMP] VIEW [IF NOT EXISTS] name [(columns)] AS query`: None
+/// for anything else.
+fn view_body(sql: &str) -> Option<&str> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let skip_space = |i: &mut usize| {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    let word = |i: &mut usize| -> &str {
+        let start = *i;
+        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+            *i += 1;
+        }
+        &sql[start..*i]
+    };
+    let mut seen_view = false;
+    loop {
+        skip_space(&mut i);
+        if i >= b.len() {
+            return None;
+        }
+        if seen_view {
+            break;
+        }
+        seen_view = word(&mut i).eq_ignore_ascii_case("view");
+        if i < b.len() && !b[i].is_ascii_whitespace() && !seen_view {
+            return None;
+        }
+    }
+    // The name, perhaps quoted and qualified, then IF NOT EXISTS before it.
+    let mut name = || -> Option<()> {
+        loop {
+            skip_space(&mut i);
+            if let q @ (b'"' | b'`' | b'[') = *b.get(i)? {
+                let close = if q == b'[' { b']' } else { q };
+                i += 1;
+                while *b.get(i)? != close || b.get(i + 1) == Some(&close) {
+                    i += if *b.get(i)? == close { 2 } else { 1 };
+                }
+                i += 1;
+            } else {
+                let w = word(&mut i);
+                if w.is_empty() {
+                    return None;
+                }
+                if w.eq_ignore_ascii_case("if") || w.eq_ignore_ascii_case("not") || w.eq_ignore_ascii_case("exists") {
+                    continue;
+                }
+            }
+            if b.get(i) == Some(&b'.') {
+                i += 1;
+                continue;
+            }
+            return Some(());
+        }
+    };
+    name()?;
+    skip_space(&mut i);
+    if b.get(i) == Some(&b'(') {
+        let mut depth = 0;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        skip_space(&mut i);
+    }
+    if !word(&mut i).eq_ignore_ascii_case("as") {
+        return None;
+    }
+    Some(sql[i..].trim().trim_end_matches(';').trim_end())
+}
+
 /// Registers everything on a new connection: SQLite functions are per connection.
 pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     for name in ["gen_random_uuid", "uuid_generate_v4", "uuidv4"] {
@@ -857,7 +972,6 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     for name in [
         "pg_get_indexdef",
         "pg_get_constraintdef",
-        "pg_get_viewdef",
         "pg_get_partkeydef",
         "pg_get_ruledef",
     ] {
@@ -1008,6 +1122,15 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             .collect();
         Ok(Value::Text(["[", &quoted.join(","), "]"].concat()))
     })?;
+    scalar(conn, "overlite_index_expr", 2, |a| {
+        let Value::Int(seqno) = a[1] else {
+            return Ok(Value::Null);
+        };
+        Ok(crate::catalog::constraints::index_expression(&arg_str(&a[0]), seqno).map_or(Value::Null, Value::Text))
+    })?;
+    scalar(conn, "overlite_index_predicate", 1, |a| {
+        Ok(crate::catalog::constraints::index_predicate(&arg_str(&a[0])).map_or(Value::Null, Value::Text))
+    })?;
     scalar(conn, "overlite_index_null_key", 2, |a| {
         let Value::Int(seqno) = a[1] else {
             return Ok(Value::Null);
@@ -1109,6 +1232,43 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         }
         Ok(Value::Text(format_type_mod(oid, typmod)))
     })?;
+    // A function's argument types as pg_proc.proargtypes holds them (an oidvector,
+    // `23 25`), from its stored argument list: pg_dump reads one oid per argument.
+    scalar(conn, "overlite_arg_oids", 1, |args| {
+        let list = crate::sql_funcs::parse::identity_args(&arg_str(&args[0]));
+        let oids: Vec<String> = list
+            .split(", ")
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| sqlite_type_oid(t).to_string())
+            .collect();
+        Ok(Value::Text(oids.join(" ")))
+    })?;
+    // A view's query, out of the CREATE VIEW SQLite keeps: what pg_get_viewdef and
+    // pg_views.definition give, ended by a semicolon as Postgres ends it.
+    // A column default as Postgres writes it back, where SQLite's DDL holds the clock
+    // the translation wrote for it.
+    scalar(conn, "overlite_default_expr", 1, |args| {
+        if args[0].is_null() {
+            return Ok(Value::Null);
+        }
+        let d = arg_str(&args[0]);
+        let bare = d.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        Ok(Value::Text(
+            match bare {
+                // Every closing parenthesis is trimmed with the outer one.
+                "datetime('now'" | "strftime('%Y-%m-%d %H:%M:%f', 'now'" => "now()",
+                "strftime('%Y-%m-%d %H:%M:%f'" | "CURRENT_TIMESTAMP" => "CURRENT_TIMESTAMP",
+                _ => &d,
+            }
+            .to_string(),
+        ))
+    })?;
+    scalar(conn, "overlite_view_body", 1, |args| {
+        if args[0].is_null() {
+            return Ok(Value::Null);
+        }
+        Ok(view_body(&arg_str(&args[0])).map_or(Value::Null, |b| Value::Text([b, ";"].concat())))
+    })?;
     scalar(conn, "overlite_type_oid", 1, |args| {
         if args.is_empty() {
             return Ok(Value::Int(TYPE_OID_TEXT));
@@ -1187,6 +1347,15 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         let cols: Vec<String> = arg_str(&a[1]).split(',').map(str::to_string).collect();
         Ok(Value::Int(unique_deferral(&arg_str(&a[0]), &cols)))
     })?;
+    // The expression of a generated column, out of its definition in the CREATE TABLE,
+    // as pg_get_expr gives a generated column's pg_attrdef.
+    scalar(conn, "overlite_generated_expr", 2, |a| {
+        Ok(
+            crate::builtins::collation::column_item(&arg_str(&a[0]), &arg_str(&a[1]))
+                .and_then(generated_expr)
+                .map_or(Value::Null, Value::Text),
+        )
+    })?;
     scalar(conn, "overlite_column_def", 2, |a| {
         Ok(
             crate::builtins::collation::column_item(&arg_str(&a[0]), &arg_str(&a[1]))
@@ -1217,7 +1386,15 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             .map_or(Value::Null, |end| Value::Text(rest[..end].to_string())))
     })?;
     scalar(conn, "overlite_identity_type", 2, |a| {
-        Ok(identity_type(&arg_str(&a[0]), &arg_str(&a[1])).map_or(Value::Null, Value::Text))
+        // A bigserial key is a rowid declared INTEGER: its comment says it is a bigint.
+        let (ddl, col) = (arg_str(&a[0]), arg_str(&a[1]));
+        Ok(identity_type(&ddl, &col)
+            .or_else(|| {
+                crate::catalog::constraints::key_width(&ddl, &col)
+                    .filter(|w| *w == "bigint")
+                    .map(str::to_string)
+            })
+            .map_or(Value::Null, Value::Text))
     })?;
     scalar(conn, "overlite_index_opclass", 2, |a| {
         Ok(index_opclass(&arg_str(&a[0]), as_int64(&a[1])).map_or(Value::Null, Value::Text))
@@ -1757,7 +1934,7 @@ fn pg_proc_view() -> String {
                     " 0 AS pronargs, 0 AS proretset, NULL AS proacl, '' AS prosrc, NULL AS probin,",
                     " 'v' AS provolatile, 0 AS proisstrict, NULL AS proargmodes, NULL AS proargnames,",
                     " NULL AS proallargtypes, 0 AS prosecdef, NULL AS proconfig, 100 AS procost,",
-                    " 0 AS prorows, 0 AS provariadic, 0 AS prosupport, 0 AS proleakproof,",
+                    " 0 AS prorows, 0 AS provariadic, '-' AS prosupport, 0 AS proleakproof,",
                     " 's' AS proparallel, NULL AS proargdefaults, 0 AS pronargdefaults, '' AS prosqlbody,",
                     " NULL AS protrftypes, 1255 AS tableoid"
                 ),
@@ -1771,13 +1948,15 @@ fn pg_proc_view() -> String {
     // signature from pg_get_function_arguments/result and the body from prosrc.
     let user_row = concat!(
         "SELECT CAST(rowid + 500000 AS INTEGER) AS oid, name AS proname, 2200 AS pronamespace, 10 AS proowner,",
-        " 14 AS prolang, 'f' AS prokind, 25 AS prorettype, '' AS proargtypes,",
+        " 14 AS prolang, 'f' AS prokind,",
+        " CASE lower(trim(rettype)) WHEN 'void' THEN 2278 WHEN 'trigger' THEN 2279 WHEN '' THEN 25",
+        " ELSE overlite_type_oid(rettype) END AS prorettype, overlite_arg_oids(args) AS proargtypes,",
         " arity AS pronargs, 0 AS proretset, NULL AS proacl, body AS prosrc, NULL AS probin,",
         " 'v' AS provolatile, 0 AS proisstrict, NULL AS proargmodes,",
         " CASE WHEN params='' THEN NULL ELSE '{'||replace(params,char(31),',')||'}' END AS proargnames,",
         " NULL AS proallargtypes, coalesce(secdef, 0) AS prosecdef, NULL AS proconfig, 100 AS procost,",
-        " 0 AS prorows, 0 AS provariadic, 0 AS prosupport, 0 AS proleakproof,",
-        " 's' AS proparallel, NULL AS proargdefaults, 0 AS pronargdefaults, NULL AS prosqlbody,",
+        " 0 AS prorows, 0 AS provariadic, '-' AS prosupport, 0 AS proleakproof,",
+        " 'u' AS proparallel, NULL AS proargdefaults, 0 AS pronargdefaults, NULL AS prosqlbody,",
         " NULL AS protrftypes, 1255 AS tableoid FROM _overlite_functions WHERE lang='sql'"
     );
     format!(
@@ -1918,7 +2097,9 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 UNION ALL SELECT 2742, 'gin',  'ginhandler', 'i'
 	 UNION ALL SELECT 4000, 'spgist', 'spghandler', 'i'
 	 UNION ALL SELECT 3580, 'brin', 'brinhandler', 'i'
-	 UNION ALL SELECT 16400 + 500, 'bloom', 'blhandler', 'i'"#,
+	 -- bloom is taken without CREATE EXTENSION, as a btree: an oid below
+	 -- FirstNormalObjectId keeps pg_dump from writing CREATE ACCESS METHOD for it.
+	 UNION ALL SELECT 9000, 'bloom', 'blhandler', 'i'"#,
     // pg_description is populated from _overlite_comments: relation-level
     // comments join to pg_class for the oid (objsubid 0); column comments join
     // through pg_attribute for the attnum (objsubid = attnum).
@@ -2005,7 +2186,12 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 JOIN pg_class t ON t.relkind = 'r' AND t.relname = substr(d.tablename, instr(d.tablename, '.') + 1)
 	 JOIN pg_attribute a ON a.attrelid = t.oid AND lower(a.attname) = lower(d.colname)
 	      AND (a.attidentity <> '' OR instr(overlite_column_def((SELECT sql FROM sqlite_master
-	           WHERE type = 'table' AND name = d.tablename), a.attname), '/*overlite owned sequence*/'))"#,
+	           WHERE type = 'table' AND name = d.tablename), a.attname), '/*overlite owned sequence*/'))
+	 UNION ALL SELECT 2616, o.oid, 0, 3079, CAST(x.rowid + 13000 AS INTEGER), 0, 'e'
+	 FROM pg_opclass o JOIN _overlite_extensions x ON x.extname = 'pg_trgm'
+	 WHERE o.opcname IN ('gin_trgm_ops', 'gist_trgm_ops')
+	 UNION ALL SELECT 2601, a.oid, 0, 3079, CAST(x.rowid + 13000 AS INTEGER), 0, 'e'
+	 FROM pg_am a JOIN _overlite_extensions x ON x.extname = 'bloom' WHERE a.amname = 'bloom'"#,
     // pg_shdepend: shared dependency of each table on its owning role.
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_shdepend AS
 	 SELECT 0 AS dbid, 1259 AS classid, c.oid AS objid, 0 AS objsubid,
@@ -2070,7 +2256,9 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 UNION ALL SELECT 10044, 403, 'varchar_ops',         11, 10, 0, 25,   0, 0
 	 UNION ALL SELECT 10091, 2742, 'jsonb_path_ops',     11, 10, 0, 3802, 0, 0
 	 UNION ALL SELECT 16616, 2742, 'gin_trgm_ops',       2200, 10, 0, 25, 0, 0
-	 UNION ALL SELECT 16595, 783, 'gist_trgm_ops',       2200, 10, 0, 25, 0, 0"#,
+	 WHERE EXISTS (SELECT 1 FROM _overlite_extensions WHERE extname = 'pg_trgm')
+	 UNION ALL SELECT 16595, 783, 'gist_trgm_ops',       2200, 10, 0, 25, 0, 0
+	 WHERE EXISTS (SELECT 1 FROM _overlite_extensions WHERE extname = 'pg_trgm')"#,
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_opfamily AS
 	 SELECT 0 AS oid, 0 AS opfmethod, '' AS opfname, 11 AS opfnamespace, 10 AS opfowner WHERE 0"#,
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_conversion AS
@@ -2193,4 +2381,36 @@ pub(crate) fn bool_forms_json(b: Option<bool>) -> String {
     }
     out.push(']');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_body_is_the_query() {
+        assert_eq!(view_body("CREATE VIEW v AS SELECT 1"), Some("SELECT 1"));
+        assert_eq!(
+            view_body("CREATE VIEW \"my view\" (a, b) AS\nSELECT 1, 2;"),
+            Some("SELECT 1, 2")
+        );
+        assert_eq!(
+            view_body("CREATE TEMP VIEW IF NOT EXISTS s.v AS SELECT x AS y FROM t"),
+            Some("SELECT x AS y FROM t")
+        );
+        assert_eq!(view_body("CREATE TABLE t (a int)"), None);
+    }
+
+    #[test]
+    fn generated_expr_reads_its_parentheses() {
+        assert_eq!(
+            generated_expr("b int GENERATED ALWAYS AS (a * (2)) STORED"),
+            Some("(a * (2))".into())
+        );
+        assert_eq!(
+            generated_expr("c text generated always as (')' || a)"),
+            Some("(')' || a)".into())
+        );
+        assert_eq!(generated_expr("a int DEFAULT 1"), None);
+    }
 }

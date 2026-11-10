@@ -528,6 +528,14 @@ pub(crate) fn scan_func_calls(
                 && let Some((args, end)) = read_paren_args(sql, k)
             {
                 let lit = replace(&f, &args)?;
+                // The call's pg_catalog qualifier (pg_dump writes pg_catalog.setval)
+                // goes with it: the answer is a literal.
+                for q in ["pg_catalog.", "\"pg_catalog\"."] {
+                    if b.len() >= q.len() && b[b.len() - q.len()..].eq_ignore_ascii_case(q) {
+                        b.truncate(b.len() - q.len());
+                        break;
+                    }
+                }
                 b.push_str(&lit);
                 i = end;
                 continue;

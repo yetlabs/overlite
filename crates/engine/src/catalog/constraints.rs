@@ -495,7 +495,8 @@ pub fn identity_columns(ddl: &str) -> Vec<Identity> {
 /// The narrow integer col of a CREATE TABLE is declared, where it is a key that is the
 /// rowid: `integer` for a serial's (`/*overlite int4*/`, which ast::ddl writes after its
 /// AUTOINCREMENT) or an integer identity's, `smallint` for a smallserial's
-/// (`/*overlite int2*/`) or a smallint identity's. SQLite declares any rowid INTEGER,
+/// (`/*overlite int2*/`) or a smallint identity's, `bigint` for a bigserial's
+/// (`/*overlite int8*/`). SQLite declares any rowid INTEGER,
 /// which says nothing of its width.
 pub(crate) fn key_width(ddl: &str, col: &str) -> Option<&'static str> {
     if !ddl.contains("/*overlite int") && !ddl.contains("int*/") && !ddl.contains("integer*/") {
@@ -513,6 +514,8 @@ pub(crate) fn key_width(ddl: &str, col: &str) -> Option<&'static str> {
         Some("integer")
     } else if text.contains("/*overlite int2*/") {
         Some("smallint")
+    } else if text.contains("/*overlite int8*/") {
+        Some("bigint")
     } else {
         None
     }
@@ -949,4 +952,88 @@ mod tests {
         assert_eq!(attidentity(ddl, "a"), "");
         assert_eq!(identity_type(ddl, "b c").as_deref(), Some("integer"));
     }
+}
+
+/// The expression a key of a CREATE INDEX is, as pg_get_indexdef writes one: a call as
+/// it is (`lower(title)`), anything else in parentheses. None for a key that is a column
+/// or that cannot be read.
+pub(crate) fn index_expression(sql: &str, seqno: i64) -> Option<String> {
+    let item = index_item(sql, seqno)?;
+    let mut text = RE_INDEX_COMMENT.replace_all(item, "").trim().to_string();
+    for suffix in [" desc", " asc"] {
+        if text.to_ascii_lowercase().ends_with(suffix) {
+            text.truncate(text.len() - suffix.len());
+            text = text.trim_end().to_string();
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let call = RE_CALL_START.is_match(&text) && text.ends_with(')') && balanced_call(&text);
+    Some(if call || (text.starts_with('(') && text.ends_with(')')) {
+        text
+    } else {
+        ["(", &text, ")"].concat()
+    })
+}
+
+/// Whether text is one call: its first parenthesis closes at its end.
+fn balanced_call(text: &str) -> bool {
+    let Some(open) = text.find('(') else { return false };
+    let mut depth = 0;
+    for (i, c) in text[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + i == text.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+lazy_regex!(RE_INDEX_COMMENT, r"/\*.*?\*/");
+lazy_regex!(RE_CALL_START, r"^[A-Za-z_][\w$]*\s*\(");
+
+/// The WHERE of a partial index's CREATE INDEX, as pg_get_indexdef ends with it.
+pub(crate) fn index_predicate(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let on = lower.find(" on ")?;
+    let open = on + sql[on..].find('(')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    let b = sql.as_bytes();
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let rest = RE_INDEX_COMMENT.replace_all(&sql[close? + 1..], "");
+    let rest = rest.trim();
+    let pred = rest
+        .strip_prefix("WHERE")
+        .or_else(|| rest.strip_prefix("where"))?
+        .trim();
+    (!pred.is_empty()).then(|| ["(", pred, ")"].concat())
 }

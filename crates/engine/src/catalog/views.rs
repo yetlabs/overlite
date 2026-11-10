@@ -17,6 +17,7 @@ lazy_regex!(
 /// across schemas), @PG@ = the Postgres schema name. One pass: what was
 /// substituted is not rescanned.
 fn frag(tmpl: &str, r: &SchemaRef, db_name: &str, enum_base: i64) -> String {
+    let tmpl: &str = &tmpl.replace("@SERIAL_DEFAULT@", SERIAL_DEFAULT);
     let pairs: [(&str, String); 9] = [
         ("@DB@", r.db.clone()),
         ("@MASTER@", r.master()),
@@ -409,7 +410,13 @@ const PG_CLASS_TMPL: &str = concat!(
    ELSE CASE WHEN EXISTS(SELECT 1 FROM @MASTER@ mv WHERE mv.type = 'view' AND mv.name = '_overlite_mv_' || m.name)
    THEN 'm' ELSE 'r' END END AS relkind,
  (SELECT count(*) FROM pragma_table_xinfo(m.name,'@DB@')) AS relnatts,
- 0 AS relchecks, 0 AS relhasrules,
+ -- The CHECK constraints pg_constraint lists: psql's \d and pg_dump read them only
+ -- when this counts them.
+ CASE WHEN m.type = 'table' THEN (SELECT count(*) FROM json_each(overlite_checks(m.sql, substr(m.name,@PLEN@))) ck
+   WHERE NOT (json_extract(ck.value, '$.enum') AND EXISTS (SELECT 1 FROM _overlite_enum_types et
+    WHERE (SELECT group_concat(label) FROM (SELECT label FROM _overlite_enums WHERE typname = et.typname ORDER BY sortorder))
+          = overlite_enum_labels(m.sql, json_extract(ck.value, '$.cols[0]'))))) ELSE 0 END AS relchecks,
+ 0 AS relhasrules,
  CASE WHEN EXISTS(SELECT 1 FROM @MASTER@ trg WHERE trg.type='trigger' AND trg.tbl_name=m.name)
        OR (m.type='table' AND EXISTS(SELECT 1 FROM pragma_foreign_key_list(m.name,'@DB@')))
       THEN 1 ELSE 0 END AS relhastriggers,
@@ -443,7 +450,7 @@ const PG_ATTRIBUTE_TMPL: &str = r#"SELECT CAST(m.rowid + @OFF@ AS INTEGER) AS at
  overlite_typmod(ti.type) AS atttypmod,
  0 AS attbyval, 'p' AS attstorage, 'i' AS attalign,
  CASE WHEN ti."notnull"=1 OR ti.pk>0 THEN 1 ELSE 0 END AS attnotnull,
- CASE WHEN ti.dflt_value IS NOT NULL THEN 1 ELSE 0 END AS atthasdef,
+ CASE WHEN ti.dflt_value IS NOT NULL OR @SERIAL_DEFAULT@ IS NOT NULL THEN 1 ELSE 0 END AS atthasdef,
  0 AS atthasmissing, overlite_attidentity(m.sql, ti.name) AS attidentity,
  CASE ti.hidden WHEN 2 THEN 'v' WHEN 3 THEN 's' ELSE '' END AS attgenerated, 0 AS attisdropped, 1 AS attislocal,
  0 AS attinhcount,
@@ -489,11 +496,27 @@ WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' AND m.name NOT G
   AND ti.hidden <> 1
 ) WHERE grantee = 'PUBLIC' OR overlite_role_visible(grantee) OR overlite_role_visible(grantor)"#;
 
-const PG_ATTRDEF_TMPL: &str = r#"SELECT CAST(m.rowid * 1000 + ti.cid + @OFF@ AS INTEGER) AS oid,
- CAST(m.rowid + @OFF@ AS INTEGER) AS adrelid, ti.cid + 1 AS adnum, ti.dflt_value AS adbin
+/// A column's default that SQLite's DEFAULT does not hold: a generated column's
+/// expression, and a nextval default (a serial key is the rowid, and a nextval default
+/// is kept in `_overlite_defaults`), as Postgres writes it,
+/// `nextval('t_id_seq'::regclass)`, so pg_dump restores it. Over `m` (the table's
+/// sqlite_master row) and `ti` (its column), in a template.
+const SERIAL_DEFAULT: &str = r#"COALESCE(
+ CASE WHEN ti.hidden IN (2, 3) THEN overlite_generated_expr(m.sql, ti.name) END,
+ (SELECT 'nextval(''' || d.seqname || '''::regclass)' FROM _overlite_defaults d
+   WHERE d.tablename = m.name AND lower(d.colname) = lower(ti.name) LIMIT 1),
+ (SELECT 'nextval(''' || CASE s.schemaname WHEN 'public' THEN '' ELSE s.schemaname || '.' END
+    || s.seqname || '''::regclass)' FROM _overlite_serial_sequences s
+   WHERE ti.pk = 1 AND s.tablename = m.name AND s.seqname = substr(m.name,@PLEN@) || '_' || ti.name || '_seq'
+     AND overlite_attidentity(m.sql, ti.name) = '' LIMIT 1))"#;
+
+const PG_ATTRDEF_TMPL: &str = r#"SELECT oid, adrelid, adnum, adbin FROM (
+SELECT CAST(m.rowid * 1000 + ti.cid + @OFF@ AS INTEGER) AS oid,
+ CAST(m.rowid + @OFF@ AS INTEGER) AS adrelid, ti.cid + 1 AS adnum,
+ COALESCE(overlite_default_expr(ti.dflt_value), @SERIAL_DEFAULT@) AS adbin
 FROM @MASTER@ m JOIN pragma_table_xinfo(m.name,'@DB@') ti
-WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT GLOB '_overlite_*'
-  AND ti.dflt_value IS NOT NULL"#;
+WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name NOT GLOB '_overlite_*')
+WHERE adbin IS NOT NULL"#;
 
 const PG_INDEX_TMPL: &str = concat!(
     r#"SELECT idx.rowid + @OFF@ AS indexrelid, tbl.rowid + @OFF@ AS indrelid,
@@ -515,10 +538,12 @@ const PG_INDEX_TMPL: &str = concat!(
     r#"),' ') FROM pragma_index_info(idx.name,'@DB@') ii) AS indclass,
  (SELECT group_concat(CASE WHEN x."desc" THEN 3 ELSE 0 END,' ') FROM pragma_index_xinfo(idx.name,'@DB@') x WHERE x.key) AS indoption,
  NULL AS indexprs, NULL AS indpred,
- (SELECT group_concat(COALESCE(x.name, overlite_index_null_key(idx.sql, x.seqno)) || COALESCE(' ' || overlite_index_opclass(idx.sql, x.seqno), '')
+ (SELECT group_concat(COALESCE(x.name, overlite_index_null_key(idx.sql, x.seqno), overlite_index_expr(idx.sql, x.seqno))
+   || COALESCE(' ' || overlite_index_opclass(idx.sql, x.seqno), '')
    || CASE WHEN x."desc" THEN ' DESC' ELSE '' END, ', ')
    FROM pragma_index_xinfo(idx.name,'@DB@') x WHERE x.key)
-   || COALESCE(') INCLUDE (' || overlite_index_include(idx.sql, 0), '') AS ov_cols
+   || COALESCE(') INCLUDE (' || overlite_index_include(idx.sql, 0), '') AS ov_cols,
+ overlite_index_predicate(idx.sql) AS ov_pred
 FROM @MASTER@ idx
 JOIN @MASTER@ tbl ON tbl.name = idx.tbl_name AND tbl.type='table'
 JOIN pragma_index_list(tbl.name,'@DB@') il ON il.name = idx.name
@@ -535,7 +560,7 @@ SELECT tbl.rowid + 90000000 + @OFF@, tbl.rowid + @OFF@,
     r#",' ') FROM (SELECT cid FROM pragma_table_xinfo(tbl.name,'@DB@') WHERE pk>0 ORDER BY pk) pk),
  (SELECT group_concat(0,' ') FROM pragma_table_xinfo(tbl.name,'@DB@') WHERE pk>0),
  NULL,NULL,
- (SELECT group_concat(name,', ') FROM pragma_table_xinfo(tbl.name,'@DB@') WHERE pk>0 ORDER BY pk)
+ (SELECT group_concat(name,', ') FROM pragma_table_xinfo(tbl.name,'@DB@') WHERE pk>0 ORDER BY pk), NULL
 FROM @MASTER@ tbl
 WHERE tbl.type='table' AND tbl.name NOT LIKE 'sqlite_%' AND tbl.name NOT GLOB '_overlite_*'
   AND EXISTS(SELECT 1 FROM pragma_table_xinfo(tbl.name,'@DB@') WHERE pk>0)
@@ -551,7 +576,7 @@ SELECT CAST(tbl.rowid*1000 + il.seq + 84000000 + @OFF@ AS INTEGER), tbl.rowid + 
     r#",' ') FROM pragma_index_info(il.name,'@DB@') ii),
  (SELECT group_concat(0,' ') FROM pragma_index_info(il.name,'@DB@') ii),
  NULL,NULL,
- (SELECT group_concat(ii.name,', ') FROM pragma_index_info(il.name,'@DB@') ii)
+ (SELECT group_concat(ii.name,', ') FROM pragma_index_info(il.name,'@DB@') ii), NULL
 FROM @MASTER@ tbl JOIN pragma_index_list(tbl.name,'@DB@') il
 WHERE tbl.type='table' AND tbl.name NOT LIKE 'sqlite_%' AND tbl.name NOT GLOB '_overlite_*'
   AND il.origin='u' AND il."unique"=1"#
@@ -666,7 +691,8 @@ const PG_INDEXES_TMPL: &str = concat!(
    || ' ON @PG@.' || substr(tbl.name,@PLEN@) || ' USING '
    || COALESCE((SELECT am.amname FROM pg_am am WHERE instr(idx.sql, '/*overlite using ' || am.amname || '*/')), 'btree')
    || ' ('
-   || (SELECT group_concat(COALESCE(x.name, overlite_index_null_key(idx.sql, x.seqno)) || COALESCE(' ' || overlite_index_opclass(idx.sql, x.seqno), '')
+   || (SELECT group_concat(COALESCE(x.name, overlite_index_null_key(idx.sql, x.seqno), overlite_index_expr(idx.sql, x.seqno))
+   || COALESCE(' ' || overlite_index_opclass(idx.sql, x.seqno), '')
         || CASE WHEN x."desc" THEN ' DESC' ELSE '' END, ', ')
        FROM pragma_index_xinfo(idx.name,'@DB@') x WHERE x.key) || ')'
    || COALESCE(' INCLUDE (' || overlite_index_include(idx.sql, 0) || ')', '')
@@ -712,11 +738,12 @@ FROM @MASTER@ t JOIN @MASTER@ v ON v.type = 'view' AND v.name = '_overlite_mv_' 
 WHERE t.type='table'"#;
 
 const PG_VIEWS_TMPL: &str = r#"SELECT '@PG@' AS schemaname, substr(name,@PLEN@) AS viewname,
- @ROLE@ AS viewowner, sql AS definition
+ @ROLE@ AS viewowner, overlite_view_body(sql) AS definition
 FROM @MASTER@ WHERE type='view' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_overlite_*'"#;
 
 const INFO_COLUMNS_TMPL: &str = r#"SELECT @DBNAME@ AS table_catalog, '@PG@' AS table_schema, substr(m.name,@PLEN@) AS table_name,
- ti.name AS column_name, ti.cid + 1 AS ordinal_position, ti.dflt_value AS column_default,
+ ti.name AS column_name, ti.cid + 1 AS ordinal_position,
+ COALESCE(overlite_default_expr(ti.dflt_value), @SERIAL_DEFAULT@) AS column_default,
  CASE WHEN ti."notnull"=1 OR ti.pk>0 THEN 'NO' ELSE 'YES' END AS is_nullable,
  CASE WHEN ti.type LIKE '%[]' THEN 'ARRAY'
       ELSE format_type(overlite_type_oid(COALESCE(overlite_identity_type(m.sql, ti.name), ti.type)), NULL) END AS data_type,

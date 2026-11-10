@@ -597,6 +597,44 @@ as clients (tests/wire/pg18.rs).
   in SQLite: pg_attribute.attgenerated now says 'v' for it, so psql and pg_dump 18 write
   it back without STORED.
 
+## pg_dump and pg_restore
+
+A database pg_dump 18 writes (plain or -Fc) restores, with psql or pg_restore 18, into
+another Overlite database and into Postgres 18 (tests/wire/pgdump.rs). What made that
+hold:
+
+- pg_proc.proargtypes holds one oid per argument of a function (it was empty, and
+  pg_dump stopped at "could not parse numeric array"), prorettype the result's;
+  prosupport is `-` and proparallel `u` for a function of the user's, so pg_dump
+  writes neither SUPPORT 0 nor PARALLEL SAFE.
+- pg_get_viewdef and pg_views.definition give a view's query, not an empty string or
+  the whole CREATE VIEW. A view's query is the SQL SQLite keeps, which is the client's
+  for a plain query and the translation's otherwise.
+- pg_class.relchecks counts the CHECK constraints, which psql's `\d` and pg_dump read
+  only when it says there are some: both left them out before.
+- pg_get_indexdef writes an expression key (`lower(title)`, `(price * 2)`) and a
+  partial index's WHERE, where an expression index came out empty.
+- pg_attrdef holds a serial's and any nextval default (`nextval('t_id_seq'::regclass)`)
+  and a generated column's expression, which the CREATE TABLE SQLite keeps does not:
+  the serial key is the rowid and a nextval default is in `_overlite_defaults`. A
+  bigserial key is marked `/*overlite int8*/` when made, so the catalogs say bigint; one
+  made before says integer.
+- A DEFAULT now() or CURRENT_TIMESTAMP is SQLite's clock to the millisecond, where it
+  was datetime('now'), to the second, and the catalogs give it back as now() and
+  CURRENT_TIMESTAMP, which Postgres reads, rather than datetime('now'), which it
+  does not. A table made before keeps datetime('now'), shown as now().
+- pg_catalog.setval, nextval and currval, as pg_dump writes them, run: the qualifier
+  was left in front of the value the call became, a syntax error.
+- pg_trgm's operator classes are listed only once CREATE EXTENSION pg_trgm has run,
+  and depend on it in pg_depend ('e'), so pg_dump writes CREATE EXTENSION and not the
+  classes themselves; bloom's access method has an oid below FirstNormalObjectId, so it
+  is not dumped as CREATE ACCESS METHOD.
+
+Still lost or different in a dump: GRANTs on tables (pg_class.relacl is NULL), a
+CHECK and a default in the translation's spelling where that differs from the
+client's (`CAST(a AS text)` for `a::text`), jsonb's spacing, a numeric generated
+column computed as SQLite computes it.
+
 ## Limits
 
 Intentional, each for a case not worth more code. Grouped by what a client sees, the
@@ -773,8 +811,7 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 - STRICT_WORD_SIMILARITY and `<<<->` are float8, where Postgres gives real (silent in
   the digits past float4's).
 - Catalogs (silent): inet goes out as text, a column's COLLATE "C"
-  is not in pg_attribute, information_schema.columns.column_default of a serial is NULL,
-  an index's reloptions are NULL, result-column OIDs after ADD COLUMN are int8, the
+  is not in pg_attribute, an index's reloptions are NULL, result-column OIDs after ADD COLUMN are int8, the
   sequence list misses some.
 - In a session whose TimeZone is not UTC: DATE_TRUNC and EXTRACT of a timestamptz the
   typing does not see (see above) go by UTC (silent).
