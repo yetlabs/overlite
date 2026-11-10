@@ -181,6 +181,7 @@ pub(crate) static BOOL_CATALOG_COLUMNS: LazyLock<HashSet<&'static str>> = LazyLo
         "proretset",
         "prosecdef",
         "proleakproof",
+        "pending_restart",
         "is_instead",
         // Prisma's aliases for the booleans it reads.
         "is_partition",

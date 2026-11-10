@@ -682,11 +682,23 @@ hold:
   still not taken, and psql's `\d+` shows no Options line: it concatenates reloptions
   with another array, and the typing does not know a catalog column for an array.
 
-Still not done: psql 18 meta-commands answer but for `\dx` (its query reads a function with a column
-list: 0A000), `\dd` (pg_opfamily_is_visible is missing) and `\drds`, which now finds
-pg_db_role_setting; `\dconfig server_version*` lists nothing, as pg_settings does not
-hold server_version; `\dp` shows no table privileges (relacl is NULL); `\da` lists
-no built-in aggregate; `\sf` prints the CREATE FUNCTION as written. pg_typeof() is
+- psql 18's `\dx`, `\dd`, `\dconfig`, `\dp` and `\da` answer as Postgres 18's do
+  (`psql_meta_commands`): pg_available_extensions (a relation, and the function in a
+  FROM with its column list) with Postgres' descriptions, which pg_description has for
+  an installed extension; the pg_*_is_visible functions of operator classes, families
+  and the rest (true: they are pg_catalog's); pg_settings with the settings
+  current_setting answers; pg_class.relacl from the grants, NULL until the first one
+  and then the owner's and each grantee's privileges (`arwdDxtm`), with acldefault as
+  Postgres', so pg_dump writes a table's GRANTs back and the public schema's ACL is
+  Postgres' (`{owner=UC/owner,=U/owner}`); and the aggregates of pg_catalog in pg_proc
+  with Postgres' oids, arguments and descriptions (crates/engine/src/catalog/aggregates.rs, from
+  postgres:18-alpine). format_type names the rest of pg_catalog's types (interval,
+  anyelement, money... were text), and a reg* cast names the catalogs psql and pg_dump
+  name (pg_extension was NULL, so pg_dump found no extension member). A materialized
+  view has its query in pg_get_viewdef (pg_dump stopped at it) and its `_RETURN` rule.
+
+Still not done: `\sf` prints the CREATE FUNCTION as written; `\dn+` names the public
+schema's owner `postgres` where Postgres 18 says pg_database_owner. pg_typeof() is
 missing, and so are pg_get_acl, has_largeobject_privilege and gamma/lgamma of 18.
 RETURNING OLD/NEW (18) is refused: the parser reads `old.v` as a table that is not
 there. Overlite still reports server_version 16.0: psql and pg_dump 18 then use their
@@ -694,7 +706,7 @@ queries for 16, which the catalogs answer; reporting 18 would have them read 18'
 columns (pg_constraint's NOT NULL rows, conenforced and the like) that are not here, so
 it was left at 16. A nested `ARRAY[[1,2],[3,4]]` literal is not typed as an array.
 
-Still lost or different in a dump: GRANTs on tables (pg_class.relacl is NULL), a
+Still lost or different in a dump: GRANTs on sequences, schemas and functions, a
 CHECK and a default in the translation's spelling where that differs from the
 client's (`CAST(a AS text)` for `a::text`), jsonb's spacing, a numeric generated
 column computed as SQLite computes it. A partial index or CHECK over a numeric
@@ -1016,10 +1028,9 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 - EXPLAIN's costs and estimated rows are 0: SQLite estimates none.
 - pg_attribute.attacl, information_schema.column_privileges, has_table_privilege,
   has_column_privilege and has_any_column_privilege answer from the grants, so psql's
-  `\dp` lists column privileges as Postgres prints them. pg_class.relacl is still NULL:
-  `\dp` shows no table privileges, and column_privileges shows them only through their
-  columns. A table named in has_*_privilege without its schema is the public one, not
-  the search_path's.
+  `\dp` lists column privileges as Postgres prints them, and pg_class.relacl the table
+  privileges. WITH GRANT OPTION is not kept, so no `*` shows in them. A table named in
+  has_*_privilege without its schema is the public one, not the search_path's.
 
 ### Messages
 

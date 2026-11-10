@@ -183,3 +183,100 @@ fn pgbench_initializes_and_runs() {
     }
     assert_eq!(scan_str(&conn, "SELECT count(*) FROM pgbench_history"), "200");
 }
+
+/// The major version of a client binary ("psql (PostgreSQL) 18.1" is 18).
+fn client_major(bin: &std::path::Path) -> u32 {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .expect("the client must start");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find_map(|w| w.split('.').next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+// psql's meta-commands that read what the catalogs did not have: \dx (a function in
+// FROM with a column list, pg_available_extensions), \dd (pg_opfamily_is_visible),
+// \dconfig (pg_settings), \dp (pg_class.relacl from the grants) and \da (the
+// aggregates of pg_catalog). Each answer is Postgres 18's, but for the version.
+#[test]
+fn psql_meta_commands() {
+    let Some(psql) = look_path("psql") else {
+        skip_test!("psql not installed");
+    };
+    let major = client_major(&psql);
+    let addr = start_server();
+    let conn = connect(&addr);
+    for sql in [
+        "CREATE ROLE reader",
+        "CREATE TABLE t (id int PRIMARY KEY, v text)",
+        "GRANT SELECT ON t TO reader",
+        "GRANT INSERT, UPDATE ON t TO PUBLIC",
+        "CREATE TABLE u (a int)",
+    ] {
+        must_exec(&conn, sql);
+    }
+    let port = addr.port().to_string();
+    let run = |meta: &str| {
+        let out = std::process::Command::new(&psql)
+            .args([
+                "-X",
+                "-A",
+                "-t",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-h",
+                addr.host(),
+                "-p",
+                &port,
+                "-U",
+                "postgres",
+            ])
+            .args(["-d", "test", "-c", meta])
+            .output()
+            .expect("psql must start");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{meta}: {}", String::from_utf8_lossy(&out.stderr));
+        text
+    };
+    let dx = if major >= 18 {
+        "plpgsql|1.0|1.0|pg_catalog|PL/pgSQL procedural language\n"
+    } else {
+        "plpgsql|1.0|pg_catalog|PL/pgSQL procedural language\n"
+    };
+    assert_eq!(run("\\dx"), dx);
+    assert_eq!(run("\\dd"), "");
+    let config = run("\\dconfig server_version*");
+    let names: Vec<&str> = config.lines().filter_map(|l| l.split('|').next()).collect();
+    assert_eq!(names, ["server_version", "server_version_num"], "{config}");
+    // The owner, as relowner names it.
+    let o = scan_str(
+        &conn,
+        "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 't'",
+    );
+    assert_eq!(
+        run("\\dp t"),
+        format!("public|t|table|{o}=arwdDxtm/{o}\nreader=r/{o}\n=aw/{o}||\n")
+    );
+    assert_eq!(run("\\dp u"), "public|u|table|||\n");
+    assert_eq!(
+        run("\\da count"),
+        "pg_catalog|count|bigint|\"any\"|number of input rows for which the input expression is not null\n\
+         pg_catalog|count|bigint|*|number of input rows\n"
+    );
+    assert!(
+        run("\\daS avg").contains(
+            "pg_catalog|avg|interval|interval|the average (arithmetic mean) as interval of all interval values"
+        )
+    );
+    // pg_dump writes the GRANTs back now that relacl holds them.
+    assert_eq!(
+        scan_str(&conn, "SELECT relacl FROM pg_class WHERE relname = 't'"),
+        format!("{{{o}=arwdDxtm/{o},reader=r/{o},=aw/{o}}}")
+    );
+    assert_eq!(
+        scan_str(&conn, "SELECT acldefault('r', 10)"),
+        format!("{{{o}=arwdDxtm/{o}}}")
+    );
+}

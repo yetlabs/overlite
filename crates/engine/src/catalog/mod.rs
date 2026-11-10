@@ -12,6 +12,7 @@
 //! use bare names and the Postgres protocol strips the "pg_catalog." qualifier.
 //! Either way the user's real database file stays free of emulation objects.
 
+pub(crate) mod aggregates;
 mod comments;
 pub(crate) mod constraints;
 pub(crate) mod enums;
@@ -541,6 +542,21 @@ fn fn_field(pick: fn(&SqlFunc) -> String) -> impl Fn(&[Value]) -> Result<Value> 
     }
 }
 
+/// fn_field, where a pg_catalog aggregate (by its oid) answers from its row first.
+fn agg_or_fn_field(
+    agg: fn(&aggregates::Aggregate) -> &'static str,
+    pick: fn(&SqlFunc) -> String,
+) -> impl Fn(&[Value]) -> Result<Value> + Send + Copy + 'static {
+    let field = fn_field(pick);
+    move |a: &[Value]| {
+        let oid = a.first().map_or(0, as_int64);
+        if let Some(g) = aggregates::AGGREGATES.iter().find(|g| g.0 == oid) {
+            return Ok(Value::Text(agg(g).to_string()));
+        }
+        field(a)
+    }
+}
+
 fn range_acc(conn: &Connection, name: &str, f: fn(&Range) -> Value) -> Result<()> {
     scalar(conn, name, 1, move |a| {
         if a.is_empty() || a[0].is_null() {
@@ -994,6 +1010,21 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     scalar(conn, "pg_relation_is_publishable", -1, |_| Ok(Value::Int(0)))?;
     scalar(conn, "pg_function_is_visible", 1, |_| Ok(Value::Int(1)))?;
     scalar(conn, "pg_type_is_visible", 1, |_| Ok(Value::Int(1)))?;
+    // What the catalogs list of these is pg_catalog's, always on the path.
+    for name in [
+        "pg_opclass_is_visible",
+        "pg_opfamily_is_visible",
+        "pg_operator_is_visible",
+        "pg_collation_is_visible",
+        "pg_conversion_is_visible",
+        "pg_statistics_obj_is_visible",
+        "pg_ts_config_is_visible",
+        "pg_ts_dict_is_visible",
+        "pg_ts_parser_is_visible",
+        "pg_ts_template_is_visible",
+    ] {
+        scalar(conn, name, 1, |_| Ok(Value::Int(1)))?;
+    }
     // obj_description/col_description look up comments; we store none, so NULL.
     for name in ["obj_description", "col_description", "shobj_description"] {
         scalar(conn, name, -1, null)?;
@@ -1006,14 +1037,31 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         Ok(crate::builtins::arrays::array_to_string(a))
     })?;
     scalar(conn, "pg_get_functiondef", -1, fn_field(|f| f.src.clone()))?;
-    scalar(conn, "pg_get_function_arguments", -1, fn_field(|f| f.args.clone()))?;
-    scalar(conn, "pg_get_function_result", -1, fn_field(|f| f.rettype.clone()))?;
+    scalar(
+        conn,
+        "pg_get_function_arguments",
+        -1,
+        agg_or_fn_field(|a| a.2, |f| f.args.clone()),
+    )?;
+    scalar(
+        conn,
+        "pg_get_function_result",
+        -1,
+        agg_or_fn_field(|a| a.3, |f| f.rettype.clone()),
+    )?;
     scalar(
         conn,
         "pg_get_function_identity_arguments",
         -1,
-        fn_field(|f| identity_args(&f.args)),
+        agg_or_fn_field(|a| a.2, |f| identity_args(&f.args)),
     )?;
+    scalar(conn, "overlite_aggregate_description", 1, |a| {
+        let oid = a.first().map_or(0, as_int64);
+        Ok(aggregates::AGGREGATES
+            .iter()
+            .find(|g| g.0 == oid)
+            .map_or(Value::Null, |g| Value::Text(g.7.to_string())))
+    })?;
     {
         use crate::builtins::arrays as a;
         scalar(conn, "array_cat", 2, |v| Ok(a::array_cat(&v[0], &v[1], "aa")))?;
@@ -1179,7 +1227,8 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         scalar(conn, name, -1, empty)?;
     }
     // ACL helpers pg_dump calls; we don't model privileges, so return NULL/empty.
-    for name in ["acldefault", "aclexplode", "aclitemin", "aclitemout"] {
+    scalar(conn, "acldefault", 2, grants::acldefault)?;
+    for name in ["aclexplode", "aclitemin", "aclitemout"] {
         scalar(conn, name, -1, null)?;
     }
     scalar(conn, "pg_is_in_recovery", 0, |_| Ok(Value::Int(0)))?;
@@ -1876,6 +1925,42 @@ fn format_type_name(oid: i64) -> &'static str {
         TYPE_OID_JSON => "json",
         TYPE_OID_JSONB => "jsonb",
         TYPE_OID_UUID => "uuid",
+        // The rest of pg_catalog's that a column, a function or an aggregate names.
+        18 => "\"char\"",
+        19 => "name",
+        24 => "regproc",
+        26 => "oid",
+        27 => "tid",
+        28 => "xid",
+        142 => "xml",
+        650 => "cidr",
+        700 => "real",
+        705 => "unknown",
+        790 => "money",
+        829 => "macaddr",
+        869 => "inet",
+        1033 => "aclitem",
+        1042 => "character",
+        1083 => "time without time zone",
+        1186 => "interval",
+        1266 => "time with time zone",
+        1560 => "bit",
+        1562 => "bit varying",
+        2205 => "regclass",
+        2206 => "regtype",
+        2249 => "record",
+        2276 => "\"any\"",
+        2277 => "anyarray",
+        2278 => "void",
+        2279 => "trigger",
+        2283 => "anyelement",
+        3220 => "pg_lsn",
+        3500 => "anyenum",
+        3614 => "tsvector",
+        3615 => "tsquery",
+        3831 => "anyrange",
+        4089 => "regnamespace",
+        5069 => "xid8",
         _ => "text",
     }
 }
@@ -2004,9 +2089,27 @@ fn pg_proc_view() -> String {
         " 'u' AS proparallel, NULL AS proargdefaults, 0 AS pronargdefaults, NULL AS prosqlbody,",
         " NULL AS protrftypes, 1255 AS tableoid FROM _overlite_functions WHERE lang='sql'"
     );
+    // The aggregates of pg_catalog (prokind 'a'), with Postgres' oids.
+    let aggregates: Vec<String> = aggregates::AGGREGATES
+        .iter()
+        .map(|(oid, name, _, _, ret, nargs, argtypes, _)| {
+            format!(
+                concat!(
+                    "SELECT {}, {}, 11, 10, 12, 'a', {}, {}, {}, 0, NULL, 'aggregate_dummy', NULL, 'i', 0, NULL,",
+                    " NULL, NULL, 0, NULL, 1, 0, 0, '-', 0, 's', NULL, 0, NULL, NULL, 1255"
+                ),
+                oid,
+                quote_literal(name),
+                ret,
+                quote_literal(argtypes),
+                nargs
+            )
+        })
+        .collect();
     format!(
-        "CREATE TEMP VIEW pg_proc AS {} UNION ALL {}",
+        "CREATE TEMP VIEW pg_proc AS {} UNION ALL {} UNION ALL {}",
         parts.join(" UNION ALL "),
+        aggregates.join(" UNION ALL "),
         user_row
     )
 }
@@ -2164,6 +2267,10 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	   JOIN pg_namespace n ON n.nspname = cm.objname
 	  WHERE cm.objkind = 'schema' AND cm.comment IS NOT NULL
 	 UNION ALL
+	 SELECT e.oid, 3079, 0, a.comment FROM pg_extension e JOIN pg_available_extensions a ON a.name = e.extname
+	 UNION ALL
+	 SELECT p.oid, 1255, 0, overlite_aggregate_description(p.oid) FROM pg_proc p WHERE p.prokind = 'a'
+	 UNION ALL
 	 SELECT 2200, 2615, 0, 'standard public schema'
 	  WHERE NOT EXISTS (SELECT 1 FROM _overlite_comments
 	                     WHERE objkind = 'schema' AND objname = 'public')
@@ -2181,7 +2288,7 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_rewrite AS
 	 SELECT c.oid AS oid, '_RETURN' AS rulename, c.oid AS ev_class, '1' AS ev_type,
 	        'O' AS ev_enabled, 1 AS is_instead, NULL AS ev_qual, NULL AS ev_action, 2618 AS tableoid
-	 FROM pg_class c WHERE c.relkind = 'v'"#,
+	 FROM pg_class c WHERE c.relkind IN ('v', 'm')"#,
     // pg_policy: real RLS policies from _overlite_policies. polcmd maps the
     // command to Postgres' single-char code; polqual/polwithcheck carry the
     // expression text (what psql renders for \d). polroles NULL means "to all".
@@ -2258,13 +2365,15 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 UNION ALL SELECT 2618, r.oid, 0, 1259, r.ev_class, 0, 'i' FROM pg_rewrite r
 	 UNION ALL SELECT 2618, v.oid, 0, 1259, t.oid, 0, 'n'
 	 FROM pg_class v JOIN pg_namespace vn ON vn.oid = v.relnamespace
-	 JOIN pg_views pv ON pv.schemaname = vn.nspname AND pv.viewname = v.relname
+	 JOIN (SELECT schemaname, viewname, definition FROM pg_views
+	       UNION ALL SELECT schemaname, matviewname, definition FROM pg_matviews) pv
+	      ON pv.schemaname = vn.nspname AND pv.viewname = v.relname
 	 JOIN json_each(overlite_view_relations(pv.definition, '')) r
 	 JOIN pg_class t ON t.relname = substr(r.value, instr(r.value, '.') + 1) AND t.oid <> v.oid
 	 JOIN pg_namespace tn ON tn.oid = t.relnamespace
 	      AND (tn.nspname = substr(r.value, 1, instr(r.value, '.') - 1)
 	           OR (r.value LIKE '.%' AND tn.oid IN (vn.oid, 2200)))
-	 WHERE v.relkind = 'v'
+	 WHERE v.relkind IN ('v', 'm')
 	 UNION ALL SELECT 2616, o.oid, 0, 3079, CAST(x.rowid + 13000 AS INTEGER), 0, 'e'
 	 FROM pg_opclass o JOIN _overlite_extensions x ON x.extname = 'pg_trgm'
 	 WHERE o.opcname IN ('gin_trgm_ops', 'gist_trgm_ops')
@@ -2282,6 +2391,23 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
     // Settings of ALTER DATABASE ... SET and ALTER ROLE ... SET: none are kept.
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_db_role_setting AS
 	 SELECT 0 AS setdatabase, 0 AS setrole, NULL AS setconfig WHERE 0"#,
+    // GRANT ... ON PARAMETER is not kept: no parameter has privileges.
+    // The extensions CREATE EXTENSION takes (ddl/objects.rs EXTENSIONS), with
+    // Postgres' versions and descriptions, and the version made where it was.
+    r#"CREATE TEMP VIEW IF NOT EXISTS pg_available_extensions AS
+	 SELECT a.column1 AS name, a.column2 AS default_version,
+	        (SELECT e.extversion FROM pg_extension e WHERE e.extname = a.column1) AS installed_version,
+	        a.column3 AS comment
+	 FROM (VALUES ('plpgsql', '1.0', 'PL/pgSQL procedural language'),
+	              ('pgcrypto', '1.3', 'cryptographic functions'),
+	              ('uuid-ossp', '1.1', 'generate universally unique identifiers (UUIDs)'),
+	              ('hstore', '1.8', 'data type for storing sets of (key, value) pairs'),
+	              ('citext', '1.6', 'data type for case-insensitive character strings'),
+	              ('unaccent', '1.1', 'text search dictionary that removes accents'),
+	              ('pg_trgm', '1.6', 'text similarity measurement and index searching based on trigrams'),
+	              ('btree_gin', '1.3', 'support for indexing common datatypes in GIN'),
+	              ('btree_gist', '1.7', 'support for indexing common datatypes in GiST'),
+	              ('bloom', '1.0', 'bloom access method - signature file based index')) a"#,
     // GRANT ... ON PARAMETER is not kept: no parameter has privileges.
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_parameter_acl AS
 	 SELECT 0 AS oid, '' AS parname, NULL AS paracl WHERE 0"#,
@@ -2386,11 +2512,29 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 UNION ALL SELECT 13,'c',10,0,0,0,0,0,NULL
 	 UNION ALL SELECT 14,'sql',10,0,1,0,0,0,NULL
 	 UNION ALL SELECT 13545,'plpgsql',10,1,1,0,0,0,NULL"#,
+    // The settings current_setting answers, each at its value for the session.
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_settings AS
-	 SELECT '' AS name, '' AS setting, '' AS unit, '' AS category, '' AS short_desc,
-	        '' AS context, '' AS vartype, '' AS source, NULL AS min_val, NULL AS max_val,
-	        NULL AS enumvals, '' AS boot_val, '' AS reset_val
-	 WHERE 0"#,
+	 SELECT v.column1 AS name, current_setting(v.column1) AS setting, NULL AS unit,
+	        v.column2 AS category, v.column3 AS short_desc, NULL AS extra_desc,
+	        v.column4 AS context, v.column5 AS vartype, 'default' AS source, NULL AS min_val,
+	        NULL AS max_val, NULL AS enumvals, current_setting(v.column1) AS boot_val,
+	        current_setting(v.column1) AS reset_val, NULL AS sourcefile, NULL AS sourceline,
+	        0 AS pending_restart
+	 FROM (VALUES
+	   ('application_name', 'Reporting and Logging / What to Log', 'Sets the application name to be reported in statistics and logs.', 'user', 'string'),
+	   ('client_encoding', 'Client Connection Defaults / Locale and Formatting', 'Sets the client''s character set encoding.', 'user', 'string'),
+	   ('default_transaction_isolation', 'Client Connection Defaults / Statement Behavior', 'Sets the transaction isolation level of each new transaction.', 'user', 'enum'),
+	   ('integer_datetimes', 'Preset Options', 'Shows whether datetimes are integer based.', 'internal', 'bool'),
+	   ('is_superuser', 'Preset Options', 'Shows whether the current user is a superuser.', 'internal', 'bool'),
+	   ('max_identifier_length', 'Preset Options', 'Shows the maximum identifier length.', 'internal', 'integer'),
+	   ('max_index_keys', 'Preset Options', 'Shows the maximum number of index keys.', 'internal', 'integer'),
+	   ('search_path', 'Client Connection Defaults / Statement Behavior', 'Sets the schema search order for names that are not schema-qualified.', 'user', 'string'),
+	   ('server_encoding', 'Preset Options', 'Shows the server (database) character set encoding.', 'internal', 'string'),
+	   ('server_version', 'Preset Options', 'Shows the server version.', 'internal', 'string'),
+	   ('server_version_num', 'Preset Options', 'Shows the server version as an integer.', 'internal', 'integer'),
+	   ('standard_conforming_strings', 'Version and Platform Compatibility / Previous PostgreSQL Versions', 'Causes ''...'' strings to treat backslashes literally.', 'user', 'bool'),
+	   ('TimeZone', 'Client Connection Defaults / Locale and Formatting', 'Sets the time zone for displaying and interpreting time stamps.', 'user', 'string'),
+	   ('transaction_isolation', 'Client Connection Defaults / Statement Behavior', 'Sets the current transaction''s isolation level.', 'user', 'enum')) v"#,
     // Sequence metadata for \d <seq> and pg_dump (rows come from
     // _overlite_sequences; oids match the pg_class 'S' rows).
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_sequence AS

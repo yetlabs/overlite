@@ -1834,6 +1834,42 @@ impl<'a> Emitter<'a> {
                 }
                 return Ok(());
             }
+            // pg_available_extensions(): the relation of that name, its columns named
+            // by the alias's list (psql's \dx).
+            if let NodeEnum::FuncCall(f) = node(call)?
+                && func_name(f) == Some("pg_available_extensions")
+                && f.args.is_empty()
+                && !r.ordinality
+                && r.coldeflist.is_empty()
+            {
+                let cols = ["name", "default_version", "comment"];
+                let names: Vec<String> = match &r.alias {
+                    Some(a) if !a.colnames.is_empty() => a
+                        .colnames
+                        .iter()
+                        .map(|c| string(c).map(ident))
+                        .collect::<Result<_, _>>()?,
+                    _ => cols.iter().map(|c| (*c).to_string()).collect(),
+                };
+                if names.len() > cols.len() {
+                    return Err("FROM function with more columns than it has");
+                }
+                self.push("(SELECT ");
+                for (i, c) in cols.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.push(c);
+                    self.push(" AS ");
+                    self.push(names.get(i).map_or(*c, String::as_str));
+                }
+                self.push(" FROM pg_available_extensions)");
+                if let Some(a) = &r.alias {
+                    self.push(" AS ");
+                    self.push(&ident(&a.aliasname));
+                }
+                return Ok(());
+            }
             if r.ordinality || r.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) || !r.coldeflist.is_empty() {
                 return Err("FROM function with columns");
             }
@@ -4777,10 +4813,13 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// pg_get_viewdef: the view's query, as pg_views has it, found by the view's oid.
+    /// pg_get_viewdef: the view's query, as pg_views (or pg_matviews) has it, found by
+    /// the view's oid.
     fn viewdef(&mut self, oid: &NodeEnum) -> Out {
         self.push(
-            "(SELECT v.definition FROM pg_views v JOIN pg_class c ON c.relname = v.viewname AND c.relkind = 'v' \
+            "(SELECT v.definition FROM (SELECT schemaname, viewname, definition, 'v' AS kind FROM pg_views \
+             UNION ALL SELECT schemaname, matviewname, definition, 'm' FROM pg_matviews) v \
+             JOIN pg_class c ON c.relname = v.viewname AND c.relkind = v.kind \
              JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = v.schemaname WHERE c.oid = ",
         );
         self.expr(oid, Prec::Compare)?;
@@ -5642,6 +5681,42 @@ fn system_catalog_oid(name: &str) -> Option<&'static str> {
         "pg_policy" => "3256",
         "pg_database" => "1262",
         "pg_authid" => "1260",
+        "pg_extension" => "3079",
+        "pg_opclass" => "2616",
+        "pg_opfamily" => "2753",
+        "pg_am" => "2601",
+        "pg_operator" => "2617",
+        "pg_language" => "2612",
+        "pg_cast" => "2605",
+        "pg_collation" => "3456",
+        "pg_conversion" => "2607",
+        "pg_aggregate" => "2600",
+        "pg_tablespace" => "1213",
+        "pg_event_trigger" => "3466",
+        "pg_foreign_data_wrapper" => "2328",
+        "pg_foreign_server" => "1417",
+        "pg_default_acl" => "826",
+        "pg_ts_config" => "3602",
+        "pg_ts_dict" => "3600",
+        "pg_ts_parser" => "3601",
+        "pg_ts_template" => "3764",
+        "pg_statistic_ext" => "3381",
+        "pg_publication" => "6104",
+        "pg_subscription" => "6100",
+        "pg_transform" => "3576",
+        "pg_largeobject" => "2613",
+        "pg_largeobject_metadata" => "2995",
+        "pg_sequence" => "2224",
+        "pg_depend" => "2608",
+        "pg_shdepend" => "1214",
+        "pg_shdescription" => "2396",
+        "pg_enum" => "3501",
+        "pg_range" => "3541",
+        "pg_inherits" => "2611",
+        "pg_auth_members" => "1261",
+        "pg_db_role_setting" => "2964",
+        "pg_parameter_acl" => "6243",
+        "pg_init_privs" => "3394",
         _ => return None,
     })
 }

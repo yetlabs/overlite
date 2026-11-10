@@ -2,6 +2,7 @@
 //! `_overlite_grants` and table ownership in `_overlite_owners`. The protocol
 //! layer consults them before it runs a statement.
 
+use crate::catalog::schema::CATALOG_ROLE;
 use crate::catalog::schema::stored_table_name;
 use crate::error::{Error, Result, errf};
 use overlite_core::text::quote_literal;
@@ -466,18 +467,28 @@ pub(crate) fn role_visible(db: &Connection, a: &[Value]) -> Result<Value> {
 
 /// overlite_aclitem(grantee, privileges, grantor): one element of an aclitem[] as
 /// Postgres prints it, `carol=arw/postgres` (`=r/postgres` for PUBLIC), quoted as an
-/// array element when it has to be. privileges is a comma list of SELECT, INSERT,
-/// UPDATE and REFERENCES.
+/// array element when it has to be. privileges is a comma list of a table's
+/// privileges (ALL for each of them).
 pub(crate) fn aclitem(a: &[Value]) -> Result<Value> {
     let [Value::Text(grantee), Value::Text(privs), Value::Text(grantor)] = a else {
         return Ok(Value::Null);
     };
     let privs: Vec<String> = privs.split(',').map(|p| p.trim().to_uppercase()).collect();
-    let letters: String = [("INSERT", 'a'), ("SELECT", 'r'), ("UPDATE", 'w'), ("REFERENCES", 'x')]
-        .iter()
-        .filter(|(p, _)| privs.iter().any(|q| q == p))
-        .map(|(_, l)| *l)
-        .collect();
+    let all = privs.iter().any(|p| p == "ALL" || p == "ALL PRIVILEGES");
+    let letters: String = [
+        ("INSERT", 'a'),
+        ("SELECT", 'r'),
+        ("UPDATE", 'w'),
+        ("DELETE", 'd'),
+        ("TRUNCATE", 'D'),
+        ("REFERENCES", 'x'),
+        ("TRIGGER", 't'),
+        ("MAINTAIN", 'm'),
+    ]
+    .iter()
+    .filter(|(p, _)| all || privs.iter().any(|q| q == p))
+    .map(|(_, l)| *l)
+    .collect();
     let who = if grantee.eq_ignore_ascii_case("public") {
         String::new()
     } else {
@@ -492,6 +503,26 @@ pub(crate) fn aclitem(a: &[Value]) -> Result<Value> {
         )));
     }
     Ok(Value::Text(item))
+}
+
+/// acldefault(kind, owner): the privileges an object of that kind has before any GRANT
+/// or REVOKE, its owner's (the catalog's role) and PUBLIC's, as Postgres prints them.
+pub(crate) fn acldefault(a: &[Value]) -> Result<Value> {
+    let Some(Value::Text(kind)) = a.first() else {
+        return Ok(Value::Null);
+    };
+    let o = acl_name(&CATALOG_ROLE);
+    let items = match kind.as_str() {
+        "r" => vec![format!("{o}=arwdDxtm/{o}")],
+        "s" => vec![format!("{o}=rwU/{o}")],
+        "f" => vec![format!("=X/{o}"), format!("{o}=X/{o}")],
+        "l" | "T" => vec![format!("=U/{o}"), format!("{o}=U/{o}")],
+        "n" => vec![format!("{o}=UC/{o}")],
+        "d" => vec![format!("=Tc/{o}"), format!("{o}=CTc/{o}")],
+        "t" | "F" | "S" | "L" | "p" => vec![format!("{o}=U/{o}")],
+        _ => Vec::new(),
+    };
+    Ok(Value::Text(["{", &items.join(","), "}"].concat()))
 }
 
 /// A role name in an aclitem: bare when it is letters, digits and underscores

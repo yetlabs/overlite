@@ -234,7 +234,7 @@ than read unfiltered.
 | Feature | State |
 |---|---|
 | `SHOW`, `current_setting`, `SET` | partial: settings Overlite does not use read as empty |
-| `pg_settings` | no: empty |
+| `pg_settings` | partial: the settings `SHOW` answers |
 | `pg_stat_activity`, `pg_locks`, `pg_stat_*` | no |
 | `pg_size_pretty`, `pg_database_size`, `pg_typeof` | no |
 | Cancel requests | yes |

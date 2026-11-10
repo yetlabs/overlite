@@ -5122,7 +5122,7 @@ ok	SELECT x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversio
 ok	INSERT INTO t VALUES ('804', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('805', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('806', 'x') /*overlite typed*/
-ok	SELECT classid, objid, refobjid FROM pg_depend WHERE refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_extension' COLLATE NOCASE) AND deptype = 'e' ORDER BY 3 NULLS LAST /*overlite typed*/
+ok	SELECT classid, objid, refobjid FROM pg_depend WHERE refclassid = 3079 AND deptype = 'e' ORDER BY 3 NULLS LAST /*overlite typed*/
 ok	INSERT INTO t VALUES ('807', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('808', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('809', 'x') /*overlite typed*/
@@ -5409,7 +5409,7 @@ ok	INSERT INTO t VALUES ('1020', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1021', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1022', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1023', 'x') /*overlite typed*/
-ok	SELECT conrelid, confrelid FROM pg_constraint JOIN pg_depend ON objid = confrelid WHERE contype = 'f' AND refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_extension' COLLATE NOCASE) AND classid = 1259 /*overlite typed*/
+ok	SELECT conrelid, confrelid FROM pg_constraint JOIN pg_depend ON objid = confrelid WHERE contype = 'f' AND refclassid = 3079 AND classid = 1259 /*overlite typed*/
 ok	INSERT INTO t VALUES ('1024', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1025', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1026', 'x') /*overlite typed*/
@@ -5596,7 +5596,7 @@ ok	SELECT tableoid, oid, pnpubid, pnnspid FROM pg_publication_namespace /*overli
 ok	INSERT INTO t VALUES ('1181', 'x') /*overlite typed*/
 ok	SELECT count(*) AS "count" FROM pg_subscription WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database()) /*overlite typed int8*/
 ok	INSERT INTO t VALUES ('1182', 'x') /*overlite typed*/
-ok	SELECT classid, objid, refclassid, refobjid, deptype FROM pg_depend WHERE deptype <> 'p' AND deptype <> 'e' UNION ALL SELECT (SELECT oid FROM pg_class WHERE relname = 'pg_opfamily' COLLATE NOCASE) AS "classid", amopfamily AS "objid", refclassid, refobjid, deptype FROM pg_depend AS d, pg_amop AS o WHERE deptype NOT IN ('p', 'e', 'i') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amop' COLLATE NOCASE) AND objid = o.oid AND NOT (refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_opfamily' COLLATE NOCASE) AND amopfamily = refobjid) UNION ALL SELECT (SELECT oid FROM pg_class WHERE relname = 'pg_opfamily' COLLATE NOCASE) AS "classid", amprocfamily AS "objid", refclassid, refobjid, deptype FROM pg_depend AS d, pg_amproc AS p WHERE deptype NOT IN ('p', 'e', 'i') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amproc' COLLATE NOCASE) AND objid = p.oid AND NOT (refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_opfamily' COLLATE NOCASE) AND amprocfamily = refobjid) ORDER BY 1 NULLS LAST, 2 NULLS LAST /*overlite typed*/
+ok	SELECT classid, objid, refclassid, refobjid, deptype FROM pg_depend WHERE deptype <> 'p' AND deptype <> 'e' UNION ALL SELECT 2753 AS "classid", amopfamily AS "objid", refclassid, refobjid, deptype FROM pg_depend AS d, pg_amop AS o WHERE deptype NOT IN ('p', 'e', 'i') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amop' COLLATE NOCASE) AND objid = o.oid AND NOT (refclassid = 2753 AND amopfamily = refobjid) UNION ALL SELECT 2753 AS "classid", amprocfamily AS "objid", refclassid, refobjid, deptype FROM pg_depend AS d, pg_amproc AS p WHERE deptype NOT IN ('p', 'e', 'i') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amproc' COLLATE NOCASE) AND objid = p.oid AND NOT (refclassid = 2753 AND amprocfamily = refobjid) ORDER BY 1 NULLS LAST, 2 NULLS LAST /*overlite typed*/
 ok	INSERT INTO t VALUES ('1183', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1184', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1185', 'x') /*overlite typed*/
@@ -5907,7 +5907,7 @@ ok	SELECT setval('s', '퟿') AS "setval" /*overlite typed int8*/
 ok	ALTER TABLE t ADD COLUMN IF NOT EXISTS extra text
 ok	INSERT INTO t VALUES ('1343', 'x') /*overlite typed*/
 no	statement kind
-ok	SELECT amopstrategy, overlite_cast(amopopr, 'regoperator') AS "amopopr", opfname AS "sortfamily", nspname AS "sortfamilynsp" FROM pg_amop AS ao JOIN pg_depend ON classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amop' COLLATE NOCASE) AND objid = ao.oid LEFT JOIN pg_opfamily AS f ON f.oid = amopsortfamily LEFT JOIN pg_namespace AS n ON n.oid = opfnamespace WHERE refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_opclass' COLLATE NOCASE) AND refobjid = overlite_cast('16616', 'oid') AND amopfamily = overlite_cast('0', 'oid') ORDER BY amopstrategy NULLS LAST /*overlite typed*/
+ok	SELECT amopstrategy, overlite_cast(amopopr, 'regoperator') AS "amopopr", opfname AS "sortfamily", nspname AS "sortfamilynsp" FROM pg_amop AS ao JOIN pg_depend ON classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amop' COLLATE NOCASE) AND objid = ao.oid LEFT JOIN pg_opfamily AS f ON f.oid = amopsortfamily LEFT JOIN pg_namespace AS n ON n.oid = opfnamespace WHERE refclassid = 2616 AND refobjid = overlite_cast('16616', 'oid') AND amopfamily = overlite_cast('0', 'oid') ORDER BY amopstrategy NULLS LAST /*overlite typed*/
 no	statement kind
 ok	INSERT INTO t VALUES ('1344', 'x') /*overlite typed*/
 ok	DROP SCHEMA "퟿"
@@ -6364,7 +6364,7 @@ ok	INSERT INTO t VALUES ('1652', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1653', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1654', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1655', 'x') /*overlite typed*/
-ok	SELECT amprocnum, (SELECT proname FROM pg_proc WHERE oid = amproc) AS "amproc", (SELECT typname FROM pg_type WHERE oid = amproclefttype) AS "amproclefttype", (SELECT typname FROM pg_type WHERE oid = amprocrighttype) AS "amprocrighttype" FROM pg_amproc AS ap, pg_depend WHERE refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_opclass' COLLATE NOCASE) AND refobjid = overlite_cast('16616', 'oid') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amproc' COLLATE NOCASE) AND objid = ap.oid ORDER BY amprocnum NULLS LAST /*overlite typed*/
+ok	SELECT amprocnum, (SELECT proname FROM pg_proc WHERE oid = amproc) AS "amproc", (SELECT typname FROM pg_type WHERE oid = amproclefttype) AS "amproclefttype", (SELECT typname FROM pg_type WHERE oid = amprocrighttype) AS "amprocrighttype" FROM pg_amproc AS ap, pg_depend WHERE refclassid = 2616 AND refobjid = overlite_cast('16616', 'oid') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amproc' COLLATE NOCASE) AND objid = ap.oid ORDER BY amprocnum NULLS LAST /*overlite typed*/
 ok	INSERT INTO t VALUES ('1656', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1657', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1658', 'x') /*overlite typed*/
@@ -6538,7 +6538,7 @@ ok	INSERT INTO t VALUES ('1824', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1825', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1826', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1827', 'x') /*overlite typed*/
-ok	SELECT amopstrategy, overlite_cast(amopopr, 'regoperator') AS "amopopr", opfname AS "sortfamily", nspname AS "sortfamilynsp" FROM pg_amop AS ao JOIN pg_depend ON classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amop' COLLATE NOCASE) AND objid = ao.oid LEFT JOIN pg_opfamily AS f ON f.oid = amopsortfamily LEFT JOIN pg_namespace AS n ON n.oid = opfnamespace WHERE refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_opclass' COLLATE NOCASE) AND refobjid = overlite_cast('16595', 'oid') AND amopfamily = overlite_cast('0', 'oid') ORDER BY amopstrategy NULLS LAST /*overlite typed*/
+ok	SELECT amopstrategy, overlite_cast(amopopr, 'regoperator') AS "amopopr", opfname AS "sortfamily", nspname AS "sortfamilynsp" FROM pg_amop AS ao JOIN pg_depend ON classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amop' COLLATE NOCASE) AND objid = ao.oid LEFT JOIN pg_opfamily AS f ON f.oid = amopsortfamily LEFT JOIN pg_namespace AS n ON n.oid = opfnamespace WHERE refclassid = 2616 AND refobjid = overlite_cast('16595', 'oid') AND amopfamily = overlite_cast('0', 'oid') ORDER BY amopstrategy NULLS LAST /*overlite typed*/
 ok	INSERT INTO t VALUES ('1828', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1829', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1830', 'x') /*overlite typed*/
@@ -6577,7 +6577,7 @@ ok	INSERT INTO t VALUES ('1862', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1863', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1864', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1865', 'x') /*overlite typed*/
-ok	SELECT amprocnum, (SELECT proname FROM pg_proc WHERE oid = amproc) AS "amproc", (SELECT typname FROM pg_type WHERE oid = amproclefttype) AS "amproclefttype", (SELECT typname FROM pg_type WHERE oid = amprocrighttype) AS "amprocrighttype" FROM pg_amproc AS ap, pg_depend WHERE refclassid = (SELECT oid FROM pg_class WHERE relname = 'pg_opclass' COLLATE NOCASE) AND refobjid = overlite_cast('16595', 'oid') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amproc' COLLATE NOCASE) AND objid = ap.oid ORDER BY amprocnum NULLS LAST /*overlite typed*/
+ok	SELECT amprocnum, (SELECT proname FROM pg_proc WHERE oid = amproc) AS "amproc", (SELECT typname FROM pg_type WHERE oid = amproclefttype) AS "amproclefttype", (SELECT typname FROM pg_type WHERE oid = amprocrighttype) AS "amprocrighttype" FROM pg_amproc AS ap, pg_depend WHERE refclassid = 2616 AND refobjid = overlite_cast('16595', 'oid') AND classid = (SELECT oid FROM pg_class WHERE relname = 'pg_amproc' COLLATE NOCASE) AND objid = ap.oid ORDER BY amprocnum NULLS LAST /*overlite typed*/
 ok	INSERT INTO t VALUES ('1866', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1867', 'x') /*overlite typed*/
 ok	INSERT INTO t VALUES ('1868', 'x') /*overlite typed*/

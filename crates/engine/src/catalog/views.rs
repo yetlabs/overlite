@@ -115,8 +115,16 @@ pub(crate) fn dynamic_catalog_views(refs: &[SchemaRef], db_name: &str, enum_base
     let mut ns = String::from(
         "CREATE TEMP VIEW pg_namespace AS SELECT 11 AS oid,'pg_catalog' AS nspname,10 AS nspowner, 2615 AS tableoid, NULL AS nspacl UNION ALL SELECT 2201,'information_schema',10,2615,NULL",
     );
+    // The public schema's privileges are Postgres' own from the start (USAGE for
+    // everyone), which pg_dump compares with: another schema has the default, NULL.
+    let role = CATALOG_ROLE.replace('\'', "''");
     for r in refs {
-        ns.push_str(&format!(" UNION ALL SELECT {},'{}',10,2615,NULL", r.ns_oid, r.pg_name));
+        let acl = if r.pg_name == "public" {
+            format!("'{{{role}=UC/{role},=U/{role}}}'")
+        } else {
+            "NULL".to_string()
+        };
+        ns.push_str(&format!(" UNION ALL SELECT {},'{}',10,2615,{acl}", r.ns_oid, r.pg_name));
     }
 
     vec![
@@ -434,7 +442,14 @@ const PG_CLASS_TMPL: &str = concat!(
  COALESCE((SELECT enabled FROM _overlite_rls rls WHERE lower(rls.tablename)=lower(m.name)),0) AS relrowsecurity,
  COALESCE((SELECT forced FROM _overlite_rls rls WHERE lower(rls.tablename)=lower(m.name)),0) AS relforcerowsecurity,
  1 AS relispopulated, 'd' AS relreplident, 0 AS relispartition,
- NULL AS relacl, overlite_reloptions(m.sql) AS reloptions, NULL AS relpartbound, 0 AS relrewrite, 0 AS relminmxid
+ -- Who may do what: NULL until a GRANT, then the owner's and each grantee's, the
+ -- owner named as relowner names it.
+ (SELECT '{' || overlite_aclitem(@ROLE@, 'ALL', @ROLE@) || group_concat(',' || overlite_aclitem(gr, pr, @ROLE@), '') || '}'
+  FROM (SELECT min(g.grantee) AS gr, group_concat(g.privilege) AS pr
+        FROM _overlite_grants g
+        WHERE g.tablename = (CASE WHEN '@PG@' = 'public' THEN m.name ELSE '@PG@.' || substr(m.name, @PLEN@) END)
+        GROUP BY lower(g.grantee) ORDER BY min(g.rowid))) AS relacl,
+ overlite_reloptions(m.sql) AS reloptions, NULL AS relpartbound, 0 AS relrewrite, 0 AS relminmxid
 FROM @MASTER@ m
 WHERE m.type IN ('table','view','index') AND m.name NOT LIKE 'sqlite_%' AND m.name NOT GLOB '_overlite_*'
 UNION ALL
@@ -745,7 +760,7 @@ WHERE tbl.type='table' AND tbl.name NOT LIKE 'sqlite_%' AND tbl.name NOT GLOB '_
 const PG_MATVIEWS_TMPL: &str = r#"SELECT '@PG@' AS schemaname, substr(t.name,@PLEN@) AS matviewname,
  @ROLE@ AS matviewowner, NULL AS tablespace,
  EXISTS(SELECT 1 FROM @MASTER@ i WHERE i.type='index' AND i.tbl_name=t.name) AS hasindexes,
- 1 AS ispopulated, substr(v.sql, instr(upper(v.sql), ' AS ') + 4) AS definition
+ 1 AS ispopulated, overlite_view_body(v.sql, '@FILESCHEMA@') AS definition
 FROM @MASTER@ t JOIN @MASTER@ v ON v.type = 'view' AND v.name = '_overlite_mv_' || t.name
 WHERE t.type='table'"#;
 
