@@ -65,6 +65,10 @@ What is listed here and in Limits was checked against it; `SIGTERM`, bytes outsi
 UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
 
 - `COPY ... TO STDOUT` writes NULL as `\N`, so a NULL survives a dump and restore.
+  Each value is written as a DataRow's text gives it (tests/wire/copy.rs): an array as
+  `{...}`, a timestamptz with its offset in the session's zone, a bytea as `\x...`.
+  It wrote the stored form before, an array's JSON and a bare UTC time, which pg_dump
+  carried into a dump that Postgres could not restore.
 - Shutdown ends sessions first (5s at most, a session waiting out busy_timeout
   cannot be interrupted), so the last one out checkpoints the WAL and none is left
   behind. Clients see 57014, or a closed connection.

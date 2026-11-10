@@ -106,3 +106,32 @@ fn copy_keywords_not_in_a_literal() {
         .unwrap();
     assert_eq!(String::from_utf8(buf).unwrap(), "v\n");
 }
+
+// COPY TO writes each value as Postgres' text output does, which is what pg_dump
+// restores from: an array as `{...}`, not the JSON it is stored as, a timestamptz with
+// its offset, a bytea as `\x...`, a boolean as t or f.
+#[test]
+fn copy_to_writes_values_as_postgres_does() {
+    let conn = connect(&start_server());
+    must_exec(
+        &conn,
+        "CREATE TABLE c (tags text[], nums int[], at timestamptz, b bytea, ok boolean)",
+    );
+    must_exec(
+        &conn,
+        r"INSERT INTO c VALUES (ARRAY['a','b c'], '{1,2}', '2026-01-02 03:04:05.5+00', '\x00ff', true)",
+    );
+    let mut buf = Vec::new();
+    conn.copy_to(&mut buf, "COPY c TO STDOUT").unwrap();
+    assert_eq!(
+        String::from_utf8(buf).unwrap(),
+        "{a,\"b c\"}\t{1,2}\t2026-01-02 03:04:05.5+00\t\\\\x00ff\tt\n"
+    );
+    let mut buf = Vec::new();
+    conn.copy_to(&mut buf, "COPY (SELECT tags, at FROM c) TO STDOUT WITH (FORMAT csv)")
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(buf).unwrap(),
+        "\"{a,\"\"b c\"\"}\",2026-01-02 03:04:05.5+00\n"
+    );
+}

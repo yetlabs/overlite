@@ -161,7 +161,15 @@ impl Session {
         // CopyOutResponse: text format (0), one format code per column.
         self.c.send_copy_response(MSG_COPY_OUT_RESPONSE, rs.columns.len())?;
 
-        let w = new_copy_writer(cs);
+        // Each value as a DataRow's text gives it: an array as `{...}`, a timestamptz
+        // with its offset, a bytea as `\x...`, so a dump restores into Postgres.
+        let oids: Vec<overlite_core::Oid> = rs
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| crate::types::oid_for_column(col, &rs.rows, i))
+            .collect();
+        let w = CopyWriter { cs, oids: &oids };
         if cs.header {
             let names: Vec<String> = rs.columns.iter().map(|c| c.name.clone()).collect();
             self.c.send(MSG_COPY_DATA, &w.line(&names))?;
@@ -291,22 +299,26 @@ fn placeholders(n: usize) -> String {
 #[derive(Debug)]
 struct CopyWriter<'a> {
     cs: &'a CopyStmt,
-}
-
-fn new_copy_writer(cs: &CopyStmt) -> CopyWriter<'_> {
-    CopyWriter { cs }
+    /// The type of each column, which says how a value is written.
+    oids: &'a [overlite_core::Oid],
 }
 
 impl CopyWriter<'_> {
     /// Encodes one result row as a copy line (with trailing newline).
     fn row(&self, cells: &[Value]) -> Vec<u8> {
         let mut f: Vec<String> = Vec::with_capacity(cells.len());
-        for cell in cells {
+        for (i, cell) in cells.iter().enumerate() {
             if cell.is_null() {
                 f.push(self.cs.null.clone());
                 continue;
             }
-            f.push(value_to_text(cell));
+            f.push(match self.oids.get(i) {
+                Some(&oid) => match crate::types::encode_value(crate::types::Format::Text, oid, cell) {
+                    Ok(Some(b)) => text_from_bytes(&b).into_owned(),
+                    _ => value_to_text(cell),
+                },
+                None => value_to_text(cell),
+            });
         }
         if self.cs.csv {
             return self.line(&f);
