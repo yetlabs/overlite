@@ -1189,7 +1189,13 @@ fn describe(
     // values, or has an error of its own to report at Execute. And a set built from a
     // parameter holds what the probe made of it, which says nothing of the real one.
     let sampled = args.is_empty() || !intro.contains("overlite_elements");
-    let row = sampled && stmt.step().unwrap_or(false);
+    // A WITH whose statement writes is described as prepared, never run.
+    let writes = !rewritten
+        && !matches!(
+            leading_command(&intro).as_str(),
+            "SELECT" | "VALUES" | "PRAGMA" | "EXPLAIN"
+        );
+    let row = sampled && !writes && stmt.step().unwrap_or(false);
     let mut columns = make_columns(names, &decls, &hints, row.then_some(&stmt));
     apply_result_types(&mut columns, typed.as_deref());
     Ok(Some(columns))
@@ -1214,7 +1220,8 @@ pub(crate) fn resolve_names<'a>(sp: Option<&[String]>, st: &DbState, q: &Connect
 /// Whether a statement is expected to return rows.
 fn is_query(sql: &str) -> bool {
     match first_word(sql).as_str() {
-        "SELECT" | "WITH" | "PRAGMA" | "EXPLAIN" | "VALUES" | "SHOW" => return true,
+        "SELECT" | "PRAGMA" | "EXPLAIN" | "VALUES" | "SHOW" => return true,
+        "WITH" if matches!(leading_command(sql).as_str(), "SELECT" | "VALUES") => return true,
         _ => {}
     }
     // INSERT/UPDATE/DELETE ... RETURNING also yields rows.
@@ -1229,6 +1236,28 @@ fn leading_command(sql: &str) -> String {
     let fields: Vec<&str> = up.split_whitespace().collect();
     if fields.is_empty() {
         return String::new();
+    }
+    // WITH ...: the statement the CTEs are for, the first of its words outside them.
+    if fields[0] == "WITH" {
+        let code = blank_literals(&up);
+        let mut depth = 0i32;
+        let mut word = String::new();
+        for c in code.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_alphabetic() && depth == 0 {
+                word.push(c);
+                continue;
+            }
+            if matches!(word.as_str(), "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "VALUES") {
+                return word;
+            }
+            word.clear();
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        return "SELECT".to_string();
     }
     match fields[0] {
         // CREATE UNIQUE INDEX is CREATE INDEX, and CREATE TEMP TABLE is CREATE TABLE.
@@ -1428,6 +1457,12 @@ pub(crate) mod tests {
             ("create table t (a int)", "CREATE TABLE"),
             ("drop table t", "DROP TABLE"),
             ("create unique index i on t (a)", "CREATE INDEX"),
+            ("with x as (select 1) update t set a = 1", "UPDATE"),
+            (
+                "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r) SELECT * FROM r",
+                "SELECT",
+            ),
+            ("with o as materialized (select 'update') delete from t", "DELETE"),
         ] {
             assert_eq!(leading_command(sql), want, "leading_command({sql:?})");
         }

@@ -336,3 +336,102 @@ fn pg_typeof_pg_get_acl_and_gamma() {
         assert_eq!(err.pg().map(|e| e.message.as_str()), Some(message), "{q}");
     }
 }
+
+// RETURNING OLD and NEW (Postgres 18): the row before and after the write, by those
+// names or the ones RETURNING WITH gives. An UPDATE's old values are read from the
+// rows as they were before the first is written; a DELETE has no NEW and an INSERT no
+// OLD. Each answer is Postgres 18's.
+#[test]
+fn returning_old_and_new() {
+    let conn = connect(&start_server());
+    must_exec(&conn, "CREATE TABLE r (id int PRIMARY KEY, v int, s text)");
+    // Each row's cells joined with `:`, the rows with `,`: the statement runs once.
+    let all = |q: &str, cols: usize| -> String {
+        let rows = conn.query(q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        rows.iter()
+            .map(|r| {
+                (0..cols)
+                    .map(|c| {
+                        let cell = r.cell(c);
+                        if cell.is_null() {
+                            "NULL".to_string()
+                        } else {
+                            cell.text()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(":")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    assert_eq!(
+        all(
+            "INSERT INTO r VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c') RETURNING old.v, new.v, new.s",
+            3
+        ),
+        "NULL:10:a,NULL:20:b,NULL:30:c"
+    );
+    assert_eq!(
+        all(
+            "UPDATE r SET v = v + 1, s = s || 'x' WHERE id >= 2 RETURNING id, old.v, new.v, new.v - old.v, old.s, new.s",
+            6
+        ),
+        "2:20:21:1:b:bx,3:30:31:1:c:cx"
+    );
+    assert_eq!(
+        all(
+            "UPDATE r AS t SET v = 0 WHERE t.id = 1 RETURNING WITH (OLD AS o, NEW AS n) o.v, n.v, t.id",
+            3
+        ),
+        "10:0:1"
+    );
+    assert_eq!(
+        all("UPDATE r SET v = v * 2 RETURNING old.*, new.*", 6)
+            .split(',')
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(","),
+        "1:0:a:1:0:a,2:21:bx:2:42:bx,3:31:cx:3:62:cx"
+    );
+    assert_eq!(
+        all("DELETE FROM r WHERE id = 3 RETURNING old.id, new.id, old.v", 3),
+        "3:NULL:62"
+    );
+    // A parameter in the WHERE, read where the old rows are made and where they are
+    // written; through the extended protocol, the write runs once.
+    let (o, n): (i32, i32) = conn
+        .query_row("UPDATE r SET v = v + 1 WHERE id = $1 RETURNING old.v, new.v", &[&2])
+        .scan()
+        .unwrap();
+    assert_eq!((o, n), (42, 43));
+    assert_eq!(scan_str(&conn, "SELECT v FROM r WHERE id = 2"), "43");
+    // The labels are Postgres': a column of OLD or NEW is named for the column.
+    let rows = conn
+        .query(
+            "UPDATE r SET v = 7 WHERE id = 1 RETURNING old.v, new.v, new.v AS nv",
+            &[],
+        )
+        .unwrap();
+    let names: Vec<&str> = rows.field_descriptions().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["v", "v", "nv"]);
+    // A WITH before a write is described without running it (it ran twice), and
+    // tagged by its write.
+    let v: i32 = conn
+        .query_row(
+            "WITH x AS (SELECT 1) UPDATE r SET v = v + 1 WHERE id = $1 RETURNING v",
+            &[&2],
+        )
+        .scan()
+        .unwrap();
+    assert_eq!(v, 44);
+    assert_eq!(scan_str(&conn, "SELECT v FROM r WHERE id = 2"), "44");
+    let err = conn
+        .exec(
+            "INSERT INTO r VALUES (1, 1, 'z') ON CONFLICT (id) DO UPDATE SET v = 100 RETURNING old.v",
+            &[],
+        )
+        .expect_err("not provided");
+    assert_eq!(err.code(), "0A000");
+}

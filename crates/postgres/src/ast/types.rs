@@ -573,6 +573,13 @@ impl Typer {
     }
 
     /// Opens a query level whose relation is a write's target.
+    /// The names of a table's columns, in order, None for one the catalog does not have.
+    pub(crate) fn table_columns(&self, r: &pb::RangeVar) -> Option<Vec<String>> {
+        self.ctx
+            .table(&r.schemaname, &r.relname)
+            .map(|cols| cols.iter().map(|c| Col::of(c).name).collect())
+    }
+
     pub(crate) fn push_target(&mut self, r: &pb::RangeVar) {
         let mut rels = Vec::new();
         self.range_var(r, &mut rels);

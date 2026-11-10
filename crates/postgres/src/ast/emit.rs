@@ -400,6 +400,8 @@ struct Emitter<'a> {
     /// The alias of a written table and its name, which RETURNING reads it by: SQLite's
     /// RETURNING names the table alone.
     returning_table: Option<(String, String)>,
+    /// The OLD and NEW of the RETURNING being written (Postgres 18).
+    old_new: Option<OldNew>,
     /// Writing an expression of a table's DDL, which SQLite keeps in the file's
     /// schema: a cast there is SQLite's CAST (`table_ddl_cast`).
     table_ddl: bool,
@@ -671,6 +673,7 @@ impl<'a> Emitter<'a> {
             srf_aliases: Vec::new(),
             aliases: 0,
             returning_table: None,
+            old_new: None,
             table_ddl: false,
             ddl: false,
             whole_item: false,
@@ -2189,7 +2192,19 @@ impl<'a> Emitter<'a> {
         if let Some(c) = &s.on_conflict_clause {
             self.on_conflict(c)?;
         }
-        self.returning_with_alias(r, s.returning_clause.as_ref())?;
+        let old_new = self.old_new_of(s.returning_clause.as_ref(), r, WriteKind::Insert)?;
+        if old_new.is_some()
+            && s.on_conflict_clause
+                .as_ref()
+                .is_some_and(|c| c.action == pb::OnConflictAction::OnconflictUpdate as i32)
+        {
+            // The row a conflict finds is not kept apart from the one written.
+            return Err("RETURNING OLD/NEW of ON CONFLICT DO UPDATE");
+        }
+        self.old_new = old_new;
+        let out = self.returning_with_alias(r, s.returning_clause.as_ref());
+        self.old_new = None;
+        out?;
         self.leave_from();
         self.pop_scope();
         self.pop_with(ctes);
@@ -2249,14 +2264,145 @@ impl<'a> Emitter<'a> {
 
     fn returning(&mut self, r: Option<&pb::ReturningClause>) -> Out {
         let Some(r) = r else { return Ok(()) };
-        if !r.options.is_empty() {
-            return Err("RETURNING OLD/NEW");
-        }
         if r.exprs.is_empty() {
             return Ok(());
         }
         self.push(" RETURNING ");
-        self.targets(&r.exprs, true)
+        let Some(on) = self.old_new.clone() else {
+            return self.targets(&r.exprs, true);
+        };
+        // `old.*` and `new.*`: each column of the table, through the alias.
+        let mut items = Vec::with_capacity(r.exprs.len());
+        for e in &r.exprs {
+            let star = match node(e)? {
+                NodeEnum::ResTarget(t) => match boxed(t.val.as_deref())? {
+                    NodeEnum::ColumnRef(c)
+                        if c.fields.len() == 2 && matches!(node(&c.fields[1])?, NodeEnum::AStar(_)) =>
+                    {
+                        string(&c.fields[0]).ok().filter(|q| *q == on.old || *q == on.new)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(qual) = star else {
+                // An unnamed `old.v` is labelled v, as Postgres labels it, where SQLite
+                // would label what it is written as.
+                let mut e = e.clone();
+                if let Some(NodeEnum::ResTarget(t)) = e.node.as_mut()
+                    && t.name.is_empty()
+                    && let Some(NodeEnum::ColumnRef(c)) = t.val.as_deref().and_then(|v| v.node.as_ref())
+                    && let [q, col] = c.fields.as_slice()
+                    && string(q).is_ok_and(|q| q == on.old || q == on.new)
+                    && let Ok(col) = string(col)
+                {
+                    t.name = col.to_string();
+                }
+                items.push(e);
+                continue;
+            };
+            for col in &on.columns {
+                let field = |s: &str| pb::Node {
+                    node: Some(NodeEnum::String(pb::String { sval: s.to_string() })),
+                };
+                items.push(pb::Node {
+                    node: Some(NodeEnum::ResTarget(Box::new(pb::ResTarget {
+                        name: col.clone(),
+                        val: Some(Box::new(pb::Node {
+                            node: Some(NodeEnum::ColumnRef(pb::ColumnRef {
+                                fields: vec![field(qual), field(col)],
+                                location: -1,
+                            })),
+                        })),
+                        location: -1,
+                        ..Default::default()
+                    }))),
+                });
+            }
+        }
+        self.targets(&items, true)
+    }
+
+    /// The OLD and NEW a RETURNING names (by its WITH, or as `old` and `new`) where it
+    /// reads either, for a write of kind to the table r; None where it reads neither.
+    fn old_new_of(
+        &self,
+        ret: Option<&pb::ReturningClause>,
+        r: &pb::RangeVar,
+        kind: WriteKind,
+    ) -> Result<Option<OldNew>, Unsupported> {
+        let Some(ret) = ret else { return Ok(None) };
+        let (mut old, mut new) = ("old".to_string(), "new".to_string());
+        for o in &ret.options {
+            let NodeEnum::ReturningOption(o) = node(o)? else {
+                return Err("RETURNING option");
+            };
+            match pb::ReturningOptionKind::try_from(o.option) {
+                Ok(pb::ReturningOptionKind::ReturningOptionOld) => old.clone_from(&o.value),
+                Ok(pb::ReturningOptionKind::ReturningOptionNew) => new.clone_from(&o.value),
+                _ => return Err("RETURNING option"),
+            }
+        }
+        // A table named or aliased so is read by that name, as Postgres reads it.
+        let named = r.alias.as_ref().map_or(r.relname.as_str(), |a| a.aliasname.as_str());
+        if ret.options.is_empty() && (named == old || named == new) {
+            return Ok(None);
+        }
+        let mut reads = false;
+        for e in &ret.exprs {
+            let Some(n) = e.node.as_ref() else { continue };
+            for (n, ..) in n.nodes() {
+                if let pg_query::NodeRef::ColumnRef(c) = n
+                    && let Some(q) = c.fields.first().and_then(|f| string(f).ok())
+                    && (q == old || q == new)
+                {
+                    if c.fields.len() != 2 {
+                        return Err("RETURNING OLD or NEW as a whole row");
+                    }
+                    reads = true;
+                }
+            }
+        }
+        if !reads {
+            return Ok(None);
+        }
+        if !r.schemaname.is_empty() && r.schemaname != "public" {
+            return Err("RETURNING OLD/NEW of a table of another schema");
+        }
+        let columns = self.typer.as_ref().and_then(|t| t.table_columns(r)).unwrap_or_default();
+        Ok(Some(OldNew {
+            old,
+            new,
+            kind,
+            table: r.relname.clone(),
+            columns,
+        }))
+    }
+
+    /// A column of OLD or NEW, as SQLite reads it in a RETURNING; None for any other
+    /// column.
+    fn old_new_column(&mut self, c: &pb::ColumnRef) -> Result<Option<()>, Unsupported> {
+        let Some(on) = &self.old_new else { return Ok(None) };
+        let [q, col] = c.fields.as_slice() else { return Ok(None) };
+        let Ok(q) = string(q) else { return Ok(None) };
+        let is_old = q == on.old;
+        if !is_old && q != on.new {
+            return Ok(None);
+        }
+        let NodeEnum::String(col) = node(col)? else {
+            return Err("OLD or NEW star in an expression");
+        };
+        let col = ident(&col.sval);
+        let table = ident(&on.table);
+        let text = match (is_old, on.kind) {
+            (true, WriteKind::Insert) | (false, WriteKind::Delete) => "NULL".to_string(),
+            (true, WriteKind::Update) => format!(
+                "(SELECT \"_overlite_old\".{col} FROM \"_overlite_old\" WHERE \"_overlite_old\".\"_r\" = {table}.rowid)"
+            ),
+            _ => format!("{table}.{col}"),
+        };
+        self.push(&text);
+        Ok(Some(()))
     }
 
     /// The `a = x, b = y` of an UPDATE or an ON CONFLICT DO UPDATE, each value's
@@ -2352,6 +2498,30 @@ impl<'a> Emitter<'a> {
             s.where_clause.as_deref(),
         );
         let ctes = self.write_with(s.with_clause.as_ref())?;
+        let old_new = self.old_new_of(ret.as_ref(), r, WriteKind::Update)?;
+        if old_new.is_some() {
+            if s.with_clause.is_some() {
+                return Err("RETURNING OLD beside a WITH");
+            }
+            // The rows as they were, made before the first is written: the WHERE below
+            // reads them, and RETURNING finds each by its rowid.
+            self.push("WITH \"_overlite_old\" AS MATERIALIZED (SELECT rowid AS \"_r\", * FROM ");
+            self.range_var(r, true)?;
+            if s.from_clause.is_empty()
+                && let Some(w) = &s.where_clause
+            {
+                self.push_target(r);
+                self.enter_from(&[pb::Node {
+                    node: Some(NodeEnum::RangeVar(r.clone())),
+                }])?;
+                self.push(" WHERE ");
+                let out = self.expr(node(w)?, Prec::Or);
+                self.leave_from();
+                self.pop_scope();
+                out?;
+            }
+            self.push(") ");
+        }
         self.push("UPDATE ");
         self.range_var(r, true)?;
         if s.from_clause.is_empty() {
@@ -2378,9 +2548,25 @@ impl<'a> Emitter<'a> {
         }
         if let Some(w) = &s.where_clause {
             self.push(" WHERE ");
+            if old_new.is_some() {
+                self.push("(");
+            }
             self.expr(node(w)?, Prec::Or)?;
+            if old_new.is_some() {
+                self.push(") AND ");
+            }
+        } else if old_new.is_some() {
+            self.push(" WHERE ");
         }
-        self.returning_with_alias(r, ret.as_ref())?;
+        if old_new.is_some() {
+            let qual = r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname);
+            self.push(&ident(qual));
+            self.push(".rowid IN (SELECT \"_r\" FROM \"_overlite_old\")");
+        }
+        self.old_new = old_new;
+        let out = self.returning_with_alias(r, ret.as_ref());
+        self.old_new = None;
+        out?;
         self.renames.truncate(renamed);
         self.leave_from();
         self.pop_scope();
@@ -2441,7 +2627,10 @@ impl<'a> Emitter<'a> {
             &s.using_clause,
             s.where_clause.as_deref(),
         );
-        self.returning_with_alias(r, ret.as_ref())?;
+        self.old_new = self.old_new_of(ret.as_ref(), r, WriteKind::Delete)?;
+        let out = self.returning_with_alias(r, ret.as_ref());
+        self.old_new = None;
+        out?;
         self.renames.truncate(renamed);
         self.leave_from();
         self.pop_scope();
@@ -2504,6 +2693,7 @@ impl<'a> Emitter<'a> {
 
     fn expr_bare(&mut self, n: &NodeEnum) -> Out {
         match n {
+            NodeEnum::ColumnRef(c) if self.old_new_column(c)?.is_some() => Ok(()),
             NodeEnum::ColumnRef(c) => {
                 // A column of a catalog relation named with its schema: the relation as
                 // `catalog_relation` writes it, then the column.
@@ -5165,6 +5355,25 @@ fn sublink_op(s: &pb::SubLink) -> Option<&str> {
         [n] => string(n).ok(),
         _ => None,
     }
+}
+
+/// What a RETURNING's OLD and NEW are written for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// The OLD and NEW of a RETURNING: their names, the write, its table and the table's
+/// columns (for `old.*` and `new.*`).
+#[derive(Debug, Clone)]
+struct OldNew {
+    old: String,
+    new: String,
+    kind: WriteKind,
+    table: String,
+    columns: Vec<String>,
 }
 
 /// A set-returning function of a FROM, as the engine walks it (`range_function`).

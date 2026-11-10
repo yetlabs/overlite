@@ -682,6 +682,16 @@ hold:
   still not taken, and psql's `\d+` shows no Options line: it concatenates reloptions
   with another array, and the typing does not know a catalog column for an array.
 
+- RETURNING OLD and NEW (18), by those names or by RETURNING WITH (OLD AS o, NEW AS
+  n), `old.*` and `new.*` included (`returning_old_and_new`). An INSERT's OLD is NULL
+  and a DELETE's NEW. An UPDATE's OLD is read from a CTE of the rows it is to write,
+  `WITH "_overlite_old" AS MATERIALIZED (SELECT rowid AS _r, * FROM t WHERE ...)`, which
+  the UPDATE's WHERE reads too (`AND t.rowid IN (SELECT _r FROM "_overlite_old")`), so
+  SQLite makes it before the first row is written; RETURNING finds a row's old values
+  by its rowid. An UPDATE ... FROM makes it of the whole table. A WITH before a write
+  is tagged by the write (it was tagged WITH, with no row count), and Describe of one
+  prepares it and no longer runs it: an extended-protocol `WITH ... UPDATE ...
+  RETURNING` was written twice.
 - pg_typeof(x) names the type the statement's typing gives x (an enum column, which
   the typing does not know, is `text`; an expression it does not type is named by the
   value SQLite holds). pg_get_acl (18) gives a table's, a column's or a schema's
@@ -708,8 +718,10 @@ hold:
 Still not done: `\sf` prints the CREATE FUNCTION as written; `\dn+` names the public
 schema's owner `postgres` where Postgres 18 says pg_database_owner.
 has_largeobject_privilege is missing (there are no large objects).
-RETURNING OLD/NEW (18) is refused: the parser reads `old.v` as a table that is not
-there. Overlite still reports server_version 16.0: psql and pg_dump 18 then use their
+RETURNING OLD/NEW of an INSERT ... ON CONFLICT DO UPDATE is 0A000 (the row the
+conflict found is not kept apart from the one written), and so is OLD in an UPDATE
+that has a WITH of its own, of a table of another schema, or a whole row (`old`).
+MERGE is not translated at all (0A000), so neither is its RETURNING. Overlite still reports server_version 16.0: psql and pg_dump 18 then use their
 queries for 16, which the catalogs answer; reporting 18 would have them read 18's
 columns (pg_constraint's NOT NULL rows, conenforced and the like) that are not here, so
 it was left at 16. A nested `ARRAY[[1,2],[3,4]]` literal is not typed as an array.
