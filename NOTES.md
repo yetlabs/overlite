@@ -682,6 +682,16 @@ hold:
   still not taken, and psql's `\d+` shows no Options line: it concatenates reloptions
   with another array, and the typing does not know a catalog column for an array.
 
+- A jsonb[]'s (and a json[]'s) elements are jsonb: a subscript, an unnest (in FROM,
+  reading the tables on its left, or in a select list) and `->` read them as jsonb and
+  send them as jsonb, and the column goes out as jsonb[] in Postgres' text form
+  (`jsonb_array_elements_are_jsonb`). An element is held as its JSON text, a string of
+  the stored JSON array, as the array's text form and a client give it; ARRAY[...] of
+  jsonb writes it so (`overlite_json_text`), where it held SQLite's JSON value, whose
+  object came out as `""`. A row so held reads the same, as does one from before, but
+  for a jsonb string ARRAY[] held as a bare JSON string (`"x"` held as `x`), which
+  reads as the JSON text it spells. An object element of any array goes out as its
+  JSON text, where it went out empty.
 - A range's intersection (`*`), union (`+`, 22000 where the two neither overlap nor
   touch) and difference (`-`, 22000 where it would leave two pieces) are Postgres'
   range_intersect, range_union and range_minus over the type's bounds, made canonical
@@ -904,8 +914,7 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
   `ARRAY[[...]]` literal is not typed as an array, so it goes out as JSON text.
 - Arrays (silent): ARRAY_AGG goes out as text (OID 25) with FILTER, a window or ORDER BY,
   `<` and `>` of arrays compare the JSON text outside a typed statement (ARRAY_AGG is
-  not in the AST slice yet), `&&` in HAVING over ARRAY_AGG finds nothing. A jsonb[]
-  holds its elements as strings, so a subscript of one is text. A slice followed by a
+  not in the AST slice yet), `&&` in HAVING over ARRAY_AGG finds nothing. A slice followed by a
   subscript (`g[1:1][2]`) takes the subscript as an index, where Postgres takes every
   subscript of it as a slice. An int[][] stored before `int[][]` was read as an array of
   ints holds its elements as strings. hstore[]::text writes its elements as JSON

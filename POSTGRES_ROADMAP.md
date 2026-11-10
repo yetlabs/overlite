@@ -159,7 +159,7 @@ no equivalent; use `DELETE`.
 | `numeric` with exact arithmetic at PostgreSQL's scale | yes |
 | date, time, timestamp, timestamptz with the session's time zone, `interval` | yes |
 | json, jsonb and their operators | yes |
-| arrays | partial: a `jsonb[]` keeps its elements as strings (planned) |
+| arrays | yes |
 | enums, `hstore` | yes |
 | ranges | partial: a statement's Describe reports a range column as text (planned) |
 | identity columns, serial, sequences, generated stored columns | partial: a key's next id follows the highest row |
@@ -311,7 +311,7 @@ NOTES.md lists the rest, each held to PostgreSQL 17's answer in the wire tests.
 
 Only what has work recorded against it:
 
-- **What the framework test suite found and is not done yet** (NOTES.md): `jsonb[]` elements kept as strings; instants past the year 9999
+- **What the framework test suite found and is not done yet** (NOTES.md): instants past the year 9999
   compared as text; tsquery `&&`, `||` and `!!`; `DISTINCT ON` with `LIMIT` and
   `OFFSET`; a bytea column default; catalog details (an index's access
   method, collations, serial `column_default`, the sequence of a renamed serial);

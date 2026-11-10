@@ -1587,6 +1587,14 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         Ok(range_op(&a[0].to_string(), &a[1].to_string(), &a[2].to_string())
             .map_or(Value::Null, |b| Value::Int(bool_int(b))))
     })?;
+    // A json value as plain text, without SQLite's JSON subtype: what json_array keeps
+    // as a string rather than embedding (a jsonb[] element).
+    scalar(conn, "overlite_json_text", 1, |a| {
+        Ok(match &a[0] {
+            Value::Null => Value::Null,
+            v => Value::Text(v.to_string()),
+        })
+    })?;
     scalar(conn, "overlite_range_setop", 4, |a| {
         if a.len() < 4 || a[..3].iter().any(Value::is_null) {
             return Ok(Value::Null);

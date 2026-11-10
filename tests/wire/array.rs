@@ -404,3 +404,69 @@ fn any_of_an_array_parameter_in_text() {
     assert_eq!(ids("SELECT id FROM an WHERE id = ANY($1) ORDER BY id", "[3]"), ["3"]);
     assert_eq!(ids("SELECT id FROM an WHERE id = ANY($1)", "{}"), Vec::<String>::new());
 }
+
+// A jsonb[]'s elements are jsonb: a subscript, an unnest and `->` read them as jsonb,
+// they go out as jsonb, and the array goes out in Postgres' text form, each element's
+// JSON text quoted. Each element is held as its JSON text; rows held as SQLite's JSON
+// values (ARRAY[...] wrote them so) or as strings of JSON text (the array's text form)
+// read the same. The answers are Postgres 18's.
+#[test]
+fn jsonb_array_elements_are_jsonb() {
+    let dir = temp_dir();
+    let path = dir.path().join("test.db");
+    let server = start_server_on(&path, 0);
+    let conn = connect(&server);
+    must_exec(&conn, "CREATE TABLE ja (id int, docs jsonb[])");
+    must_exec(
+        &conn,
+        "INSERT INTO ja VALUES (1, ARRAY['{\"a\": 1}'::jsonb, '\"x\"'::jsonb, '123'::jsonb, 'null'::jsonb, NULL])",
+    );
+    must_exec(&conn, r#"INSERT INTO ja VALUES (2, '{"{\"c\": 3}","\"s\"",null}')"#);
+    // As an older server held them: SQLite's JSON values, and strings of JSON text.
+    must_exec(&conn, "INSERT INTO ja VALUES (3, NULL), (4, NULL)");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        r#"UPDATE ja SET docs = '[{"a":1},{"b":[2,3]}]' WHERE id = 3;
+           UPDATE ja SET docs = '["{\"c\": 3}","[1, 2]"]' WHERE id = 4;"#,
+    )
+    .unwrap();
+    drop(db);
+    for (q, want) in [
+        (
+            "SELECT docs FROM ja WHERE id = 1",
+            r#"{"{\"a\": 1}","\"x\"",123,"null",NULL}"#,
+        ),
+        (
+            "SELECT docs::text FROM ja WHERE id = 2",
+            r#"{"{\"c\": 3}","\"s\"",NULL}"#,
+        ),
+        ("SELECT docs[1] -> 'a' FROM ja WHERE id = 1", "1"),
+        (
+            "SELECT jsonb_typeof(docs[2]) || ',' || jsonb_typeof(docs[3]) || ',' || jsonb_typeof(docs[4]) FROM ja WHERE id = 1",
+            "string,number,null",
+        ),
+        ("SELECT docs[2] = '\"x\"'::jsonb FROM ja WHERE id = 1", "t"),
+        ("SELECT docs[1] ->> 'c' FROM ja WHERE id = 2", "3"),
+        ("SELECT pg_typeof(docs[1]) FROM ja WHERE id = 1", "jsonb"),
+        (
+            "SELECT string_agg(u::text, ' ' ORDER BY n) FROM ja, unnest(docs) WITH ORDINALITY AS x(u, n) WHERE id = 1",
+            "{\"a\": 1} \"x\" 123 null",
+        ),
+        (
+            "SELECT pg_typeof(u) FROM ja, unnest(docs) u WHERE id = 1 LIMIT 1",
+            "jsonb",
+        ),
+        ("SELECT docs FROM ja WHERE id = 3", r#"{"{\"a\":1}","{\"b\":[2,3]}"}"#),
+        ("SELECT docs[2] -> 'b' -> 1 FROM ja WHERE id = 3", "3"),
+        ("SELECT docs[1] -> 'c' FROM ja WHERE id = 4", "3"),
+        ("SELECT jsonb_typeof(docs[2]) FROM ja WHERE id = 4", "array"),
+    ] {
+        assert_eq!(scan_str(&conn, q), want, "{q}");
+    }
+    // The wire types: jsonb[] for the column, jsonb for an element.
+    let rows = conn
+        .query("SELECT docs, docs[1], unnest(docs) FROM ja WHERE id = 1", &[])
+        .unwrap();
+    let oids: Vec<u32> = rows.field_descriptions().iter().map(|f| f.data_type_oid).collect();
+    assert_eq!(oids, [3807, 3802, 3802]);
+}

@@ -237,6 +237,8 @@ impl Ty {
             // to SQLite: the mark is what says what it is.
             t if t.is(Base::Uuid) => "uuid",
             t if t.is(Base::Timestamptz) => "timestamptz",
+            // A jsonb (an element of a jsonb[] among them) is text to SQLite.
+            t if t.is(Base::Jsonb) => "jsonb",
             _ => "",
         }
     }
@@ -651,6 +653,9 @@ impl Typer {
                         Ty::ANY
                     }
                 };
+                // Its arguments read the relations on its left (LATERAL), as Postgres
+                // reads them.
+                self.scopes.push(rels.clone());
                 let mut tys: Vec<Ty> = match srf.name {
                     "unnest" => (0..srf.args.len())
                         .map(|k| {
@@ -669,6 +674,7 @@ impl Typer {
                     n if n.ends_with("_text") => vec![Ty::TEXT],
                     _ => vec![jsonish(self)],
                 };
+                self.scopes.pop();
                 tys.push(Ty::of(Base::Int8));
                 let cols: Vec<Col> = srf
                     .names
@@ -1099,6 +1105,11 @@ impl Typer {
                 }
             }
             "array_agg" => array_of(arg(0, self)),
+            // In a select list, one array's elements, of its element type.
+            "unnest" if args.len() == 1 => {
+                let t = arg(0, self);
+                if t.array { Ty::of(t.base) } else { Ty::ANY }
+            }
             "array_cat" | "array_append" | "array_remove" | "array_replace" | "array_sort" | "array_reverse" => {
                 let t = arg(0, self);
                 if t.array { t } else { Ty::ANY }

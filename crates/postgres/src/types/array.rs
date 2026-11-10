@@ -92,6 +92,11 @@ pub(crate) fn array_oid_for_decl(decl: &str) -> Oid {
     if eq_fold(elem.trim_matches('"'), "hstore") {
         return OID_HSTORE_ARR;
     }
+    match elem.trim_matches('"').to_ascii_lowercase().as_str() {
+        "jsonb" => return OID_JSONB_ARR,
+        "json" => return OID_JSON_ARR,
+        _ => {}
+    }
     let oid = oid_from_decl_type(elem);
     if oid == OID_TIMESTAMPTZ {
         OID_TIMESTAMPTZ_ARR
@@ -136,10 +141,25 @@ pub(crate) fn json_array_to_pg_text(oid: Oid, v: &Value) -> Vec<u8> {
             let elem = array_elem_oid(oid);
             pg_array_text(&in_session_zone(arr, elem)).into_bytes()
         }
+        Some(Json::Arr(arr)) if matches!(oid, OID_JSONB_ARR | OID_JSON_ARR) => {
+            pg_array_text(&json_elements(arr)).into_bytes()
+        }
         Some(Json::Arr(arr)) => pg_array_text(&arr).into_bytes(),
         Some(Json::Null) => b"{}".to_vec(),
         _ => text_to_bytes(&s).into_owned(),
     }
+}
+
+/// The elements of a json or jsonb array, each as its JSON text: an element is held
+/// as that text, a string, as Postgres' text form and a client give it, or (as ARRAY[]
+/// made it before) as the JSON value itself.
+pub(crate) fn json_elements(arr: Vec<Json>) -> Vec<Json> {
+    arr.into_iter()
+        .map(|j| match j {
+            Json::Str(_) | Json::Null => j,
+            other => Json::Str(json_marshal(&other)),
+        })
+        .collect()
 }
 
 /// The elements of a timestamptz or tstzrange array as their text in the session's

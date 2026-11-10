@@ -2852,8 +2852,28 @@ impl<'a> Emitter<'a> {
             }
             // ARRAY[...] is the JSON array an array is stored as.
             NodeEnum::AArrayExpr(arr) => {
+                // A json or jsonb element is held as its JSON text, as the array's text
+                // form and a client give it, so that a string is told from the text of
+                // another value.
+                let json = arr.elements.iter().any(|e| {
+                    node(e).is_ok_and(|e| {
+                        let t = self.ty(e);
+                        t.is(Base::Jsonb) || t.is(Base::Json)
+                    })
+                });
                 self.push("json_array(");
-                self.list(&arr.elements, Self::expr_node)?;
+                if json {
+                    for (i, e) in arr.elements.iter().enumerate() {
+                        if i > 0 {
+                            self.push(", ");
+                        }
+                        self.push("overlite_json_text(");
+                        self.expr(node(e)?, Prec::Or)?;
+                        self.push(")");
+                    }
+                } else {
+                    self.list(&arr.elements, Self::expr_node)?;
+                }
                 self.push(")");
                 Ok(())
             }

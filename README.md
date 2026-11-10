@@ -71,7 +71,6 @@ meet:
   numeric out of an unknown function against a number.
 - 🟡 **Ranges**: a range column is described as `text` before the statement runs (its
   rows go out as the range type).
-- 🟡 **Arrays**: a `jsonb[]` keeps its elements as strings.
 - 🟡 **Timestamps past the year 9999** compare as text, before every earlier year.
 - 🟡 **Identity and serial keys** are SQLite rowids: the next id follows the highest
   row, even one inserted with an explicit id.

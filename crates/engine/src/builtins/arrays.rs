@@ -278,7 +278,8 @@ fn pg_array_elem(e: &Json) -> String {
         Json::Num(x) => overlite_core::format_float(*x),
         Json::Str(x) => quote_pg_array_elem(x),
         Json::Arr(x) => pg_array_text(x),
-        Json::Obj(_) => quote_pg_array_elem(""),
+        // An object is a json value's: its text.
+        Json::Obj(_) => quote_pg_array_elem(&crate::builtins::json::json_marshal(e)),
     }
 }
 
