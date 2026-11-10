@@ -572,6 +572,27 @@ UTF-8, zone offsets, quoting, JSON, regexes and pg_hba YAML otherwise match it.
   ALTER COLUMN TYPE of a serial key keeps the rowid; a Describe of a portal reports the
   formats it was bound with (psycopg's binary cursor read binary rows as text).
 
+## Postgres 18
+
+Held to postgres:18-alpine, with its psql, pg_dump, pg_dumpall, pg_restore and pgbench
+as clients (tests/wire/pg18.rs).
+
+- uuidv7([shift interval]) makes a version 7 UUID whose first 48 bits are the Unix time
+  in milliseconds and next 12 the fraction of the millisecond; as in Postgres, one made
+  later by the server sorts after the one before, within a millisecond too (a shared
+  counter steps past a clock that has not moved). uuidv4() is gen_random_uuid().
+  uuid_extract_version and uuid_extract_timestamp (versions 1 and 7) read them back. A
+  UUID or an instant a function gives goes out as uuid or timestamptz where the
+  statement's typing knows the function (the result-column mark), where before it was
+  text.
+- casefold() is lower(): under a libc locale, as here, so is Postgres'; only the ICU
+  and builtin providers fold `ß` to `ss`.
+- crc32 and crc32c of a bytea; array_sort and array_reverse (see Limits for the order of
+  strings).
+- A generated column without STORED is virtual, as in Postgres 18, and was already so
+  in SQLite: pg_attribute.attgenerated now says 'v' for it, so psql and pg_dump 18 write
+  it back without STORED.
+
 ## Limits
 
 Intentional, each for a case not worth more code. Grouped by what a client sees, the

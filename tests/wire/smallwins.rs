@@ -383,7 +383,7 @@ fn uuid_type_and_generators() {
     // A non-deterministic generator yields a fresh value per row.
     let rows = query_column(
         &conn,
-        "SELECT gen_random_uuid() FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3)",
+        "SELECT gen_random_uuid()::text FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3)",
         0,
     );
     assert_eq!(rows.len(), 3);

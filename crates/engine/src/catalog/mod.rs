@@ -581,8 +581,16 @@ fn int(b: bool) -> Result<Value> {
 
 /// Registers everything on a new connection: SQLite functions are per connection.
 pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
-    for name in ["gen_random_uuid", "uuid_generate_v4"] {
+    for name in ["gen_random_uuid", "uuid_generate_v4", "uuidv4"] {
         scalar_nd(conn, name, 0, |_| Ok(Value::Text(new_uuid_v4()?)))?;
+    }
+    {
+        use crate::builtins::uuid as u;
+        scalar_nd(conn, "uuidv7", -1, u::uuidv7)?;
+        scalar(conn, "uuid_extract_version", 1, |a| Ok(u::uuid_extract_version(a)))?;
+        scalar(conn, "uuid_extract_timestamp", 1, |a| Ok(u::uuid_extract_timestamp(a)))?;
+        scalar(conn, "crc32", 1, |a| Ok(u::crc32(a)))?;
+        scalar(conn, "crc32c", 1, |a| Ok(u::crc32c(a)))?;
     }
 
     // Exact numeric: a collation that compares decimal text numerically, plus
@@ -1350,6 +1358,14 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             return Ok(bound_value(r.lo.as_ref()));
         }
         Ok(Value::Text(lower_chars(&s)))
+    })?;
+    // casefold (Postgres 18) folds case for caseless matching. Under a libc locale, as
+    // here, that is lower(): only the ICU and builtin providers fold `ß` to `ss`.
+    scalar(conn, "casefold", 1, |a| {
+        if a.is_empty() || a[0].is_null() {
+            return Ok(Value::Null);
+        }
+        Ok(Value::Text(lower_chars(&a[0].to_string())))
     })?;
     scalar(conn, "upper", 1, |a| {
         if a.is_empty() || a[0].is_null() {

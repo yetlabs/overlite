@@ -224,6 +224,10 @@ impl Ty {
             t if t.is(Base::Int8) => "int8",
             // A comparison or a test is a boolean whatever SQLite's 1 or 0 says.
             t if t.is(Base::Bool) => "bool",
+            // A function's uuid or instant (uuidv7(), uuid_extract_timestamp()) is text
+            // to SQLite: the mark is what says what it is.
+            t if t.is(Base::Uuid) => "uuid",
+            t if t.is(Base::Timestamptz) => "timestamptz",
             _ => "",
         }
     }
@@ -1113,9 +1117,13 @@ impl Typer {
             | "obj_description"
             | "col_description"
             | "set_config"
-            | "pg_encoding_to_char" => Ty::TEXT,
+            | "pg_encoding_to_char"
+            | "casefold" => Ty::TEXT,
             "current_database" | "current_schema" => Ty::of(Base::Name),
-            "gen_random_uuid" | "uuid_generate_v4" => Ty::of(Base::Uuid),
+            "gen_random_uuid" | "uuid_generate_v4" | "uuidv4" | "uuidv7" => Ty::of(Base::Uuid),
+            "uuid_extract_version" => Ty::of(Base::Int2),
+            "uuid_extract_timestamp" => Ty::of(Base::Timestamptz),
+            "crc32" | "crc32c" => Ty::of(Base::Int8),
             "array_length" | "array_upper" | "array_lower" | "cardinality" | "json_array_length"
             | "jsonb_array_length" | "position" => Ty::of(Base::Int4),
             "regexp_split_to_array" | "string_to_array" | "akeys" | "avals" => Ty {

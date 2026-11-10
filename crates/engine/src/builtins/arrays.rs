@@ -332,33 +332,6 @@ pub(crate) fn array_slice(a: &[Value]) -> Value {
     Value::Text(crate::builtins::json::json_marshal(&Json::Arr(kept)))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn array_as_json_cases() {
-        for (v, want) in [
-            ("{1,2}", "[1,2]"),
-            (
-                r#"{a,"b,c","d\"e", f ,NULL,"NULL"}"#,
-                r#"["a","b,c","d\"e","f",null,"NULL"]"#,
-            ),
-            (r#"{"{x}"}"#, r#"["{x}"]"#),
-            ("[1, 2]", "[1, 2]"),
-            ("1 2", "[1,2]"),
-            ("{}", "[]"),
-        ] {
-            assert_eq!(
-                array_as_json(&Value::Text(v.to_string())),
-                Value::Text(want.to_string()),
-                "{v}"
-            );
-        }
-        assert_eq!(array_as_json(&Value::Text("abc".to_string())), Value::Null);
-    }
-}
-
 /// The elements of an array, in either form one is stored or given in: None when the
 /// value is not an array.
 fn elements(v: &Value) -> Option<Vec<Json>> {
@@ -544,4 +517,31 @@ pub(crate) fn array_ndims(a: &[Value]) -> Value {
         }
     }
     if n == 0 { Value::Null } else { Value::Int(n) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_as_json_cases() {
+        for (v, want) in [
+            ("{1,2}", "[1,2]"),
+            (
+                r#"{a,"b,c","d\"e", f ,NULL,"NULL"}"#,
+                r#"["a","b,c","d\"e","f",null,"NULL"]"#,
+            ),
+            (r#"{"{x}"}"#, r#"["{x}"]"#),
+            ("[1, 2]", "[1, 2]"),
+            ("1 2", "[1,2]"),
+            ("{}", "[]"),
+        ] {
+            assert_eq!(
+                array_as_json(&Value::Text(v.to_string())),
+                Value::Text(want.to_string()),
+                "{v}"
+            );
+        }
+        assert_eq!(array_as_json(&Value::Text("abc".to_string())), Value::Null);
+    }
 }

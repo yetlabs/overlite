@@ -16,3 +16,4 @@ pub(crate) mod ranges;
 pub(crate) mod regex;
 pub(crate) mod srf;
 pub(crate) mod temporal;
+pub(crate) mod uuid;

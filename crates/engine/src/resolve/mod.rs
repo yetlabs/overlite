@@ -48,6 +48,8 @@ pub(crate) fn apply_result_types(columns: &mut [overlite_core::Column], types: O
                 c.decl_type = ["PG_", &t.to_ascii_uppercase()].concat();
             }
             None if *t == "bool" => c.decl_type = "BOOL".to_string(),
+            None if *t == "uuid" => c.decl_type = "UUID".to_string(),
+            None if *t == "timestamptz" => c.decl_type = "TIMESTAMPTZ".to_string(),
             None => {}
         }
     }

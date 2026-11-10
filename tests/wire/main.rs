@@ -103,6 +103,7 @@ mod parity_numeric;
 mod parity_regex;
 mod parity_shutdown;
 mod pgcatalog;
+mod pg18;
 mod pgdump;
 mod portal_fetch;
 mod postgres;

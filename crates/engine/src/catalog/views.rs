@@ -445,7 +445,7 @@ const PG_ATTRIBUTE_TMPL: &str = r#"SELECT CAST(m.rowid + @OFF@ AS INTEGER) AS at
  CASE WHEN ti."notnull"=1 OR ti.pk>0 THEN 1 ELSE 0 END AS attnotnull,
  CASE WHEN ti.dflt_value IS NOT NULL THEN 1 ELSE 0 END AS atthasdef,
  0 AS atthasmissing, overlite_attidentity(m.sql, ti.name) AS attidentity,
- CASE WHEN ti.hidden IN (2, 3) THEN 's' ELSE '' END AS attgenerated, 0 AS attisdropped, 1 AS attislocal,
+ CASE ti.hidden WHEN 2 THEN 'v' WHEN 3 THEN 's' ELSE '' END AS attgenerated, 0 AS attisdropped, 1 AS attislocal,
  0 AS attinhcount,
  COALESCE((SELECT co.oid FROM pg_collation co WHERE co.collname = overlite_column_collation(m.sql, ti.name)),
    CASE WHEN overlite_type_oid(ti.type) IN (25, 1043, 1042) THEN 100 ELSE 0 END) AS attcollation,
