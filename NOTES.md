@@ -718,6 +718,12 @@ such a value is read as the text passes read it.
 Each answers without an error unless marked so; found with Django's own tests and held
 to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 
+- array_append, array_prepend, array_cat, array_remove, array_replace,
+  array_position(s), array_ndims and Postgres 18's array_sort and array_reverse work on
+  an array's stored JSON (builtins/arrays.rs; tests/wire/array_functions.rs): the
+  classic ones were stubs answering NULL. array_sort orders strings by their bytes, as
+  the C collation does, where Postgres sorts by the database's collation. A nested
+  `ARRAY[[...]]` literal is not typed as an array, so it goes out as JSON text.
 - Arrays (silent): ARRAY_AGG goes out as text (OID 25) with FILTER, a window or ORDER BY,
   `<` and `>` of arrays compare the JSON text outside a typed statement (ARRAY_AGG is
   not in the AST slice yet), `&&` in HAVING over ARRAY_AGG finds nothing. A jsonb[]

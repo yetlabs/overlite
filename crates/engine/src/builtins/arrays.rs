@@ -358,3 +358,190 @@ mod tests {
         assert_eq!(array_as_json(&Value::Text("abc".to_string())), Value::Null);
     }
 }
+
+/// The elements of an array, in either form one is stored or given in: None when the
+/// value is not an array.
+fn elements(v: &Value) -> Option<Vec<Json>> {
+    let Value::Text(j) = array_as_json(v) else { return None };
+    match json_decode_first(&j)? {
+        Json::Arr(a) => Some(a),
+        _ => None,
+    }
+}
+
+/// An array of these elements, in the JSON form arrays are stored in.
+fn from_elements(items: &[Json]) -> Value {
+    let parts: Vec<String> = items.iter().map(crate::builtins::json::json_marshal).collect();
+    Value::Text(["[", &parts.join(","), "]"].concat())
+}
+
+/// A number's text when j is one.
+fn json_number(j: &Json) -> Option<String> {
+    match j {
+        Json::Number(n) => Some(n.clone()),
+        Json::Num(f) => Some(f.to_string()),
+        _ => None,
+    }
+}
+
+/// The order of two elements as an array's sort and comparison have it: numbers as
+/// numbers, strings by their bytes, a nested array element by element. NULL is left to
+/// the caller.
+fn element_cmp(p: &Json, q: &Json) -> std::cmp::Ordering {
+    use crate::builtins::json::json_marshal;
+    use std::cmp::Ordering;
+    match (p, q) {
+        (Json::Null, Json::Null) => Ordering::Equal,
+        (Json::Null, _) => Ordering::Greater,
+        (_, Json::Null) => Ordering::Less,
+        (Json::Str(a), Json::Str(b)) => a.cmp(b),
+        (Json::Bool(a), Json::Bool(b)) => a.cmp(b),
+        (Json::Arr(a), Json::Arr(b)) => a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| element_cmp(x, y))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| a.len().cmp(&b.len())),
+        _ => match (json_number(p), json_number(q)) {
+            (Some(a), Some(b)) => crate::builtins::decimal::dec_cmp_str(&a, &b).cmp(&0),
+            _ => json_marshal(p).cmp(&json_marshal(q)),
+        },
+    }
+}
+
+/// Whether an element is the value a caller gave, NULL matching NULL as IS NOT
+/// DISTINCT FROM does (array_remove, array_replace and array_position all match so).
+fn element_is(e: &Json, v: &Value) -> bool {
+    match (e, v) {
+        (Json::Null, Value::Null) => true,
+        (Json::Null, _) | (_, Value::Null) => false,
+        (Json::Str(s), v) => *s == arg_str(v),
+        (Json::Bool(b), v) => {
+            arg_str(v).parse::<bool>().ok() == Some(*b) || matches!(v, Value::Int(n) if (*n != 0) == *b)
+        }
+        (e, v) => match json_number(e) {
+            Some(n) => {
+                let t = arg_str(v);
+                crate::builtins::decimal::rat_from_string(t.trim()).is_some()
+                    && crate::builtins::decimal::dec_cmp_str(&n, t.trim()) == 0
+            }
+            None => crate::builtins::json::json_marshal(e) == arg_str(v),
+        },
+    }
+}
+
+/// A value given to an array function as the element it adds or puts in.
+fn as_element(v: &Value) -> Json {
+    match v {
+        Value::Null => Json::Null,
+        Value::Int(n) => Json::Number(n.to_string()),
+        Value::Float(f) if f.is_finite() => Json::Number(overlite_core::format_float(*f)),
+        Value::Bool(b) => Json::Bool(*b),
+        other => Json::Str(arg_str(other)),
+    }
+}
+
+/// array_sort(array [, descending [, nulls_first]]), Postgres 18: the elements (of the
+/// first dimension) in order, NULLs last ascending and first descending unless told.
+pub(crate) fn array_sort(a: &[Value]) -> Value {
+    let Some(mut items) = a.first().and_then(elements) else {
+        return Value::Null;
+    };
+    let flag = |i: usize| a.get(i).filter(|v| !v.is_null()).map(arg_str);
+    let truthy = |s: String| matches!(s.to_ascii_lowercase().as_str(), "1" | "t" | "true" | "y" | "yes" | "on");
+    let descending = flag(1).is_some_and(truthy);
+    let nulls_first = flag(2).map_or(descending, truthy);
+    items.sort_by(|p, q| match (matches!(p, Json::Null), matches!(q, Json::Null)) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) if nulls_first => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) if nulls_first => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ if descending => element_cmp(q, p),
+        _ => element_cmp(p, q),
+    });
+    from_elements(&items)
+}
+
+/// array_reverse(array), Postgres 18: the first dimension's elements in reverse.
+pub(crate) fn array_reverse(a: &[Value]) -> Value {
+    let Some(mut items) = a.first().and_then(elements) else {
+        return Value::Null;
+    };
+    items.reverse();
+    from_elements(&items)
+}
+
+/// array_remove(array, value): every element equal to value taken out.
+pub(crate) fn array_remove(a: &[Value]) -> Value {
+    let (Some(arr), Some(v)) = (a.first(), a.get(1)) else {
+        return Value::Null;
+    };
+    let Some(items) = elements(arr) else { return Value::Null };
+    let kept: Vec<Json> = items.into_iter().filter(|e| !element_is(e, v)).collect();
+    from_elements(&kept)
+}
+
+/// array_replace(array, from, to): every element equal to from replaced by to.
+pub(crate) fn array_replace(a: &[Value]) -> Value {
+    let (Some(arr), Some(from), Some(to)) = (a.first(), a.get(1), a.get(2)) else {
+        return Value::Null;
+    };
+    let Some(items) = elements(arr) else { return Value::Null };
+    let out: Vec<Json> = items
+        .into_iter()
+        .map(|e| if element_is(&e, from) { as_element(to) } else { e })
+        .collect();
+    from_elements(&out)
+}
+
+/// array_position(array, value [, start]): the subscript of the first element equal to
+/// value, from start on, or NULL.
+pub(crate) fn array_position(a: &[Value]) -> Value {
+    let (Some(arr), Some(v)) = (a.first(), a.get(1)) else {
+        return Value::Null;
+    };
+    let Some(items) = elements(arr) else { return Value::Null };
+    let start = match a.get(2) {
+        None => 1,
+        Some(Value::Null) => return Value::Null,
+        Some(s) => arg_str(s).trim().parse::<i64>().unwrap_or(1).max(1),
+    };
+    items
+        .iter()
+        .enumerate()
+        .skip(usize::try_from(start - 1).unwrap_or(0))
+        .find(|(_, e)| element_is(e, v))
+        .map_or(Value::Null, |(i, _)| Value::Int(i as i64 + 1))
+}
+
+/// array_positions(array, value): the subscripts of every element equal to value.
+pub(crate) fn array_positions(a: &[Value]) -> Value {
+    let (Some(arr), Some(v)) = (a.first(), a.get(1)) else {
+        return Value::Null;
+    };
+    let Some(items) = elements(arr) else { return Value::Null };
+    let found: Vec<String> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| element_is(e, v))
+        .map(|(i, _)| (i + 1).to_string())
+        .collect();
+    Value::Text(["[", &found.join(","), "]"].concat())
+}
+
+/// array_ndims(array): how many dimensions it has, NULL for an empty one.
+pub(crate) fn array_ndims(a: &[Value]) -> Value {
+    let Some(mut items) = a.first().and_then(elements) else {
+        return Value::Null;
+    };
+    let mut n = 0;
+    while !items.is_empty() {
+        n += 1;
+        match items.swap_remove(0) {
+            Json::Arr(inner) => items = inner,
+            _ => break,
+        }
+    }
+    if n == 0 { Value::Null } else { Value::Int(n) }
+}

@@ -14,6 +14,7 @@ mod advisory;
 mod alter;
 mod alteractions;
 mod array;
+mod array_functions;
 mod ast_catalog;
 mod ast_ddl;
 mod ast_fixes;

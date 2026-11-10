@@ -889,17 +889,18 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         -1,
         fn_field(|f| identity_args(&f.args)),
     )?;
-    for name in [
-        "array_ndims",
-        "array_remove",
-        "array_cat",
-        "array_append",
-        "array_prepend",
-        "array_position",
-        "array_positions",
-        "array_replace",
-    ] {
-        scalar(conn, name, -1, null)?;
+    {
+        use crate::builtins::arrays as a;
+        scalar(conn, "array_cat", 2, |v| Ok(a::array_cat(&v[0], &v[1], "aa")))?;
+        scalar(conn, "array_append", 2, |v| Ok(a::array_cat(&v[0], &v[1], "ae")))?;
+        scalar(conn, "array_prepend", 2, |v| Ok(a::array_cat(&v[0], &v[1], "ea")))?;
+        scalar(conn, "array_remove", 2, |v| Ok(a::array_remove(v)))?;
+        scalar(conn, "array_replace", 3, |v| Ok(a::array_replace(v)))?;
+        scalar(conn, "array_position", -1, |v| Ok(a::array_position(v)))?;
+        scalar(conn, "array_positions", 2, |v| Ok(a::array_positions(v)))?;
+        scalar(conn, "array_ndims", 1, |v| Ok(a::array_ndims(v)))?;
+        scalar(conn, "array_sort", -1, |v| Ok(a::array_sort(v)))?;
+        scalar(conn, "array_reverse", 1, |v| Ok(a::array_reverse(v)))?;
     }
     scalar(conn, "array_length", -1, arr_len)?;
     scalar(conn, "array_upper", -1, arr_len)?;

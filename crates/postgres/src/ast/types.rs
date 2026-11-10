@@ -1075,6 +1075,19 @@ impl Typer {
                 }
             }
             "array_agg" => array_of(arg(0, self)),
+            "array_cat" | "array_append" | "array_remove" | "array_replace" | "array_sort" | "array_reverse" => {
+                let t = arg(0, self);
+                if t.array { t } else { Ty::ANY }
+            }
+            "array_prepend" => {
+                let t = arg(1, self);
+                if t.array { t } else { Ty::ANY }
+            }
+            "array_position" | "array_ndims" => Ty::of(Base::Int4),
+            "array_positions" => Ty {
+                base: Base::Int4,
+                array: true,
+            },
             "string_agg"
             | "array_to_string"
             | "btrim"
