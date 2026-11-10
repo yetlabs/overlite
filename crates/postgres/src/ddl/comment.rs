@@ -236,15 +236,20 @@ impl Session {
             quote_literal(&subname)
         );
         self.exec(&del, &[])?;
-        let Some(text) = &c.text else {
-            return Ok(()); // IS NULL removes the comment
-        };
+        // IS NULL and IS '' remove the comment. The public schema's comes with the
+        // database ('standard public schema'), so its removal is kept as a NULL row,
+        // which pg_description reads as no comment.
+        let text = c.text.as_deref().filter(|t| !t.is_empty());
+        let public = objkind == "schema" && objname == "public";
+        if text.is_none() && !public {
+            return Ok(());
+        }
         let ins = format!(
             "INSERT INTO _overlite_comments (objkind, objname, subname, comment) VALUES ({}, {}, {}, {})",
             quote_literal(objkind),
             quote_literal(&objname),
             quote_literal(&subname),
-            quote_literal(text)
+            text.map_or_else(|| "NULL".to_string(), quote_literal)
         );
         self.exec(&ins, &[]).map(|_| ())
     }

@@ -298,3 +298,108 @@ fn catalogs_of_pg_dump_fc_and_pg_dumpall() {
         "readers>app:11"
     );
 }
+
+/// Feeds `script` to psql connected to `database`; ON_ERROR_STOP when `stop`.
+fn psql_feed(psql: &std::path::Path, addr: &Server, database: &str, script: &[u8], stop: bool) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let port = addr.port().to_string();
+    let on_error = if stop { "ON_ERROR_STOP=1" } else { "ON_ERROR_STOP=0" };
+    let mut child = Command::new(psql)
+        .args([
+            "-X",
+            "-q",
+            "-v",
+            on_error,
+            "-h",
+            addr.host(),
+            "-p",
+            &port,
+            "-U",
+            "postgres",
+            "-d",
+            database,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("psql must start");
+    let mut stdin = child.stdin.take().unwrap();
+    let script = script.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&script));
+    let out = child.wait_with_output().expect("psql must finish");
+    writer.join().unwrap().expect("psql reads its script");
+    out
+}
+
+// pg_dumpall reads the global catalogs (roles, pg_parameter_acl, tablespaces) and then
+// dumps each database; its script restores into another server. The one error is
+// Postgres' own: the script creates the role it runs as, which is there already.
+#[test]
+fn pg_dumpall_restores_into_a_new_server() {
+    let (Some(bin), Some(psql)) = (look_path("pg_dumpall"), look_path("psql")) else {
+        skip_test!("pg_dumpall or psql not installed");
+    };
+    let addr = start_cluster(8);
+    let conn = dial_db(&addr, ENTRY_DATABASE).unwrap();
+    for sql in [
+        "CREATE ROLE app LOGIN",
+        "CREATE TABLE notes (id serial PRIMARY KEY, body text NOT NULL)",
+        "INSERT INTO notes (body) VALUES ('one'), ('two')",
+        "CREATE DATABASE shop",
+    ] {
+        must_exec(&conn, sql);
+    }
+    let shop = dial_db(&addr, "shop").unwrap();
+    must_exec(&shop, "CREATE TABLE items (sku text PRIMARY KEY, qty int)");
+    must_exec(&shop, "INSERT INTO items VALUES ('a-1', 3)");
+
+    let port = addr.port().to_string();
+    let out = Command::new(bin)
+        .args(["-h", addr.host(), "-p", &port, "-U", "postgres"])
+        .output()
+        .expect("pg_dumpall must start");
+    assert!(
+        out.status.success(),
+        "pg_dumpall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("CREATE ROLE app;"), "no role in:\n{text}");
+    // The public schema keeps the comment it comes with, so none is written.
+    assert!(!text.contains("COMMENT ON SCHEMA public"), "{text}");
+
+    let fresh = start_cluster(8);
+    let out = psql_feed(&psql, &fresh, ENTRY_DATABASE, text.as_bytes(), false);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let errors: Vec<&str> = stderr.lines().filter(|l| l.contains("ERROR")).collect();
+    assert!(
+        errors.len() == 1 && errors[0].contains("role \"postgres\" already exists"),
+        "the restore failed: {stderr}"
+    );
+    let restored = dial_db(&fresh, ENTRY_DATABASE).unwrap();
+    assert_eq!(
+        scan_str(&restored, "SELECT string_agg(body, ',' ORDER BY id) FROM notes"),
+        "one,two"
+    );
+    assert_eq!(
+        scan_str(&restored, "SELECT count(*) FROM pg_roles WHERE rolname = 'app'"),
+        "1"
+    );
+    let shop = dial_db(&fresh, "shop").unwrap();
+    assert_eq!(scan_str(&shop, "SELECT sku || ':' || qty FROM items"), "a-1:3");
+}
+
+// The public schema's comment is Postgres' until it is changed, and COMMENT ON SCHEMA
+// public IS NULL takes it away.
+#[test]
+fn public_schema_comment() {
+    let conn = connect(&start_server());
+    let q = "SELECT coalesce(obj_description('public'::regnamespace, 'pg_namespace'), '-')";
+    assert_eq!(scan_str(&conn, q), "standard public schema");
+    must_exec(&conn, "COMMENT ON SCHEMA public IS 'mine'");
+    assert_eq!(scan_str(&conn, q), "mine");
+    must_exec(&conn, "COMMENT ON SCHEMA public IS NULL");
+    assert_eq!(scan_str(&conn, q), "-");
+}

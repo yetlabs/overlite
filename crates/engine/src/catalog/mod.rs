@@ -1170,6 +1170,8 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         scalar(conn, name, -1, null)?;
     }
     scalar(conn, "pg_get_partition_constraintdef", -1, empty)?;
+    // pg_default and pg_global, the only tablespaces, are in the data directory.
+    scalar(conn, "pg_tablespace_location", 1, empty)?;
     for name in ["pg_get_statisticsobjdef", "pg_get_statisticsobjdef_columns"] {
         scalar(conn, name, -1, empty)?;
     }
@@ -2107,7 +2109,16 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 SELECT c.oid AS objoid, 1259 AS classoid, 0 AS objsubid, cm.comment AS description
 	   FROM _overlite_comments cm
 	   JOIN pg_class c ON lower(c.relname) = lower(cm.objname)
-	  WHERE cm.objkind <> 'column' AND cm.comment IS NOT NULL
+	  WHERE cm.objkind NOT IN ('column', 'schema') AND cm.comment IS NOT NULL
+	 UNION ALL
+	 SELECT n.oid, 2615, 0, cm.comment
+	   FROM _overlite_comments cm
+	   JOIN pg_namespace n ON n.nspname = cm.objname
+	  WHERE cm.objkind = 'schema' AND cm.comment IS NOT NULL
+	 UNION ALL
+	 SELECT 2200, 2615, 0, 'standard public schema'
+	  WHERE NOT EXISTS (SELECT 1 FROM _overlite_comments
+	                     WHERE objkind = 'schema' AND objname = 'public')
 	 UNION ALL
 	 SELECT a.attrelid AS objoid, 1259 AS classoid, a.attnum AS objsubid, cm.comment AS description
 	   FROM _overlite_comments cm
@@ -2204,6 +2215,9 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
     // Settings of ALTER DATABASE ... SET and ALTER ROLE ... SET: none are kept.
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_db_role_setting AS
 	 SELECT 0 AS setdatabase, 0 AS setrole, NULL AS setconfig WHERE 0"#,
+    // GRANT ... ON PARAMETER is not kept: no parameter has privileges.
+    r#"CREATE TEMP VIEW IF NOT EXISTS pg_parameter_acl AS
+	 SELECT 0 AS oid, '' AS parname, NULL AS paracl WHERE 0"#,
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_default_acl AS
 	 SELECT 0 AS oid, 0 AS defaclrole, 2200 AS defaclnamespace, 'r' AS defaclobjtype, NULL AS defaclacl
 	 WHERE 0"#,

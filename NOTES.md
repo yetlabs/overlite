@@ -634,9 +634,14 @@ hold:
   reads first, pg_authid, and pg_auth_members' inherit_option and set_option exist.
   pg_authid holds no password, as every role may read it here, so a dump of roles
   carries none.
+- pg_dumpall reads pg_parameter_acl (empty: GRANT ... ON PARAMETER is not kept) and
+  pg_tablespace_location, and its script restores into another server; the one error
+  of the restore is Postgres' own, the CREATE ROLE of the role it runs as. The public
+  schema has the comment Postgres gives it, `standard public schema`, until COMMENT ON
+  SCHEMA public changes it (a removal is kept), so a dump writes no `COMMENT ON SCHEMA
+  public IS ''`; a schema's comment is in pg_description.
 
-Still not done: pg_dumpall stops at pg_parameter_acl (and whatever global catalog it
-reads after it), so only pg_dump per database works. The reverse direction (a dump
+Still not done: the reverse direction (a dump
 from Postgres 18 restored here) was not checked in this round. pgbench 18 -i fails at
 its first table: `CREATE TABLE ... WITH (fillfactor=100)` is a syntax error here (a
 storage parameter of an index is taken, one of a table is not); its point lookups run
