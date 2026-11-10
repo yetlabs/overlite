@@ -797,7 +797,20 @@ such a value is read as the text passes read it.
 - An instant past 9999-12-31 23:59:59 UTC (Django's datetime.max in a zone west of
   UTC) is stored as `10000-01-01 ...`, which is read and written back as Postgres
   writes it, but compares as text, before every year under 10000: `expires > now`
-  is false for it, and a DELETE of what has expired takes it.
+  is false for it, and a DELETE of what has expired takes it. Not fixed in the
+  round that took the rest of this list (Postgres 18 tooling, ranges, jsonb[],
+  RETURNING OLD/NEW, writers): it needs a stored form of such a year that sorts after
+  `9999-...` as text, so that comparisons and indexes stay SQLite's own (a collation
+  or a function around the column would cost every lookup of a timestamp its index),
+  e.g. `~` and the year in six digits (`~010000-01-01 ...`, `~` sorting after every
+  digit, as `infinity` already does). What blocks it is that the stored text is read
+  and written in many places that would each have to know the form: casts.rs
+  (parse_stamp, naive_stamp, format_stamp), dates.rs (parse_utc_stamp and its own
+  format_stamp), temporal.rs, ranges.rs (tsrange and tstzrange bounds), the protocol's
+  text and binary encoders (types/, binary_time), and the text passes that still
+  compare or cut it; plus a storage format v2 (storage.rs) that rewrites the stored
+  `10000-...` values of every timestamp and timestamptz column once, with its backup,
+  scanning only those columns for a five-digit year.
 - AT TIME ZONE goes by the declared type of a column, through aliases and subqueries,
   and of a cast. An operand that is any other expression, but for the `+ interval` of a
   column, is taken for an instant: nothing here knows its type.
