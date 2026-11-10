@@ -32,9 +32,12 @@ pub(crate) fn parse_create_function(sql: &str) -> Option<SqlFunc> {
     (f.params, f.arity) = parse_params(params);
     f.args = collapse_spaces(params).trim().to_string();
 
-    // body: dollar-quoted or single-quoted.
-    let (body, bs, be) = find_dollar_body(sql).or_else(|| find_quoted_body(sql))?;
-    f.body = body.trim().to_string();
+    // body: dollar-quoted or single-quoted, or the SQL standard's BEGIN ATOMIC ... END
+    // or RETURN expression, as pg_dump writes a function made with one.
+    let (body, bs, be) = find_dollar_body(sql)
+        .or_else(|| find_quoted_body(sql))
+        .or_else(|| find_standard_body(sql, after_params))?;
+    f.body = unqualified_params(body.trim(), &f.name, &f.params);
 
     // language: search outside the body region (default order puts it after).
     let region = format!("{} {}", &sql[..bs], &sql[be..]);
@@ -180,6 +183,68 @@ fn find_dollar_body(sql: &str) -> Option<(String, usize, usize)> {
         }
     }
     None
+}
+
+/// body with each parameter named through its function (`f.a`, as Postgres writes a
+/// standard body back) named bare, as the call's substitution reads it.
+fn unqualified_params(body: &str, name: &str, params: &[String]) -> String {
+    let s = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
+        if c == b'\'' || c == b'"' {
+            let j = skip_literal(body, i, c);
+            out.push_str(&body[i..j]);
+            i = j;
+            continue;
+        }
+        if is_ident_byte(c) && (i == 0 || !is_ident_byte(s[i - 1]) && s[i - 1] != b'.') {
+            let mut j = i;
+            while j < s.len() && is_ident_byte(s[j]) {
+                j += 1;
+            }
+            if body[i..j].eq_ignore_ascii_case(name) && s.get(j) == Some(&b'.') {
+                let mut k = j + 1;
+                while k < s.len() && is_ident_byte(s[k]) {
+                    k += 1;
+                }
+                if params
+                    .iter()
+                    .any(|p| !p.is_empty() && p.eq_ignore_ascii_case(&body[j + 1..k]))
+                {
+                    out.push_str(&body[j + 1..k]);
+                    i = k;
+                    continue;
+                }
+            }
+            out.push_str(&body[i..j]);
+            i = j;
+            continue;
+        }
+        let n = body[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&body[i..i + n]);
+        i += n;
+    }
+    out
+}
+
+/// The body of a `BEGIN ATOMIC ... END` (its statements) or of a `RETURN expression`
+/// (that expression's SELECT), after the parameters, and its span.
+fn find_standard_body(sql: &str, from: usize) -> Option<(String, usize, usize)> {
+    let low = sql[from..].to_ascii_lowercase();
+    if let Some(b) = index_word(&low, "begin") {
+        let a = skip_spaces2(&low, b + "begin".len());
+        if low[a..].starts_with("atomic") {
+            let start = a + "atomic".len();
+            let end = low.rfind("end").filter(|&e| e >= start)?;
+            let body = sql[from + start..from + end].trim().trim_end_matches(';').trim();
+            return Some((body.to_string(), from + b, sql.len()));
+        }
+    }
+    let r = index_word(&low, "return")?;
+    let expr = sql[from + r + "return".len()..].trim().trim_end_matches(';').trim();
+    Some((["SELECT ", expr].concat(), from + r, sql.len()))
 }
 
 /// The body of an `AS '...'` clause and its span.

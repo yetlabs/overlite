@@ -116,6 +116,9 @@ pub(crate) struct Session {
 
     /// Schema resolution order set by SET search_path (None = "public").
     pub(crate) search_path: Option<Vec<String>>,
+    /// The table and columns the last INSERT was given its nextval defaults for: an
+    /// identity column so filled is no value of the client's (identity_insert).
+    pub(crate) injected_defaults: Option<(String, Vec<String>)>,
 
     /// Whether a role skips privilege checks; cleared on role DDL.
     pub(crate) bypass_cache: HashMap<String, bool>,
@@ -275,6 +278,7 @@ impl Session {
             session_user: user.to_string(),
             current_role: user.to_string(),
             search_path: None,
+            injected_defaults: None,
             bypass_cache: HashMap::new(),
             pid,
             listens: HashSet::new(),

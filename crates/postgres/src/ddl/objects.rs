@@ -63,6 +63,7 @@ enum ObjectPlan {
         if_exists: bool,
     },
     AlterMatview,
+    AlterMatviewOwner,
     ForeignData,
 }
 
@@ -166,6 +167,17 @@ fn object_plan(n: &NodeEnum) -> Option<ObjectPlan> {
             names: lists(&d.objects).iter().map(|l| relation_of(l)).collect(),
             if_exists: d.missing_ok,
         },
+        // OWNER TO changes nothing kept here, as for a table or a view (a dump sets it).
+        NodeEnum::AlterTableStmt(a)
+            if tree::object(a.objtype) == O::ObjectMatview
+                && !a.cmds.is_empty()
+                && a.cmds.iter().all(|c| {
+                    matches!(&c.node, Some(NodeEnum::AlterTableCmd(c))
+                        if c.subtype == pg_query::protobuf::AlterTableType::AtChangeOwner as i32)
+                }) =>
+        {
+            ObjectPlan::AlterMatviewOwner
+        }
         NodeEnum::AlterTableStmt(a) if tree::object(a.objtype) == O::ObjectMatview => ObjectPlan::AlterMatview,
         NodeEnum::RenameStmt(r) if tree::object(r.rename_type) == O::ObjectMatview => ObjectPlan::AlterMatview,
         NodeEnum::AlterObjectSchemaStmt(a) if tree::object(a.object_type) == O::ObjectMatview => {
@@ -239,6 +251,7 @@ impl Session {
                 with_data,
             } => self.refresh_matview(&reference, &shown, with_data),
             ObjectPlan::DropMatview { names, if_exists } => self.drop_matview(&names, if_exists),
+            ObjectPlan::AlterMatviewOwner => Ok(Command::from("ALTER MATERIALIZED VIEW")),
             ObjectPlan::AlterMatview => Err(errf!(
                 SqlState::FEATURE_NOT_SUPPORTED,
                 "ALTER MATERIALIZED VIEW is not supported"

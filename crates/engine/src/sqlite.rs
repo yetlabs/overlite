@@ -388,6 +388,12 @@ impl DbSession {
         }
     }
 
+    /// Whether no transaction is open, the client's or one the server began: the one
+    /// state in which PRAGMA foreign_keys takes effect.
+    pub fn is_autocommit(&self) -> bool {
+        !self.pending_begin.get() && self.conn.is_autocommit()
+    }
+
     /// Whether the client is in a transaction, written to or not yet.
     pub(crate) fn in_transaction(&self) -> bool {
         self.pending_begin.get() || !self.conn.is_autocommit()
@@ -1225,6 +1231,10 @@ fn leading_command(sql: &str) -> String {
         return String::new();
     }
     match fields[0] {
+        // CREATE UNIQUE INDEX is CREATE INDEX, and CREATE TEMP TABLE is CREATE TABLE.
+        "CREATE" if fields.len() > 2 && matches!(fields[1], "UNIQUE" | "TEMP" | "TEMPORARY") => {
+            format!("CREATE {}", fields[2])
+        }
         "CREATE" | "DROP" | "ALTER" if fields.len() > 1 => format!("{} {}", fields[0], fields[1]),
         _ => fields[0].to_string(),
     }
@@ -1417,6 +1427,7 @@ pub(crate) mod tests {
             ("insert into t values (1)", "INSERT"),
             ("create table t (a int)", "CREATE TABLE"),
             ("drop table t", "DROP TABLE"),
+            ("create unique index i on t (a)", "CREATE INDEX"),
         ] {
             assert_eq!(leading_command(sql), want, "leading_command({sql:?})");
         }

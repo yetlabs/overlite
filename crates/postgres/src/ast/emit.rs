@@ -4455,8 +4455,11 @@ impl<'a> Emitter<'a> {
         }
         if f.over.is_none() && f.agg_filter.is_none() && f.agg_order.is_empty() && !f.agg_star && !f.agg_distinct {
             match (name, f.args.as_slice()) {
-                ("obj_description" | "shobj_description", [o, _]) => return self.description(node(o)?, None),
-                ("col_description", [o, n]) => return self.description(node(o)?, Some(node(n)?)),
+                ("obj_description" | "shobj_description", [o, c]) => {
+                    return self.description(node(o)?, None, Some(node(c)?));
+                }
+                ("obj_description", [o]) => return self.description(node(o)?, None, None),
+                ("col_description", [o, n]) => return self.description(node(o)?, Some(node(n)?), None),
                 ("pg_get_indexdef", [o, ..]) => return self.indexdef(node(o)?),
                 ("pg_get_constraintdef", [o, ..]) => return self.constraintdef(node(o)?),
                 ("pg_get_viewdef", [o, ..]) => return self.viewdef(node(o)?),
@@ -4698,13 +4701,45 @@ impl<'a> Emitter<'a> {
     /// obj_description, shobj_description and col_description: the comment
     /// pg_description holds for the object (and column), as rewrite_obj_description
     /// writes them.
-    fn description(&mut self, oid: &NodeEnum, column: Option<&NodeEnum>) -> Out {
+    /// A catalog named, the comment of the object of that catalog (the deprecated
+    /// form without one takes any).
+    fn description(&mut self, oid: &NodeEnum, column: Option<&NodeEnum>, catalog: Option<&NodeEnum>) -> Out {
         self.push("(SELECT description FROM pg_description WHERE objoid = ");
         self.expr(oid, Prec::Compare)?;
         self.push(" AND objsubid = ");
         match column {
             Some(c) => self.expr(c, Prec::Compare)?,
             None => self.push("0"),
+        }
+        const CATALOGS: [(&str, u32); 8] = [
+            ("pg_class", 1259),
+            ("pg_proc", 1255),
+            ("pg_namespace", 2615),
+            ("pg_type", 1247),
+            ("pg_constraint", 2606),
+            ("pg_trigger", 2620),
+            ("pg_database", 1262),
+            ("pg_authid", 1260),
+        ];
+        let named = match catalog {
+            Some(NodeEnum::AConst(k)) => match &k.val {
+                Some(Val::Sval(s)) => Some(CATALOGS.iter().find(|(n, _)| *n == s.sval).map_or(0, |(_, o)| *o)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(oid) = named {
+            self.push(" AND classoid = ");
+            self.push(&oid.to_string());
+        } else if let Some(c) = catalog {
+            self.push(" AND classoid = CASE ");
+            self.expr(c, Prec::Compare)?;
+            for (name, oid) in CATALOGS {
+                self.push(&format!(" WHEN '{name}' THEN {oid}"));
+            }
+            self.push(" ELSE 0 END");
+        } else if column.is_some() {
+            self.push(" AND classoid = 1259");
         }
         self.push(" LIMIT 1)");
         Ok(())

@@ -2137,7 +2137,12 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 SELECT c.oid AS objoid, 1259 AS classoid, 0 AS objsubid, cm.comment AS description
 	   FROM _overlite_comments cm
 	   JOIN pg_class c ON lower(c.relname) = lower(cm.objname)
-	  WHERE cm.objkind NOT IN ('column', 'schema') AND cm.comment IS NOT NULL
+	  WHERE cm.objkind NOT IN ('column', 'schema', 'function') AND cm.comment IS NOT NULL
+	 UNION ALL
+	 SELECT p.oid, 1255, 0, cm.comment
+	   FROM _overlite_comments cm
+	   JOIN pg_proc p ON lower(p.proname) = lower(cm.objname)
+	  WHERE cm.objkind = 'function' AND cm.comment IS NOT NULL
 	 UNION ALL
 	 SELECT n.oid, 2615, 0, cm.comment
 	   FROM _overlite_comments cm

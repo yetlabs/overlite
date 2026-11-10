@@ -333,6 +333,7 @@ impl Session {
         if add_cols.is_empty() {
             return sql.to_string();
         }
+        self.injected_defaults = Some((stored.clone(), add_cols.clone()));
         if default_values {
             let rest = &sql[src_start..];
             let toks = code_tokens(rest);

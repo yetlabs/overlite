@@ -654,8 +654,22 @@ hold:
   SCHEMA public changes it (a removal is kept), so a dump writes no `COMMENT ON SCHEMA
   public IS ''`; a schema's comment is in pg_description.
 
-Still not done: the reverse direction (a dump
-from Postgres 18 restored here) was not checked in this round. pgbench 18 -i fails at
+- A plain dump Postgres 18 writes restores here with psql (tests/fixtures/pg18-dump.sql,
+  `a_postgres_18_dump_restores`): what it needed was ALTER COLUMN SET DEFAULT nextval
+  (above), ALTER MATERIALIZED VIEW ... OWNER TO (taken, as for a table), a function
+  body in the SQL standard's form (BEGIN ATOMIC ... END, or RETURN expression), whose
+  parameters Postgres writes through the function's name (`f.a`), a GENERATED ALWAYS
+  identity added by ALTER TABLE to a column that is not the key (the default an INSERT
+  is given for it was taken for the client's value: 428C9), comments on functions and
+  the catalog argument of obj_description, and a foreign key added to a table other
+  tables reference. That last one was lost and left a transaction open, which lost
+  every statement after it in the session: the rebuild's DROP of the old table
+  counted each referencing row as broken, and the RELEASE that failed for it was not
+  looked at. Out of a transaction the rebuild now turns foreign keys off for the swap,
+  as SQLite's own procedure does, and checks the rebuilt table's keys after it
+  (23503 when rows break the new one, where it was taken without effect).
+
+Still not done: pgbench 18 -i fails at
 its first table: `CREATE TABLE ... WITH (fillfactor=100)` is a syntax error here (a
 storage parameter of an index is taken, one of a table is not); its point lookups run
 on tables made by hand, at the speed they had.
@@ -674,7 +688,10 @@ it was left at 16. A nested `ARRAY[[1,2],[3,4]]` literal is not typed as an arra
 Still lost or different in a dump: GRANTs on tables (pg_class.relacl is NULL), a
 CHECK and a default in the translation's spelling where that differs from the
 client's (`CAST(a AS text)` for `a::text`), jsonb's spacing, a numeric generated
-column computed as SQLite computes it.
+column computed as SQLite computes it. A partial index or CHECK over a numeric
+literal is written back in the translation's spelling
+(`CAST(overlite_numeric(...) AS DECIMALTEXT) COLLATE DECIMAL`), which Postgres does
+not read: a dump of such a table restores here but not into Postgres.
 
 ## Limits
 
@@ -819,6 +836,10 @@ such a value is read as the text passes read it.
   tells a schema from an alias by the schema list alone. pg_dump's own queries use the
   aliases `s`, `t`, `c`, `n` and `i`, so a database with a schema of one of those names
   cannot be dumped.
+- In a transaction, a change of a table that rebuilds it (ADD CONSTRAINT, ALTER
+  COLUMN) cannot turn foreign keys off: when another table's rows reference it, the
+  COMMIT fails with 23503 (the swap counts them as broken), so `psql
+  --single-transaction` of a dump that adds a foreign key to a referenced table fails.
 - A role's name compares without case, as `_overlite_roles.rolname` was created NOCASE
   and existing databases keep the table: `"Mixed"` and `mixed` are one role, where
   Postgres has two. Rebuilding the table at startup would rewrite stored data.

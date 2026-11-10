@@ -52,8 +52,10 @@ impl Session {
                 }
                 if let Some(clause) = parse_add_constraint(sql) {
                     let added = self.alter_add_constraint(&table, &clause);
-                    // A CHECK is held or refused: it is never taken without effect.
-                    if added.is_ok() || clause.check.is_some() {
+                    // A CHECK is held or refused: it is never taken without effect, and
+                    // neither is a foreign key that rows already break.
+                    let broken = matches!(&added, Err(e) if e.sql_state() == SqlState::FOREIGN_KEY_VIOLATION);
+                    if added.is_ok() || clause.check.is_some() || broken {
                         return Some(added.map(|()| tag()));
                     }
                 }
@@ -603,12 +605,43 @@ impl Session {
         let db = master.strip_suffix(".sqlite_master").unwrap_or("main").to_string();
         let old_cols = self.table_column_kinds(&db, name);
 
+        // The DROP of the old table deletes its rows first, and with foreign keys on
+        // each row another table references counts as a violation that the RENAME of
+        // the new one does not take back: the end of the transaction would fail. Out of
+        // a transaction foreign keys are turned off for the swap, as SQLite's own
+        // procedure for altering a table does, and the new table's own keys checked
+        // after it (foreign_key_check).
+        let fks_off = self.db.is_autocommit();
+        if fks_off {
+            self.exec("PRAGMA foreign_keys = OFF", &[])?;
+        }
+        let r = self.rebuild_swap(table, new_ddl, copy, name, &db, &tmp, &tmp_ddl, aux, &old_cols, fks_off);
+        if fks_off {
+            let _ = self.exec("PRAGMA foreign_keys = ON", &[]);
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_swap(
+        &mut self,
+        table: &str,
+        new_ddl: &str,
+        copy: &[String],
+        name: &str,
+        db: &str,
+        tmp: &str,
+        tmp_ddl: &str,
+        aux: Vec<String>,
+        old_cols: &[(String, bool)],
+        fks_off: bool,
+    ) -> Result<()> {
         self.exec("SAVEPOINT _rb", &[])?;
-        // The table disappears for an instant between the DROP and the RENAME, and
-        // SQLite checks any foreign key pointing at it as soon as it goes. Deferring
-        // enforcement to the end of the savepoint keeps those keys intact without
-        // turning them off: PRAGMA foreign_keys itself is ignored inside a
-        // transaction, which this is.
+        // In a transaction, the table disappears for an instant between the DROP and
+        // the RENAME, and SQLite checks any foreign key pointing at it as soon as it
+        // goes. Deferring enforcement to the end of the transaction keeps those keys
+        // intact without turning them off: PRAGMA foreign_keys itself is ignored
+        // inside a transaction.
         let _ = self.exec("PRAGMA defer_foreign_keys = ON", &[]);
         // RENAME TO re-resolves every reference in the schema so it can fix the
         // ones pointing at the renamed table. Here the table it is replacing has
@@ -616,14 +649,14 @@ impl Session {
         // The legacy behaviour renames without the fix-up, which is what a
         // create-copy-swap wants: the references already name the final table.
         let _ = self.exec("PRAGMA legacy_alter_table = ON", &[]);
-        if let Err(err) = self.exec(&tmp_ddl, &[]) {
+        if let Err(err) = self.exec(tmp_ddl, &[]) {
             let _ = self.exec("ROLLBACK TO _rb", &[]);
             let _ = self.exec("RELEASE _rb", &[]);
             let _ = self.exec("PRAGMA legacy_alter_table = OFF", &[]);
             let _ = self.exec("PRAGMA defer_foreign_keys = OFF", &[]);
             return Err(err);
         }
-        let new_cols = self.table_column_kinds(&db, "_overlite_rebuild");
+        let new_cols = self.table_column_kinds(db, "_overlite_rebuild");
         // A CHECK added NOT VALID does not hold for the rows from before it, which
         // the copy carries over: SQLite checks none of them as it copies, and every
         // other CHECK held for them already.
@@ -631,7 +664,7 @@ impl Session {
         if not_valid {
             let _ = self.exec("PRAGMA ignore_check_constraints = ON", &[]);
         }
-        let copied = self.exec(&copy_rows_sql(&tmp, table, copy, &old_cols, &new_cols), &[]);
+        let copied = self.exec(&copy_rows_sql(tmp, table, copy, old_cols, &new_cols), &[]);
         if not_valid {
             let _ = self.exec("PRAGMA ignore_check_constraints = OFF", &[]);
         }
@@ -645,7 +678,7 @@ impl Session {
         let mut steps = vec![
             "DROP TABLE ".to_string() + table,
             // RENAME TO takes a bare name: the table stays where it already is.
-            "ALTER TABLE ".to_string() + &tmp + " RENAME TO " + &quote_ident(name),
+            "ALTER TABLE ".to_string() + tmp + " RENAME TO " + &quote_ident(name),
         ];
         steps.extend(aux);
         for st in &steps {
@@ -658,8 +691,32 @@ impl Session {
                 return Err(err);
             }
         }
-        let _ = self.exec("RELEASE _rb", &[]);
+        if fks_off {
+            // A row the new table's own foreign keys find no parent for.
+            let check = "SELECT 1 FROM pragma_foreign_key_check(".to_string()
+                + &quote_literal(name)
+                + ", "
+                + &quote_literal(db)
+                + ") LIMIT 1";
+            if self.exec(&check, &[]).is_ok_and(|rs| !rs.rows.is_empty()) {
+                let _ = self.exec("ROLLBACK TO _rb", &[]);
+                let _ = self.exec("RELEASE _rb", &[]);
+                let _ = self.exec("PRAGMA legacy_alter_table = OFF", &[]);
+                let _ = self.exec("PRAGMA defer_foreign_keys = OFF", &[]);
+                let (_, relation) = split_stored_name(name);
+                return Err(errf!(
+                    SqlState::FOREIGN_KEY_VIOLATION,
+                    "insert or update on table \"{relation}\" violates foreign key constraint"
+                ));
+            }
+        }
+        let released = self.exec("RELEASE _rb", &[]);
+        if released.is_err() && !self.db.is_autocommit() && !self.in_tx() {
+            // The swap's own transaction would not end: it is undone, not left open.
+            let _ = self.exec("ROLLBACK", &[]);
+        }
         let _ = self.exec("PRAGMA legacy_alter_table = OFF", &[]);
+        released?;
         // Deferral lasts until the enclosing transaction ends, which is not always
         // here: a rebuild inside a client transaction would otherwise leave foreign
         // keys unchecked for the rest of it.

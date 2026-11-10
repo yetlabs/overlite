@@ -549,3 +549,134 @@ fn set_default_nextval() {
     conn.exec("INSERT INTO t (v) VALUES ('c')", &[])
         .expect_err("no default: id is NULL");
 }
+
+// A plain dump Postgres 18 wrote (tests/fixtures/pg18-dump.sql: pg_dump 18.6 of
+// postgres:18-alpine, its \restrict lines taken out for an older psql) restores with
+// psql: serial and identity columns whose defaults it sets after their sequences,
+// foreign keys added to tables others reference, expression, partial and gin
+// indexes, a view and a materialized view, sequences, comments, grants, a schema, and
+// sql functions with a quoted and a BEGIN ATOMIC body. The answers are Postgres'.
+#[test]
+fn a_postgres_18_dump_restores() {
+    let Some(psql) = look_path("psql") else {
+        skip_test!("psql not installed");
+    };
+    let addr = start_cluster(8);
+    let conn = dial_db(&addr, ENTRY_DATABASE).unwrap();
+    must_exec(&conn, "CREATE ROLE reader");
+    must_exec(&conn, "CREATE DATABASE src");
+    let dump = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pg18-dump.sql")).unwrap();
+    let out = psql_feed(&psql, &addr, "src", &dump, true);
+    assert!(
+        out.status.success(),
+        "the restore failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let src = dial_db(&addr, "src").unwrap();
+    for (q, want) in [
+        (
+            "SELECT created_at FROM authors WHERE id = 1",
+            "2026-01-02 03:04:05.5+00",
+        ),
+        (
+            "SELECT string_agg(name || ':' || coalesce(m::text, '-'), ',' ORDER BY id) FROM authors",
+            "Ann:ok,Bo:-",
+        ),
+        ("SELECT tags FROM books WHERE id = 1", "{a,\"b c\"}"),
+        (
+            "SELECT doc FROM books WHERE id = 1",
+            "{\"k\": [1, 2], \"s\": \"x\\ty\"}",
+        ),
+        ("SELECT title FROM books WHERE id = 3", "It's \"quoted\"\\n"),
+        (
+            "SELECT string_agg(price || ':' || twice, ',' ORDER BY id) FROM books",
+            "5.50:11.00,12.00:24.00,0.00:0.00",
+        ),
+        (
+            "SELECT uid FROM books WHERE id = 1",
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+        ),
+        (
+            "SELECT string_agg(book_id || '-' || tag_id, ',' ORDER BY book_id) FROM book_tags",
+            "1-1,2-2",
+        ),
+        (
+            "SELECT string_agg(name || ':' || title, ',' ORDER BY id) FROM cheap_books",
+            "Ann:First,Bo:It's \"quoted\"\\n",
+        ),
+        (
+            "SELECT string_agg(author_id || ':' || n, ',' ORDER BY author_id) FROM author_counts",
+            "1:2,2:1",
+        ),
+        ("SELECT add_one(1) || ',' || book_count(1)", "2,2"),
+        (
+            "SELECT string_agg(o.qty || ':' || b.title, ',' ORDER BY o.id) FROM shop.orders o JOIN books b ON b.id = o.book_id",
+            "2:First,1:It's \"quoted\"\\n",
+        ),
+        (
+            "SELECT obj_description('books'::regclass, 'pg_class') || ',' || col_description('books'::regclass, 4) \
+             || ',' || obj_description('add_one'::regproc, 'pg_proc')",
+            "All the books,The title,adds one",
+        ),
+        ("SELECT has_table_privilege('reader', 'books', 'SELECT')", "t"),
+        ("SELECT has_table_privilege('reader', 'tags', 'SELECT')", "f"),
+        ("SELECT nextval('invoice_seq')", "1005"),
+        // Each sequence goes on from where the dump left it.
+        (
+            "INSERT INTO books (author_id, title) VALUES (2, 'New') RETURNING id || ',' || n",
+            "4,4",
+        ),
+        ("INSERT INTO tags (label) VALUES ('z') RETURNING id", "3"),
+        ("INSERT INTO authors (name) VALUES ('Cy') RETURNING id", "3"),
+        (
+            "INSERT INTO shop.orders (book_id) VALUES (2) RETURNING id || ':' || qty",
+            "3:1",
+        ),
+    ] {
+        assert_eq!(scan_str(&src, q), want, "{q}");
+    }
+    src.exec("INSERT INTO tags (id, label) VALUES (9, 'w')", &[])
+        .expect_err("tags.id is GENERATED ALWAYS");
+    src.exec("INSERT INTO books (author_id, title) VALUES (1, 'FIRST')", &[])
+        .expect_err("the expression index is unique on lower(title)");
+    src.exec("INSERT INTO book_tags VALUES (99, 1)", &[])
+        .expect_err("the foreign key came back");
+}
+
+// A foreign key added to a table that another table's rows reference, out of a
+// transaction, holds and leaves no transaction open behind it (the swap of the
+// rebuilt table counted those rows as broken, and the statements after it were lost).
+// One that the rows break is 23503, as in Postgres.
+#[test]
+fn foreign_key_added_to_a_referenced_table() {
+    let addr = start_server();
+    let conn = connect(&addr);
+    for sql in [
+        "CREATE TABLE au (id int PRIMARY KEY)",
+        "CREATE TABLE bo (id bigint PRIMARY KEY, a int)",
+        "CREATE TABLE bt (b bigint REFERENCES bo(id))",
+        "INSERT INTO au VALUES (1)",
+        "INSERT INTO bo VALUES (1, 1)",
+        "INSERT INTO bt VALUES (1)",
+        "ALTER TABLE ONLY public.bo ADD CONSTRAINT bo_fk FOREIGN KEY (a) REFERENCES public.au(id)",
+        "CREATE TABLE after_it (x int)",
+    ] {
+        must_exec(&conn, sql);
+    }
+    drop(conn);
+    let conn = connect(&addr);
+    assert_eq!(
+        scan_str(&conn, "SELECT count(*) FROM pg_tables WHERE tablename = 'after_it'"),
+        "1"
+    );
+    conn.exec("INSERT INTO bo VALUES (2, 5)", &[]).expect_err("bo_fk holds");
+    must_exec(&conn, "CREATE TABLE c2 (a int)");
+    must_exec(&conn, "INSERT INTO c2 VALUES (7)");
+    let err = conn
+        .exec(
+            "ALTER TABLE c2 ADD CONSTRAINT c2_fk FOREIGN KEY (a) REFERENCES au(id)",
+            &[],
+        )
+        .expect_err("7 is not in au");
+    assert_eq!(err.code(), "23503");
+}

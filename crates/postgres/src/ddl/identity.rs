@@ -372,11 +372,18 @@ impl Session {
             }
             out = Cow::Owned([&sql[..toks[i].span.start], &sql[toks[i + 2].span.end..]].concat());
         }
+        let injected = self.injected_defaults.take();
         let (target, cols, src_start) = parse_insert(&out);
         if target.is_empty() {
             return Ok(out);
         }
         let stored = self.stored_name(&target);
+        // What apply_column_defaults put in for the columns the client left out.
+        let filled = |c: &str| {
+            injected
+                .as_ref()
+                .is_some_and(|(t, cols)| eq_fold(t, &stored) && cols.iter().any(|k| eq_fold(k, c)))
+        };
         let q = "SELECT sql FROM main.sqlite_master WHERE type = 'table' AND lower(name) = lower(".to_string()
             + &quote_literal(&stored)
             + ") AND instr(sql, '/*overlite identity always')";
@@ -395,7 +402,7 @@ impl Session {
             let given = if cols.is_empty() {
                 !default_values
             } else {
-                cols.iter().any(|c| eq_fold(&unquote_ident(c), &identity.column))
+                !filled(&identity.column) && cols.iter().any(|c| eq_fold(&unquote_ident(c), &identity.column))
             };
             if given {
                 return Err(errf!(
