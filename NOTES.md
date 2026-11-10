@@ -682,6 +682,12 @@ hold:
   still not taken, and psql's `\d+` shows no Options line: it concatenates reloptions
   with another array, and the typing does not know a catalog column for an array.
 
+- A range's intersection (`*`), union (`+`, 22000 where the two neither overlap nor
+  touch) and difference (`-`, 22000 where it would leave two pieces) are Postgres'
+  range_intersect, range_union and range_minus over the type's bounds, made canonical
+  as the type makes them (overlite_range_setop), for each built-in range type; two
+  range types are 42883 (`range_intersection_union_and_difference`). They were SQLite's
+  arithmetic on the text: 0.
 - RETURNING OLD and NEW (18), by those names or by RETURNING WITH (OLD AS o, NEW AS
   n), `old.*` and `new.*` included (`returning_old_and_new`). An INSERT's OLD is NULL
   and a DELETE's NEW. An UPDATE's OLD is read from a CTE of the rows it is to write,
@@ -904,8 +910,7 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
   subscript of it as a slice. An int[][] stored before `int[][]` was read as an array of
   ints holds its elements as strings. hstore[]::text writes its elements as JSON
   objects (the column itself goes out as hstore[]).
-- Ranges (silent): `*` and `+` of ranges are not the intersection and the union;
-  outside a typed statement, `<`, `>` and `=` of ranges compare text, `@>` between two
+- Ranges (silent): outside a typed statement, `<`, `>` and `=` of ranges compare text, `@>` between two
   casts is a syntax error (an error) and `-|-`, `<<`, `>>`, `&<`, `&>` as operators
   are a syntax error (an error); a range stored before canonical ranges keeps its text
   (`[1,5]` beside `[1,6)`).

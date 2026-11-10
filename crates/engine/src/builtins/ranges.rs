@@ -597,3 +597,181 @@ mod tests {
         assert!(range_contains("[-5,0)", "-1"));
     }
 }
+
+/// A bound of a range as Postgres' range_cmp_bounds compares them: its value (None
+/// for an infinite one), whether it is inclusive, and whether it is the lower one.
+#[derive(Clone, Debug)]
+struct Bound {
+    val: Option<String>,
+    inc: bool,
+    lower: bool,
+}
+
+fn lower_of(r: &Range) -> Bound {
+    Bound {
+        val: r.lo.clone(),
+        inc: r.lo_inc,
+        lower: true,
+    }
+}
+
+fn upper_of(r: &Range) -> Bound {
+    Bound {
+        val: r.hi.clone(),
+        inc: r.hi_inc,
+        lower: false,
+    }
+}
+
+/// range_cmp_bounds: where two bounds fall, a lower one against an upper one too.
+fn cmp_bounds(a: &Bound, b: &Bound) -> Ordering {
+    let side = |lower: bool| if lower { Ordering::Less } else { Ordering::Greater };
+    match (&a.val, &b.val) {
+        (None, None) if a.lower == b.lower => Ordering::Equal,
+        (None, _) => side(a.lower),
+        (_, None) => side(b.lower).reverse(),
+        (Some(x), Some(y)) => match cmp_values(x, y) {
+            Ordering::Equal => match (a.inc, b.inc) {
+                (false, false) if a.lower == b.lower => Ordering::Equal,
+                (false, false | true) => side(a.lower).reverse(),
+                (true, false) => side(b.lower),
+                (true, true) => Ordering::Equal,
+            },
+            o => o,
+        },
+    }
+}
+
+/// make_range: the range of two bounds, empty where they hold no point, made canonical
+/// as its type is where the type is known.
+fn make_range(kind: Option<RangeKind>, lo: &Bound, hi: &Bound) -> Result<String> {
+    let r = Range {
+        empty: false,
+        lo: lo.val.clone(),
+        hi: hi.val.clone(),
+        lo_inc: lo.inc && lo.val.is_some(),
+        hi_inc: hi.inc && hi.val.is_some(),
+    };
+    if let (Some(a), Some(b)) = (&r.lo, &r.hi) {
+        match cmp_values(a, b) {
+            Ordering::Greater => return Ok("empty".to_string()),
+            Ordering::Equal if !(r.lo_inc && r.hi_inc) => return Ok("empty".to_string()),
+            _ => {}
+        }
+    }
+    match kind {
+        Some(k) if k.discrete() => build(k, r),
+        Some(RangeKind::Tstz) | None => Ok(render(RangeKind::Num, &r)),
+        Some(k) => Ok(render(k, &r)),
+    }
+}
+
+/// A range's union (`+`), difference (`-`) or intersection (`*`), as Postgres'
+/// range_union, range_minus and range_intersect compute them over the type's bounds.
+/// None when an operand is no range.
+///
+/// # Errors
+///
+/// 22000 for a union of ranges that neither overlap nor touch, or a difference that
+/// would leave two pieces.
+pub fn range_set_op(op: &str, a: &str, b: &str, kind: Option<RangeKind>) -> Result<Option<String>> {
+    let (Some(r1), Some(r2)) = (parse_range(a), parse_range(b)) else {
+        return Ok(None);
+    };
+    let text = |r: &Range| render(RangeKind::Num, r);
+    let (l1, u1, l2, u2) = (lower_of(&r1), upper_of(&r1), lower_of(&r2), upper_of(&r2));
+    let overlap = !r1.empty && !r2.empty && cmp_bounds(&l1, &u2).is_le() && cmp_bounds(&l2, &u1).is_le();
+    Ok(Some(match op {
+        "*" => {
+            if !overlap {
+                return Ok(Some("empty".to_string()));
+            }
+            let lo = if cmp_bounds(&l1, &l2).is_ge() { &l1 } else { &l2 };
+            let hi = if cmp_bounds(&u1, &u2).is_le() { &u1 } else { &u2 };
+            make_range(kind, lo, hi)?
+        }
+        "+" => {
+            if r1.empty {
+                return Ok(Some(text(&r2)));
+            }
+            if r2.empty {
+                return Ok(Some(text(&r1)));
+            }
+            let touch = adjacent(&r1, &r2) || adjacent(&r2, &r1);
+            if !overlap && !touch {
+                return Err(Error::with_state(
+                    SqlState::DATA_EXCEPTION,
+                    "result of range union would not be contiguous".to_string(),
+                ));
+            }
+            let lo = if cmp_bounds(&l1, &l2).is_le() { &l1 } else { &l2 };
+            let hi = if cmp_bounds(&u1, &u2).is_ge() { &u1 } else { &u2 };
+            make_range(kind, lo, hi)?
+        }
+        "-" => {
+            if r1.empty || r2.empty {
+                return Ok(Some(text(&r1)));
+            }
+            let (l1l2, l1u2) = (cmp_bounds(&l1, &l2), cmp_bounds(&l1, &u2));
+            let (u1l2, u1u2) = (cmp_bounds(&u1, &l2), cmp_bounds(&u1, &u2));
+            if l1l2.is_lt() && u1u2.is_gt() {
+                return Err(Error::with_state(
+                    SqlState::DATA_EXCEPTION,
+                    "result of range difference would not be contiguous".to_string(),
+                ));
+            }
+            if l1u2.is_gt() || u1l2.is_lt() {
+                return Ok(Some(text(&r1)));
+            }
+            if l1l2.is_ge() && u1u2.is_le() {
+                return Ok(Some("empty".to_string()));
+            }
+            if l1l2.is_le() && u1l2.is_ge() && u1u2.is_le() {
+                let hi = Bound {
+                    val: l2.val.clone(),
+                    inc: !l2.inc,
+                    lower: false,
+                };
+                return make_range(kind, &l1, &hi).map(Some);
+            }
+            if l1l2.is_ge() && u1u2.is_ge() && l1u2.is_le() {
+                let lo = Bound {
+                    val: u2.val.clone(),
+                    inc: !u2.inc,
+                    lower: true,
+                };
+                return make_range(kind, &lo, &u1).map(Some);
+            }
+            return Ok(Some(text(&r1)));
+        }
+        _ => return Ok(None),
+    }))
+}
+
+#[cfg(test)]
+mod set_op_tests {
+    use super::*;
+
+    fn op(o: &str, a: &str, b: &str, k: &str) -> String {
+        range_set_op(o, a, b, RangeKind::of_name(k)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn as_postgres_computes_them() {
+        assert_eq!(op("*", "[1,5)", "[3,8)", "int4range"), "[3,5)");
+        assert_eq!(op("*", "[1,5)", "[7,9)", "int4range"), "empty");
+        assert_eq!(op("*", "[1,5)", "[5,9)", "int4range"), "empty");
+        assert_eq!(op("+", "[1,5)", "[3,8)", "int4range"), "[1,8)");
+        assert_eq!(op("+", "[1,5)", "[5,8)", "int4range"), "[1,8)");
+        assert_eq!(op("-", "[1,5)", "[3,8)", "int4range"), "[1,3)");
+        assert_eq!(op("-", "[1,10)", "[1,5)", "int4range"), "[5,10)");
+        assert_eq!(op("-", "[1,5)", "[1,8)", "int4range"), "empty");
+        assert_eq!(op("-", "[1,5)", "[7,8)", "int4range"), "[1,5)");
+        assert_eq!(op("+", "[1.5,2.5)", "[2.5,3)", "numrange"), "[1.5,3)");
+        assert_eq!(op("-", "[1.5,3)", "[2,3]", "numrange"), "[1.5,2)");
+        assert_eq!(op("*", "(,5)", "[2,)", "int4range"), "[2,5)");
+        assert_eq!(op("+", "empty", "[2,3)", "int4range"), "[2,3)");
+        assert!(range_set_op("+", "[1,2)", "[3,4)", None).is_err());
+        assert!(range_set_op("-", "[1,10)", "[3,4)", None).is_err());
+    }
+}

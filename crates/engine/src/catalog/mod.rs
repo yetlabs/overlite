@@ -1587,6 +1587,16 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         Ok(range_op(&a[0].to_string(), &a[1].to_string(), &a[2].to_string())
             .map_or(Value::Null, |b| Value::Int(bool_int(b))))
     })?;
+    scalar(conn, "overlite_range_setop", 4, |a| {
+        if a.len() < 4 || a[..3].iter().any(Value::is_null) {
+            return Ok(Value::Null);
+        }
+        let kind = crate::builtins::ranges::RangeKind::of_name(&a[3].to_string());
+        Ok(
+            crate::builtins::ranges::range_set_op(&a[0].to_string(), &a[1].to_string(), &a[2].to_string(), kind)?
+                .map_or(Value::Null, Value::Text),
+        )
+    })?;
     range_acc(conn, "isempty", |r| Value::Int(bool_int(r.empty)))?;
     range_acc(conn, "lower_inc", |r| Value::Int(bool_int(!r.empty && r.lo_inc)))?;
     range_acc(conn, "upper_inc", |r| Value::Int(bool_int(!r.empty && r.hi_inc)))?;

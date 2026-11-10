@@ -3912,6 +3912,7 @@ impl<'a> Emitter<'a> {
     fn typed_op(&mut self, a: &pb::AExpr, op: &str, l: &NodeEnum, r: &NodeEnum) -> Out {
         match op {
             "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" => self.comparison(op, l, r),
+            "+" | "-" | "*" if self.is_range(l) || self.is_range(r) => self.range_set_op(op, l, r, a.location),
             "+" | "-" | "*" | "/" => self.arithmetic(a, op),
             "||" => {
                 let (tl, tr) = (self.ty(l), self.ty(r));
@@ -4086,6 +4087,29 @@ impl<'a> Emitter<'a> {
                 t.base,
                 Base::Int4Range | Base::Int8Range | Base::NumRange | Base::DateRange | Base::TsRange | Base::TstzRange
             )
+    }
+
+    /// A range's union (`+`), difference (`-`) or intersection (`*`), as the engine
+    /// computes them (overlite_range_setop) over the range type's bounds.
+    fn range_set_op(&mut self, op: &str, l: &NodeEnum, r: &NodeEnum, at: i32) -> Out {
+        let (tl, tr) = (self.ty(l), self.ty(r));
+        let ty = if tl.is_range() { tl } else { tr };
+        let ok = |t: Ty| t == ty || matches!(t.base, Base::Unknown | Base::Any);
+        if !(ok(tl) && ok(tr)) {
+            return Err(no_operator(op, tl, tr, at));
+        }
+        self.note_param(l, ty);
+        self.note_param(r, ty);
+        self.push("overlite_range_setop(");
+        self.push(&quote_literal(op));
+        self.push(", ");
+        self.value(l, ty, Prec::Or)?;
+        self.push(", ");
+        self.value(r, ty, Prec::Or)?;
+        self.push(", ");
+        self.push(&quote_literal(range_name(ty.base).unwrap_or("")));
+        self.push(")");
+        Ok(())
     }
 
     /// A range operator or comparison over ranges, as the engine reads them

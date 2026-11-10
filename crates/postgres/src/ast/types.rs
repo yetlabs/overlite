@@ -95,6 +95,15 @@ impl Ty {
             )
     }
 
+    /// A range of one of Postgres' range types.
+    pub(crate) fn is_range(self) -> bool {
+        !self.array
+            && matches!(
+                self.base,
+                Base::Int4Range | Base::Int8Range | Base::NumRange | Base::DateRange | Base::TsRange | Base::TstzRange
+            )
+    }
+
     pub(crate) fn is_integer(self) -> bool {
         !self.array && matches!(self.base, Base::Int2 | Base::Int4 | Base::Int8)
     }
@@ -341,6 +350,10 @@ pub(crate) fn arithmetic(op: &str, l: Ty, r: Ty) -> Ty {
         (_, Base::Unknown) if l.known() => (l, l),
         _ => (l, r),
     };
+    // A range's intersection, union and difference are of its type.
+    if matches!(op, "*" | "+" | "-") && (l.is_range() || r.is_range()) {
+        return if l.is_range() { l } else { r };
+    }
     if l.is_temporal() || r.is_temporal() {
         let sub = op == "-";
         return Ty::of(match (op, l.base, r.base) {
