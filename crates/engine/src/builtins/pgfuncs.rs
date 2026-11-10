@@ -679,6 +679,8 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
 
     // Math.
     strict(conn, "cbrt", 1, |a| Ok(Value::Float(float(&a[0])?.cbrt())))?;
+    strict(conn, "gamma", 1, |a| gamma(float(&a[0])?).map(Value::Float))?;
+    strict(conn, "lgamma", 1, |a| lgamma(float(&a[0])?).map(Value::Float))?;
     strict(conn, "cot", 1, |a| Ok(Value::Float(1.0 / float(&a[0])?.tan())))?;
     let degree_fns: [(&str, DegreeFn); 7] = [
         ("sind", |x| x.to_radians().sin()),
@@ -1126,4 +1128,48 @@ mod tests {
         assert_eq!(t("masklen", "::1"), "128");
         assert_eq!(t("abbrev", "10.1.0.0/16"), "10.1.0.0/16");
     }
+}
+
+unsafe extern "C" {
+    /// The C library's gamma function, which Postgres calls too.
+    safe fn tgamma(x: f64) -> f64;
+    /// The C library's natural logarithm of the absolute value of the gamma function.
+    #[link_name = "lgamma"]
+    safe fn c_lgamma(x: f64) -> f64;
+}
+
+fn float_overflow() -> crate::error::Error {
+    errf!(SqlState::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: overflow")
+}
+
+/// gamma(x) as Postgres 18's dgamma: NaN and +Infinity are themselves, and a pole, an
+/// overflow or -Infinity is 22003, as is a result that underflows to 0.
+fn gamma(x: f64) -> Result<f64> {
+    if x.is_nan() || x == f64::INFINITY {
+        return Ok(x);
+    }
+    if x == f64::NEG_INFINITY {
+        return Err(float_overflow());
+    }
+    let r = tgamma(x);
+    if r.is_infinite() || r.is_nan() {
+        return Err(float_overflow());
+    }
+    if r == 0.0 {
+        return Err(errf!(
+            SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
+            "value out of range: underflow"
+        ));
+    }
+    Ok(r)
+}
+
+/// lgamma(x) as Postgres 18's dlgamma: an infinite result of a finite argument (a pole
+/// at zero and the negative integers, or an overflow) is 22003.
+fn lgamma(x: f64) -> Result<f64> {
+    let r = c_lgamma(x);
+    if r.is_infinite() && x.is_finite() {
+        return Err(float_overflow());
+    }
+    Ok(r)
 }

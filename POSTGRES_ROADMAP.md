@@ -236,7 +236,8 @@ than read unfiltered.
 | `SHOW`, `current_setting`, `SET` | partial: settings Overlite does not use read as empty |
 | `pg_settings` | partial: the settings `SHOW` answers |
 | `pg_stat_activity`, `pg_locks`, `pg_stat_*` | no |
-| `pg_size_pretty`, `pg_database_size`, `pg_typeof` | no |
+| `pg_typeof` | yes |
+| `pg_size_pretty`, `pg_database_size` | no |
 | Cancel requests | yes |
 | Autovacuum, bloat, transaction-ID wraparound | never, and you don't want them |
 

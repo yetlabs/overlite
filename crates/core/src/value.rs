@@ -91,10 +91,11 @@ pub fn format_float(f: f64) -> String {
         return "NaN".to_string();
     }
     if f.is_infinite() {
+        // As float8out writes it.
         return if f > 0.0 {
-            "+Inf".to_string()
+            "Infinity".to_string()
         } else {
-            "-Inf".to_string()
+            "-Infinity".to_string()
         };
     }
     if f == 0.0 {

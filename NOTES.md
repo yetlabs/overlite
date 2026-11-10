@@ -682,6 +682,14 @@ hold:
   still not taken, and psql's `\d+` shows no Options line: it concatenates reloptions
   with another array, and the typing does not know a catalog column for an array.
 
+- pg_typeof(x) names the type the statement's typing gives x (an enum column, which
+  the typing does not know, is `text`; an expression it does not type is named by the
+  value SQLite holds). pg_get_acl (18) gives a table's, a column's or a schema's
+  privileges. gamma and lgamma (18) call the C library's tgamma and lgamma, as
+  Postgres does, so their last digit is the platform's (musl's and macOS' differ by an
+  ulp), with Postgres' 22003 at a pole, an overflow and an underflow. A float's
+  infinity is written `Infinity` and `-Infinity`, as float8out writes it (it was
+  `+Inf`); a NaN is NULL, as SQLite holds no NaN.
 - psql 18's `\dx`, `\dd`, `\dconfig`, `\dp` and `\da` answer as Postgres 18's do
   (`psql_meta_commands`): pg_available_extensions (a relation, and the function in a
   FROM with its column list) with Postgres' descriptions, which pg_description has for
@@ -698,8 +706,8 @@ hold:
   view has its query in pg_get_viewdef (pg_dump stopped at it) and its `_RETURN` rule.
 
 Still not done: `\sf` prints the CREATE FUNCTION as written; `\dn+` names the public
-schema's owner `postgres` where Postgres 18 says pg_database_owner. pg_typeof() is
-missing, and so are pg_get_acl, has_largeobject_privilege and gamma/lgamma of 18.
+schema's owner `postgres` where Postgres 18 says pg_database_owner.
+has_largeobject_privilege is missing (there are no large objects).
 RETURNING OLD/NEW (18) is refused: the parser reads `old.v` as a table that is not
 there. Overlite still reports server_version 16.0: psql and pg_dump 18 then use their
 queries for 16, which the catalogs answer; reporting 18 would have them read 18's

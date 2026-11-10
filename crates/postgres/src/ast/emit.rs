@@ -4511,6 +4511,8 @@ impl<'a> Emitter<'a> {
                     return self.description(node(o)?, None, Some(node(c)?));
                 }
                 ("obj_description", [o]) => return self.description(node(o)?, None, None),
+                ("pg_typeof", [x]) => return self.pg_typeof(node(x)?),
+                ("pg_get_acl", [c, o, n]) => return self.object_acl(node(c)?, node(o)?, node(n)?),
                 ("col_description", [o, n]) => return self.description(node(o)?, Some(node(n)?), None),
                 ("pg_get_indexdef", [o, ..]) => return self.indexdef(node(o)?),
                 ("pg_get_constraintdef", [o, ..]) => return self.constraintdef(node(o)?),
@@ -4794,6 +4796,43 @@ impl<'a> Emitter<'a> {
             self.push(" AND classoid = 1259");
         }
         self.push(" LIMIT 1)");
+        Ok(())
+    }
+
+    /// pg_typeof(x): the type the statement's typing gives x, as regtype prints it;
+    /// where the typing does not know it, the type of the value SQLite holds.
+    fn pg_typeof(&mut self, x: &NodeEnum) -> Out {
+        if let Some(name) = self.ty(x).pg_name() {
+            // x stays in the statement, which an aggregate in it makes one row of.
+            let name = quote_literal(&name);
+            self.push("CASE WHEN (");
+            self.expr(x, Prec::Or)?;
+            self.push(&[") IS NULL THEN ", &name, " ELSE ", &name, " END"].concat());
+            return Ok(());
+        }
+        self.push("CASE typeof(");
+        self.expr(x, Prec::Or)?;
+        self.push(
+            ") WHEN 'integer' THEN 'bigint' WHEN 'real' THEN 'double precision' WHEN 'blob' THEN 'bytea' \
+             WHEN 'null' THEN 'unknown' ELSE 'text' END",
+        );
+        Ok(())
+    }
+
+    /// pg_get_acl(classid, objid, objsubid): the privileges of a table (or a column of
+    /// it) or a schema, as their catalogs keep them; NULL for another object.
+    fn object_acl(&mut self, class: &NodeEnum, oid: &NodeEnum, sub: &NodeEnum) -> Out {
+        self.push(
+            "(SELECT CASE WHEN _c = 1259 AND _s = 0 THEN (SELECT relacl FROM pg_class WHERE oid = _o) \
+             WHEN _c = 1259 THEN (SELECT attacl FROM pg_attribute WHERE attrelid = _o AND attnum = _s) \
+             WHEN _c = 2615 THEN (SELECT nspacl FROM pg_namespace WHERE oid = _o) END FROM (SELECT ",
+        );
+        self.expr(class, Prec::Or)?;
+        self.push(" AS _c, ");
+        self.expr(oid, Prec::Or)?;
+        self.push(" AS _o, ");
+        self.expr(sub, Prec::Or)?;
+        self.push(" AS _s))");
         Ok(())
     }
 

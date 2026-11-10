@@ -280,3 +280,59 @@ fn psql_meta_commands() {
         format!("{{{o}=arwdDxtm/{o}}}")
     );
 }
+
+// pg_typeof gives the type the statement's typing gives its argument, pg_get_acl (18)
+// an object's privileges, and gamma and lgamma (18) the C library's, as Postgres calls
+// it, with its errors at a pole, an overflow and an underflow.
+#[test]
+fn pg_typeof_pg_get_acl_and_gamma() {
+    let conn = connect(&start_server());
+    must_exec(&conn, "CREATE ROLE reader");
+    must_exec(
+        &conn,
+        "CREATE TABLE t (id int PRIMARY KEY, big bigint, price numeric(10,2), tags text[], doc jsonb, at timestamptz)",
+    );
+    must_exec(&conn, "GRANT SELECT ON t TO reader");
+    for (q, want) in [
+        (
+            "SELECT pg_typeof(id) || ',' || pg_typeof(big) || ',' || pg_typeof(price) || ',' || pg_typeof(tags) \
+             || ',' || pg_typeof(doc) || ',' || pg_typeof(at) FROM (SELECT * FROM t UNION ALL SELECT 1, 2, 3, NULL, NULL, NULL) s LIMIT 1",
+            "integer,bigint,numeric,text[],jsonb,timestamp with time zone",
+        ),
+        (
+            "SELECT pg_typeof(1) || ',' || pg_typeof(1.5) || ',' || pg_typeof('x') || ',' || pg_typeof(NULL) \
+             || ',' || pg_typeof(true) || ',' || pg_typeof(1::float8) || ',' || pg_typeof(now())",
+            "integer,numeric,unknown,unknown,boolean,double precision,timestamp with time zone",
+        ),
+        ("SELECT pg_typeof(count(*)) FROM t", "bigint"),
+        ("SELECT pg_typeof(gamma(5))", "double precision"),
+        (
+            "SELECT pg_get_acl('pg_class'::regclass, 't'::regclass, 0) = (SELECT relacl FROM pg_class WHERE relname = 't')",
+            "t",
+        ),
+        (
+            "SELECT pg_get_acl('pg_class'::regclass, 't'::regclass, 0) LIKE '%reader=r/%'",
+            "t",
+        ),
+        ("SELECT gamma(5)", "24"),
+        ("SELECT gamma(1)", "1"),
+        ("SELECT lgamma(1)", "0"),
+        ("SELECT round(gamma(0.5) ^ 2 * 1e9)", "3141592654"),
+        ("SELECT round(lgamma(100) * 1e6)", "359134205"),
+        ("SELECT gamma('Infinity'::float8)", "Infinity"),
+    ] {
+        assert_eq!(scan_str(&conn, q), want, "{q}");
+    }
+    for (q, message) in [
+        ("SELECT gamma(0)", "value out of range: overflow"),
+        ("SELECT gamma(-1)", "value out of range: overflow"),
+        ("SELECT gamma(200)", "value out of range: overflow"),
+        ("SELECT gamma(-1000.5)", "value out of range: underflow"),
+        ("SELECT lgamma(0)", "value out of range: overflow"),
+        ("SELECT lgamma(-2)", "value out of range: overflow"),
+    ] {
+        let err = conn.exec(q, &[]).expect_err(q);
+        assert_eq!(err.code(), "22003", "{q}");
+        assert_eq!(err.pg().map(|e| e.message.as_str()), Some(message), "{q}");
+    }
+}
