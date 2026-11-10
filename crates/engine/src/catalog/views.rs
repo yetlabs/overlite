@@ -18,7 +18,17 @@ lazy_regex!(
 /// substituted is not rescanned.
 fn frag(tmpl: &str, r: &SchemaRef, db_name: &str, enum_base: i64) -> String {
     let tmpl: &str = &tmpl.replace("@SERIAL_DEFAULT@", SERIAL_DEFAULT);
-    let pairs: [(&str, String); 9] = [
+    let pairs: [(&str, String); 10] = [
+        // The schema of an undotted name in the schema's file: a single-file schema's
+        // tables are dotted names beside public's.
+        (
+            "@FILESCHEMA@",
+            if r.prefix.is_empty() {
+                r.pg_name.clone()
+            } else {
+                "public".to_string()
+            },
+        ),
         ("@DB@", r.db.clone()),
         ("@MASTER@", r.master()),
         ("@NS@", r.ns_oid.to_string()),
@@ -606,7 +616,7 @@ const PG_CONSTRAINT_TMPL: &str = concat!(
     FROM (SELECT "to", seq FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq) k) AS confkey,
  NULL AS conbin,
  (SELECT group_concat(quote_ident("from"), ', ') FROM (SELECT "from" FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq)) AS ov_cols,
- quote_ident(fk."table") || '(' || (SELECT group_concat(quote_ident("to"), ', ') FROM (SELECT "to" FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq)) || ')' ||
+ overlite_relation_ref(fk."table", '@FILESCHEMA@') || '(' || (SELECT group_concat(quote_ident("to"), ', ') FROM (SELECT "to" FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq)) || ')' ||
  CASE fk.on_update WHEN 'NO ACTION' THEN '' ELSE ' ON UPDATE ' || fk.on_update END ||
  CASE fk.on_delete WHEN 'NO ACTION' THEN '' ELSE ' ON DELETE ' || fk.on_delete END ||
  CASE "#,
@@ -738,7 +748,7 @@ FROM @MASTER@ t JOIN @MASTER@ v ON v.type = 'view' AND v.name = '_overlite_mv_' 
 WHERE t.type='table'"#;
 
 const PG_VIEWS_TMPL: &str = r#"SELECT '@PG@' AS schemaname, substr(name,@PLEN@) AS viewname,
- @ROLE@ AS viewowner, overlite_view_body(sql) AS definition
+ @ROLE@ AS viewowner, overlite_view_body(sql, '@FILESCHEMA@') AS definition
 FROM @MASTER@ WHERE type='view' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_overlite_*'"#;
 
 const INFO_COLUMNS_TMPL: &str = r#"SELECT @DBNAME@ AS table_catalog, '@PG@' AS table_schema, substr(m.name,@PLEN@) AS table_name,

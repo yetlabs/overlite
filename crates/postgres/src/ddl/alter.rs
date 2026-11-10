@@ -406,6 +406,30 @@ impl Session {
             ColumnCmd::SetGenerated { always } => return self.alter_set_generated(table, &col, *always),
             _ => {}
         }
+        // A nextval default is no SQLite default: it is kept in _overlite_defaults, which
+        // an INSERT that leaves the column out reads, as CREATE TABLE keeps one.
+        let nextval = match cmd {
+            ColumnCmd::SetDefault => crate::ddl::defaults::nextval_in(&default_arg(sql)),
+            _ => None,
+        };
+        if matches!(cmd, ColumnCmd::SetDefault | ColumnCmd::DropDefault) {
+            let (t, c) = (quote_literal(table), quote_literal(&col));
+            self.exec(
+                &format!(
+                    "DELETE FROM _overlite_defaults WHERE lower(tablename) = lower({t}) AND lower(colname) = lower({c})"
+                ),
+                &[],
+            )?;
+            if let Some(seq) = &nextval {
+                self.exec(
+                    &format!(
+                        "INSERT INTO _overlite_defaults (tablename, colname, seqname) VALUES ({t}, {c}, {})",
+                        quote_literal(seq)
+                    ),
+                    &[],
+                )?;
+            }
+        }
         // A new type's modifier, which the rows are made to fit, as Postgres rewrites them.
         let mut fit: Option<String> = None;
         let edit: ColumnEdit = if matches!(cmd, ColumnCmd::Type) {
@@ -435,6 +459,8 @@ impl Session {
             Box::new(|name, typ, cons| join_def(name, typ, &add_not_null(cons)))
         } else if matches!(cmd, ColumnCmd::DropNotNull) {
             Box::new(|name, typ, cons| join_def(name, typ, &drop_not_null(cons)))
+        } else if nextval.is_some() {
+            Box::new(|name, typ, cons| join_def(name, typ, &drop_default(cons)))
         } else if matches!(cmd, ColumnCmd::SetDefault) {
             let def = default_arg(sql);
             Box::new(move |name, typ, cons| join_def(name, typ, &set_default(cons, &default_value(name, typ, &def))))

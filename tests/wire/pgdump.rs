@@ -114,7 +114,8 @@ fn pg_dump_integration() {
     assert_contains!(dump, "id integer NOT NULL"); // NOT NULL
     assert_contains!(dump, "active boolean DEFAULT true"); // DEFAULT
     assert_contains!(dump, "ADD CONSTRAINT emp_pkey PRIMARY KEY (id)"); // PK constraint
-    assert_contains!(dump, "FOREIGN KEY (dept_id) REFERENCES dept(id)");
+    // pg_dump empties the search_path, so every name is qualified.
+    assert_contains!(dump, "FOREIGN KEY (dept_id) REFERENCES public.dept(id)");
     assert_contains!(dump, "ADD CONSTRAINT dept_name_key UNIQUE (name)"); // UNIQUE
     assert_contains!(dump, "CREATE SEQUENCE public.order_seq"); // sequence
     assert_contains!(dump, "INCREMENT BY 5");
@@ -188,8 +189,10 @@ fn pg_dump_restores_into_a_new_database() {
     }
     let text = dump(&bin, &addr, ENTRY_DATABASE);
     for want in [
-        "id bigint DEFAULT nextval('books_id_seq'::regclass) NOT NULL",
-        "n integer DEFAULT nextval('books_n_seq'::regclass) NOT NULL",
+        // A sequence's default is set after the sequence is made, as Postgres' is.
+        "ALTER TABLE ONLY public.books ALTER COLUMN id SET DEFAULT nextval('public.books_id_seq'::regclass);",
+        "ALTER TABLE ONLY public.books ALTER COLUMN n SET DEFAULT nextval('public.books_n_seq'::regclass);",
+        "SELECT id, title FROM public.books WHERE price < 10;",
         "CONSTRAINT name_not_blank CHECK (name <> '')",
         "CREATE UNIQUE INDEX books_title_lower ON public.books USING btree (lower(title));",
         "WHERE (price > 10)",
@@ -402,4 +405,147 @@ fn public_schema_comment() {
     assert_eq!(scan_str(&conn, q), "mine");
     must_exec(&conn, "COMMENT ON SCHEMA public IS NULL");
     assert_eq!(scan_str(&conn, q), "-");
+}
+
+// A custom-format dump (pg_dump -Fc) restores with pg_restore into a new database.
+// What Postgres 18 needs of it to restore there too: a view after the tables it reads
+// (pg_rewrite and pg_depend say so, whatever the names' order), a sequence's default
+// set after the sequence is made, and every name qualified, as pg_dump empties the
+// search_path.
+#[test]
+fn pg_restore_of_a_custom_dump() {
+    let (Some(dump_bin), Some(restore)) = (look_path("pg_dump"), look_path("pg_restore")) else {
+        skip_test!("pg_dump or pg_restore not installed");
+    };
+    let addr = start_cluster(8);
+    let conn = dial_db(&addr, ENTRY_DATABASE).unwrap();
+    for sql in [
+        "CREATE TABLE zauthors (id serial PRIMARY KEY, name text NOT NULL)",
+        "CREATE TABLE zbooks (id bigserial PRIMARY KEY, author_id int NOT NULL REFERENCES zauthors(id), title text)",
+        "CREATE VIEW a_titles AS SELECT b.title, a.name FROM zbooks b JOIN zauthors a ON a.id = b.author_id",
+        "CREATE VIEW a_first AS SELECT title FROM a_titles WHERE title < 'M'",
+        "CREATE SCHEMA shop",
+        "CREATE TABLE shop.items (sku text PRIMARY KEY, book bigint REFERENCES zbooks(id))",
+        "INSERT INTO zauthors (name) VALUES ('Ann')",
+        "INSERT INTO zbooks (author_id, title) VALUES (1, 'First'), (1, 'Second')",
+        "INSERT INTO shop.items VALUES ('a-1', 2)",
+        "CREATE DATABASE copy",
+    ] {
+        must_exec(&conn, sql);
+    }
+    let port = addr.port().to_string();
+    let file = addr.dir().join("db.dump");
+    let file = file.to_str().unwrap();
+    let out = Command::new(dump_bin)
+        .args([
+            "-h",
+            addr.host(),
+            "-p",
+            &port,
+            "-U",
+            "postgres",
+            "-Fc",
+            "-f",
+            file,
+            ENTRY_DATABASE,
+        ])
+        .output()
+        .expect("pg_dump must start");
+    assert!(
+        out.status.success(),
+        "pg_dump failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let script = Command::new(&restore)
+        .args(["-f", "-", file])
+        .output()
+        .expect("pg_restore must start");
+    let script = String::from_utf8_lossy(&script.stdout).into_owned();
+    let at = |want: &str| script.find(want).unwrap_or_else(|| panic!("no {want} in:\n{script}"));
+    assert!(
+        at("CREATE TABLE public.zbooks") < at("CREATE VIEW public.a_titles"),
+        "{script}"
+    );
+    assert!(
+        at("CREATE VIEW public.a_titles") < at("CREATE VIEW public.a_first"),
+        "{script}"
+    );
+    assert!(
+        at("CREATE SEQUENCE public.zbooks_id_seq") < at("ALTER COLUMN id SET DEFAULT"),
+        "{script}"
+    );
+    for want in [
+        "FROM public.zbooks AS b JOIN public.zauthors AS a",
+        "FROM public.a_titles",
+        "nextval('public.zbooks_id_seq'::regclass)",
+        "REFERENCES public.zbooks(id)",
+    ] {
+        at(want);
+    }
+
+    let out = Command::new(&restore)
+        .args([
+            "-h",
+            addr.host(),
+            "-p",
+            &port,
+            "-U",
+            "postgres",
+            "-d",
+            "copy",
+            "--exit-on-error",
+            file,
+        ])
+        .output()
+        .expect("pg_restore must start");
+    assert!(
+        out.status.success(),
+        "pg_restore failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let copy = dial_db(&addr, "copy").unwrap();
+    for (q, want) in [
+        (
+            "SELECT string_agg(title || ':' || name, ',' ORDER BY title) FROM a_titles",
+            "First:Ann,Second:Ann",
+        ),
+        ("SELECT string_agg(title, ',') FROM a_first", "First"),
+        ("SELECT sku || ':' || book FROM shop.items", "a-1:2"),
+        // The defaults set after the tables were made take the sequences' next values.
+        (
+            "INSERT INTO zbooks (author_id, title) VALUES (1, 'Third') RETURNING id",
+            "3",
+        ),
+        ("INSERT INTO zauthors (name) VALUES ('Bo') RETURNING id", "2"),
+    ] {
+        assert_eq!(scan_str(&copy, q), want, "{q}");
+    }
+}
+
+// ALTER COLUMN ... SET DEFAULT nextval(...), as a dump sets a serial's default, gives
+// a row that leaves the column out the sequence's next value; DROP DEFAULT stops it.
+#[test]
+fn set_default_nextval() {
+    let conn = connect(&start_server());
+    for sql in [
+        "CREATE TABLE t (id bigint NOT NULL, v text)",
+        "CREATE SEQUENCE t_id_seq START 10",
+        "ALTER SEQUENCE t_id_seq OWNED BY t.id",
+        "ALTER TABLE ONLY public.t ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq'::regclass)",
+    ] {
+        must_exec(&conn, sql);
+    }
+    assert_eq!(scan_str(&conn, "INSERT INTO t (v) VALUES ('a') RETURNING id"), "10");
+    assert_eq!(scan_str(&conn, "INSERT INTO t (v) VALUES ('b') RETURNING id"), "11");
+    assert_eq!(
+        scan_str(
+            &conn,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 't'::regclass"
+        ),
+        "nextval('t_id_seq'::regclass)"
+    );
+    must_exec(&conn, "ALTER TABLE t ALTER COLUMN id DROP DEFAULT");
+    conn.exec("INSERT INTO t (v) VALUES ('c')", &[])
+        .expect_err("no default: id is NULL");
 }

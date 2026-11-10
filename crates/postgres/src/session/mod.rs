@@ -396,6 +396,7 @@ impl Session {
         }
         self.canceler.arm();
         let sp = self.search_path.as_deref();
+        overlite_engine::set_display_search_path(sp);
         let r = if self.in_tx() {
             self.db.tx_execute(sql, args, sp)
         } else {
@@ -404,6 +405,9 @@ impl Session {
         self.canceler.disarm();
         if let Some((before, local)) = overlite_engine::take_zone_change() {
             self.zone_changed_by_sql(before, local)?;
+        }
+        if let Some(change) = overlite_engine::take_search_path_change() {
+            self.search_path = change.0;
         }
         Ok(r?)
     }

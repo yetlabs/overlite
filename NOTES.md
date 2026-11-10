@@ -634,6 +634,19 @@ hold:
   reads first, pg_authid, and pg_auth_members' inherit_option and set_option exist.
   pg_authid holds no password, as every role may read it here, so a dump of roles
   carries none.
+- A custom-format dump (pg_dump -Fc) restores with pg_restore into Overlite and into
+  Postgres 18, and so does a plain one (tests/wire/pgdump.rs, checked by hand against
+  postgres:18-alpine). pg_get_viewdef, pg_get_constraintdef's REFERENCES and a nextval
+  default's sequence name a relation the session's search_path does not find with its
+  schema, as Postgres' ruleutils does: pg_dump empties the path (set_config, which now
+  sets the session's search_path), so its output is qualified throughout. A view's
+  query is read by Postgres' grammar for it (`ddl::view_reader`, given to the engine,
+  which does not link the grammar). Each view has its `_RETURN` rule in pg_rewrite, and
+  pg_depend ties the rule to the relations the query reads and a column's default to
+  its sequence, so pg_dump writes a view after its tables and a serial's default as an
+  ALTER TABLE ... SET DEFAULT after the sequence, as for Postgres. ALTER COLUMN ... SET
+  DEFAULT nextval(...) is kept as CREATE TABLE's is, in `_overlite_defaults` (it was
+  refused: SQLite takes no such default).
 - pg_dumpall reads pg_parameter_acl (empty: GRANT ... ON PARAMETER is not kept) and
   pg_tablespace_location, and its script restores into another server; the one error
   of the restore is Postgres' own, the CREATE ROLE of the role it runs as. The public
@@ -800,6 +813,12 @@ such a value is read as the text passes read it.
 - ROLLBACK TO a savepoint does not undo a SET ROLE or SET LOCAL ROLE made after it;
   the end of the transaction does (a SET ROLE is undone by a rollback, SET LOCAL at
   either end, as in Postgres). `set_config('role', ...)` changes no role.
+- In a database with a schema whose name is also an alias of the statement
+  (`FROM pg_tablespace s WHERE s.oid = ...` beside a schema `s`), `s.oid` is read as
+  the schema's table `oid`: 42703. The engine's schema pass (resolve/schema_qualify.rs)
+  tells a schema from an alias by the schema list alone. pg_dump's own queries use the
+  aliases `s`, `t`, `c`, `n` and `i`, so a database with a schema of one of those names
+  cannot be dumped.
 - A role's name compares without case, as `_overlite_roles.rolname` was created NOCASE
   and existing databases keep the table: `"Mixed"` and `mixed` are one role, where
   Postgres has two. Rebuilding the table at startup would rewrite stored data.

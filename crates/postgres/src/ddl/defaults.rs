@@ -63,6 +63,20 @@ fn nextval_of(expr: &pg_query::protobuf::Node) -> Option<String> {
     Some(name.to_string())
 }
 
+/// The sequence a default expression (as written) takes nextval of, without a schema.
+pub(crate) fn nextval_in(expr: &str) -> Option<String> {
+    tree::read_any(&["SELECT ", expr].concat(), |n| match n {
+        NodeEnum::SelectStmt(s) => match s.target_list.as_slice() {
+            [t] => match &t.node {
+                Some(NodeEnum::ResTarget(r)) => nextval_of(r.val.as_deref()?),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
 /// sql's column plan, when it is a CREATE TABLE with a column list.
 pub(crate) fn table_plan(sql: &str) -> Option<TablePlan> {
     use pg_query::protobuf::ConstrType;

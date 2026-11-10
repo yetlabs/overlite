@@ -58,6 +58,7 @@ impl Server {
     /// When the address cannot be bound.
     pub fn new(addr: &str, proto: Protocol, cluster: Arc<dyn Cluster>) -> std::io::Result<Server> {
         let ln = TcpListener::bind(addr)?;
+        overlite_engine::set_view_reader(crate::ddl::view_reader::reader());
         Ok(Server {
             proto: Arc::new(proto),
             cluster,

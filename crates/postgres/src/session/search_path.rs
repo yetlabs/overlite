@@ -59,8 +59,9 @@ impl Session {
     /// Renders the current path for SHOW (defaults like Postgres).
     fn search_path_string(&self) -> String {
         let path = match &self.search_path {
-            Some(p) if !p.is_empty() => p,
-            _ => return "\"$user\", public".to_string(),
+            Some(p) if p.is_empty() => return "\"\"".to_string(),
+            Some(p) => p,
+            None => return "\"$user\", public".to_string(),
         };
         let quoted: Vec<&str> = path
             .iter()

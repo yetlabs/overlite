@@ -53,6 +53,10 @@ pub use catalog::constraints::{Identity, NOT_VALID_MARK, identity_columns, relat
 pub use catalog::declared_typmod;
 pub use catalog::grants::{forget_table_rows_sql, move_table_rows_sql, set_session_role};
 pub use catalog::schema::stored_table_name;
+pub use catalog::visible::{
+    QualifyQuery, SearchPathChange, ViewReader, parse_search_path, set_display_search_path, set_view_reader,
+    take_search_path_change,
+};
 pub use cluster::{Cluster, DEFAULT_MAX_OPEN_DATABASES, open_cluster, single};
 pub use error::{Error, ErrorKind, Result};
 pub use resolve::TYPED_MARK;

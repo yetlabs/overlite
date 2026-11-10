@@ -24,13 +24,16 @@ pub(crate) mod sequences;
 mod triggers;
 mod type_mod;
 mod views;
+pub(crate) mod visible;
 
 use crate::builtins::arrays::{array_as_json, array_lower, is_json_array_text, json_array_len, json_arrays_overlap};
 use crate::builtins::casts::{CastType, assign, cast};
 use crate::builtins::dates::{age_fn, at_time_zone, date_trunc_fn, from_time_zone, to_char_fn};
 use crate::builtins::decimal::{DecAgg, DecSum, bin_dec, dec_cmp, dec_cmp_str, dec_round, dec_string, parse_dec};
 use crate::builtins::hstore::{hstore_get, hstore_in, hstore_keys, hstore_vals};
-use crate::builtins::json::{json_quote, jsonb_contains, jsonb_exists, jsonb_exists_all, jsonb_exists_any};
+use crate::builtins::json::{
+    Json, json_marshal, json_quote, jsonb_contains, jsonb_exists, jsonb_exists_all, jsonb_exists_any,
+};
 use crate::builtins::ranges::{
     Range, RangeKind, arg_str, bound_value, is_range_text, parse_range, range_construct, range_contains,
     range_contains_range, range_op, range_overlaps,
@@ -960,11 +963,11 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     // pg_get_expr(expr, relation[, pretty]) renders a stored expression. Our
     // pg_attrdef keeps the default's SQL text as adbin, so returning the first
     // argument yields the column default for pg_dump; other callers pass NULL.
-    scalar(conn, "pg_get_expr", -1, |args| {
+    scalar_nd(conn, "pg_get_expr", -1, |args| {
         if args.is_empty() || args[0].is_null() {
             return Ok(Value::Null); // NULL in -> NULL out (e.g. a policy with no WITH CHECK)
         }
-        Ok(Value::Text(args[0].to_string()))
+        Ok(Value::Text(visible::qualify_nextval(&args[0].to_string())))
     })?;
 
     // Definition-rendering helpers psql calls in \d; we don't reconstruct DDL yet,
@@ -1197,8 +1200,11 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         if args.len() < 2 {
             return text("");
         }
+        let local = matches!(&args[2], Value::Int(1)) || crate::catalog::truthy(&args[2]);
+        if args[0].to_string().eq_ignore_ascii_case("search_path") && !local {
+            visible::set_search_path_from_sql(&args[1].to_string());
+        }
         if args[0].to_string().eq_ignore_ascii_case("timezone") {
-            let local = matches!(&args[2], Value::Int(1)) || crate::catalog::truthy(&args[2]);
             return Ok(Value::Text(crate::builtins::dates::set_zone_from_sql(
                 &args[1].to_string(),
                 local,
@@ -1265,11 +1271,33 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             .to_string(),
         ))
     })?;
-    scalar(conn, "overlite_view_body", 1, |args| {
+    // The view's query (its stored DDL, its schema) with each relation named as the
+    // session's search_path finds it.
+    scalar_nd(conn, "overlite_view_body", 2, |args| {
         if args[0].is_null() {
             return Ok(Value::Null);
         }
-        Ok(view_body(&arg_str(&args[0])).map_or(Value::Null, |b| Value::Text([b, ";"].concat())))
+        let schema = arg_str(&args[1]);
+        Ok(view_body(&arg_str(&args[0])).map_or(Value::Null, |b| {
+            Value::Text([visible::qualified_view_query(b, &schema).as_str(), ";"].concat())
+        }))
+    })?;
+    // The relations a view's query reads, as a JSON array of `schema.name` (pg_depend).
+    scalar(conn, "overlite_view_relations", 2, |args| {
+        let Some(body) = (!args[0].is_null()).then(|| arg_str(&args[0])) else {
+            return Ok(Value::Null);
+        };
+        let relations = visible::view_relations(&body, &arg_str(&args[1]));
+        Ok(Value::Text(json_marshal(&Json::Arr(
+            relations.into_iter().map(Json::Str).collect(),
+        ))))
+    })?;
+    // A relation (as stored, the schema of its file) as a definition names it.
+    scalar_nd(conn, "overlite_relation_ref", 2, |args| {
+        Ok(Value::Text(visible::relation_ref(
+            &arg_str(&args[0]),
+            &arg_str(&args[1]),
+        )))
     })?;
     scalar(conn, "overlite_type_oid", 1, |args| {
         if args.is_empty() {
@@ -2128,10 +2156,12 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_inherits AS
 	 SELECT 0 AS inhrelid, 0 AS inhparent, 0 AS inhseqno, 0 AS inhdetachpending
 	 WHERE 0"#,
+    // A view's ON SELECT rule, which pg_dump makes the view depend on, and through
+    // the rule's dependencies (pg_depend) on what the view reads.
     r#"CREATE TEMP VIEW IF NOT EXISTS pg_rewrite AS
-	 SELECT 0 AS oid, '' AS rulename, 0 AS ev_class, '1' AS ev_type,
-	        'O' AS ev_enabled, 0 AS is_instead, NULL AS ev_qual, NULL AS ev_action
-	 WHERE 0"#,
+	 SELECT c.oid AS oid, '_RETURN' AS rulename, c.oid AS ev_class, '1' AS ev_type,
+	        'O' AS ev_enabled, 1 AS is_instead, NULL AS ev_qual, NULL AS ev_action, 2618 AS tableoid
+	 FROM pg_class c WHERE c.relkind = 'v'"#,
     // pg_policy: real RLS policies from _overlite_policies. polcmd maps the
     // command to Postgres' single-char code; polqual/polwithcheck carry the
     // expression text (what psql renders for \d). polroles NULL means "to all".
@@ -2198,6 +2228,23 @@ static STATIC_CATALOG_VIEWS: &[&str] = &[
 	 JOIN pg_attribute a ON a.attrelid = t.oid AND lower(a.attname) = lower(d.colname)
 	      AND (a.attidentity <> '' OR instr(overlite_column_def((SELECT sql FROM sqlite_master
 	           WHERE type = 'table' AND name = d.tablename), a.attname), '/*overlite owned sequence*/'))
+	 UNION ALL SELECT 2604, d.oid, 0, 1259, d.adrelid, d.adnum, 'a' FROM pg_attrdef d
+	 UNION ALL SELECT 2604, d.oid, 0, 1259, q.oid, 0, 'n'
+	 FROM pg_attrdef d JOIN pg_class q ON q.relkind = 'S'
+	 JOIN pg_namespace qn ON qn.oid = q.relnamespace
+	 WHERE d.adbin LIKE 'nextval(''%'
+	   AND substr(d.adbin, 10, instr(d.adbin, '''::regclass') - 10)
+	       IN (q.relname, qn.nspname || '.' || q.relname)
+	 UNION ALL SELECT 2618, r.oid, 0, 1259, r.ev_class, 0, 'i' FROM pg_rewrite r
+	 UNION ALL SELECT 2618, v.oid, 0, 1259, t.oid, 0, 'n'
+	 FROM pg_class v JOIN pg_namespace vn ON vn.oid = v.relnamespace
+	 JOIN pg_views pv ON pv.schemaname = vn.nspname AND pv.viewname = v.relname
+	 JOIN json_each(overlite_view_relations(pv.definition, '')) r
+	 JOIN pg_class t ON t.relname = substr(r.value, instr(r.value, '.') + 1) AND t.oid <> v.oid
+	 JOIN pg_namespace tn ON tn.oid = t.relnamespace
+	      AND (tn.nspname = substr(r.value, 1, instr(r.value, '.') - 1)
+	           OR (r.value LIKE '.%' AND tn.oid IN (vn.oid, 2200)))
+	 WHERE v.relkind = 'v'
 	 UNION ALL SELECT 2616, o.oid, 0, 3079, CAST(x.rowid + 13000 AS INTEGER), 0, 'e'
 	 FROM pg_opclass o JOIN _overlite_extensions x ON x.extname = 'pg_trgm'
 	 WHERE o.opcname IN ('gin_trgm_ops', 'gist_trgm_ops')
