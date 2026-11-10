@@ -637,7 +637,10 @@ hold:
 
 Still not done: pg_dumpall stops at pg_parameter_acl (and whatever global catalog it
 reads after it), so only pg_dump per database works. The reverse direction (a dump
-from Postgres 18 restored here) and pgbench -i were not checked again in this round.
+from Postgres 18 restored here) was not checked in this round. pgbench 18 -i fails at
+its first table: `CREATE TABLE ... WITH (fillfactor=100)` is a syntax error here (a
+storage parameter of an index is taken, one of a table is not); its point lookups run
+on tables made by hand, at the speed they had.
 psql 18 meta-commands answer but for `\dx` (its query reads a function with a column
 list: 0A000), `\dd` (pg_opfamily_is_visible is missing) and `\drds`, which now finds
 pg_db_role_setting; `\dconfig server_version*` lists nothing, as pg_settings does not
