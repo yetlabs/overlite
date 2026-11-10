@@ -80,7 +80,10 @@ pub(crate) fn uuidv7(a: &[Value]) -> Result<Value> {
 
 /// A UUID's 16 bytes, in any spelling uuid_in takes; None when the text is no UUID.
 fn uuid_bytes(v: &Value) -> Option<[u8; 16]> {
-    let s: String = arg_str(v).chars().filter(|c| *c != '-' && *c != '{' && *c != '}').collect();
+    let s: String = arg_str(v)
+        .chars()
+        .filter(|c| *c != '-' && *c != '{' && *c != '}')
+        .collect();
     let raw = hex::decode(s.trim()).ok()?;
     raw.try_into().ok()
 }
@@ -177,7 +180,9 @@ mod tests {
         let Value::Text(u) = uuidv7(&[]).unwrap() else { panic!() };
         let v = Value::Text(u);
         assert_eq!(uuid_extract_version(std::slice::from_ref(&v)), Value::Int(7));
-        let Value::Text(t) = uuid_extract_timestamp(&[v]) else { panic!() };
+        let Value::Text(t) = uuid_extract_timestamp(&[v]) else {
+            panic!()
+        };
         assert!(t.starts_with(&Utc::now().format("%Y-%m-%d").to_string()), "{t}");
     }
 
