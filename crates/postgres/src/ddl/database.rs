@@ -94,6 +94,7 @@ impl Session {
             )),
             DatabaseDdl::Create(name) => {
                 self.cluster.create_database(&name)?;
+                self.copy_roles_to(&name)?;
                 Ok(Command::from("CREATE DATABASE"))
             }
             DatabaseDdl::Drop { name, if_exists } => {
@@ -132,6 +133,38 @@ impl Session {
                 Ok(Command::from("ALTER DATABASE"))
             }
         }
+    }
+
+    /// Gives a database just created the roles and memberships of this one. Roles are
+    /// the cluster's in Postgres, and each file here keeps its own, so a role made
+    /// before CREATE DATABASE (the usual CREATE USER, CREATE DATABASE, GRANT) is the
+    /// same role, with the same password, in the new database.
+    fn copy_roles_to(&mut self, database: &str) -> Result<()> {
+        let eng = self.cluster.engine(database)?;
+        let r = (|| -> Result<()> {
+            let target = eng.session()?;
+            for (table, verb) in [
+                ("_overlite_roles", "INSERT OR REPLACE"),
+                ("_overlite_memberships", "INSERT"),
+            ] {
+                let rs = self.db.execute(&format!("SELECT * FROM {table}"), &[])?;
+                if rs.rows.is_empty() {
+                    continue;
+                }
+                let cols: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
+                let insert = format!(
+                    "{verb} INTO {table} ({}) VALUES ({})",
+                    cols.join(", "),
+                    vec!["?"; cols.len()].join(", ")
+                );
+                for row in &rs.rows {
+                    target.execute(&insert, row)?;
+                }
+            }
+            Ok(())
+        })();
+        self.cluster.release(database);
+        r
     }
 
     /// Answers a query against pg_database from the cluster, so a client sees the

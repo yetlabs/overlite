@@ -176,3 +176,48 @@ fn existing_sibling_is_a_database() {
     let v: String = conn.query_row("SELECT v FROM t", &[]).scan().unwrap();
     assert_eq!(v, "from before");
 }
+
+// Roles belong to the cluster in Postgres, so a role made before CREATE DATABASE logs
+// into the new database with its own password and is the same role there: the setup
+// of Zitadel and most tools (CREATE USER, CREATE DATABASE, GRANT, then connect as the
+// user) depends on it.
+#[test]
+fn a_new_database_has_the_roles_there_were() {
+    let addr = start_cluster_env(8, Env::password("admin-pw"));
+    let admin = connect_config(
+        &addr,
+        &Config::new()
+            .user("postgres", "admin-pw")
+            .database(ENTRY_DATABASE)
+            .simple(),
+    )
+    .unwrap();
+    must_exec(&admin, "CREATE USER app WITH PASSWORD 'app-pw'");
+    must_exec(&admin, "CREATE ROLE readers");
+    must_exec(&admin, "GRANT readers TO app");
+    must_exec(&admin, "CREATE DATABASE appdb");
+    must_exec(&admin, r#"GRANT ALL ON DATABASE appdb TO app"#);
+
+    let app = connect_config(&addr, &Config::new().user("app", "app-pw").database("appdb").simple())
+        .expect("the role's own password opens the new database");
+    let who: String = app.query_row("SELECT current_user", &[]).scan().unwrap();
+    assert_eq!(who, "app");
+    let roles: String = app
+        .query_row(
+            "SELECT string_agg(rolname || ':' || CASE WHEN rolcanlogin THEN 'login' ELSE 'nologin' END, ',' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('app', 'readers')",
+            &[],
+        )
+        .scan()
+        .unwrap();
+    assert_eq!(roles, "app:login,readers:nologin");
+    let member: String = app
+        .query_row(
+            "SELECT CASE WHEN pg_has_role('app', 'readers', 'MEMBER') THEN 'member' ELSE 'not' END",
+            &[],
+        )
+        .scan()
+        .unwrap();
+    assert_eq!(member, "member", "the membership comes along with the roles");
+    connect_config(&addr, &Config::new().user("app", "admin-pw").database("appdb").simple())
+        .expect_err("the global password is not the role's");
+}

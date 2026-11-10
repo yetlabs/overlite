@@ -795,6 +795,13 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
   statement.
 - ALTER DATABASE RENAME cannot be rolled back, so it is 0A000 in a transaction. A
   database name is held to 63 bytes with 42622, where Postgres truncates with a notice.
+- Roles are kept per database file, where Postgres has one set for the cluster. CREATE
+  DATABASE gives the new database the roles and memberships of the database it runs
+  in, so the usual CREATE USER, CREATE DATABASE, GRANT and then logging into the new
+  database as that user works with the user's own password
+  (tests/wire/cluster.rs). A role created, altered or dropped afterwards changes only
+  the database it was run in: elsewhere it is missing (and logs in with
+  POSTGRES_PASSWORD, as a role the catalog does not hold) or keeps what it was.
 - An operator class is known by its `_ops` suffix; one with parameters is not taken.
 - PL/pgSQL is not run: CREATE FUNCTION ... LANGUAGE plpgsql is still taken without
   effect, and a call to one fails.
