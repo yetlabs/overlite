@@ -144,6 +144,7 @@ impl Sqlite {
             cursors: crate::cursor::OpenQueries::default(),
             pending_begin: Cell::new(false),
             immediate_fks: Cell::new(false),
+            holds_gate: Cell::new(false),
             views_and_triggers: std::cell::RefCell::new(None),
             _permit: permit,
         };
@@ -179,6 +180,7 @@ impl Sqlite {
             cursors: crate::cursor::OpenQueries::default(),
             pending_begin: Cell::new(false),
             immediate_fks: Cell::new(false),
+            holds_gate: Cell::new(false),
             views_and_triggers: std::cell::RefCell::new(None),
             _permit: permit,
         })
@@ -212,6 +214,8 @@ pub struct DbSession {
     pending_begin: Cell<bool>,
     /// SET CONSTRAINTS ALL IMMEDIATE holds in the open transaction: deferred.rs.
     pub(crate) immediate_fks: Cell<bool>,
+    /// Whether this connection holds the database's write gate (db_state.rs).
+    holds_gate: Cell<bool>,
     /// The views and triggers of the schema, as [`DbSession::views_and_triggers`]
     /// read them, at the schema_version they were read at.
     views_and_triggers: std::cell::RefCell<Option<(i64, std::sync::Arc<ViewsAndTriggers>)>>,
@@ -231,6 +235,9 @@ pub struct ViewsAndTriggers {
 impl Drop for DbSession {
     fn drop(&mut self) {
         self.cursors.clear();
+        if self.holds_gate.replace(false) {
+            self.state.write_gate.release();
+        }
     }
 }
 
@@ -282,7 +289,9 @@ impl DbSession {
             return rs;
         }
         self.begin_for(sql)?;
+        self.gate_for(sql)?;
         let rs = execute(sp, &self.state, &self.conn, sql, args);
+        self.settle_gate();
         if rs.is_ok() {
             self.check_immediate()?;
         }
@@ -312,7 +321,10 @@ impl DbSession {
             return rs;
         }
         self.begin_for(sql)?;
-        let rs = execute(sp, &self.state, &self.conn, sql, args)?;
+        self.gate_for(sql)?;
+        let rs = execute(sp, &self.state, &self.conn, sql, args);
+        self.settle_gate();
+        let rs = rs?;
         self.check_immediate()?;
         Ok(rs)
     }
@@ -361,10 +373,27 @@ impl DbSession {
         if !self.pending_begin.get() {
             return Ok(true);
         }
+        if !self.holds_gate.get() {
+            let wait = if nowait {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_millis(BUSY_TIMEOUT_MS)
+            };
+            if !self.state.write_gate.acquire(wait, &|| self.interrupted()) {
+                if nowait {
+                    return Ok(false);
+                }
+                return Err(self.gate_refusal());
+            }
+            self.holds_gate.set(true);
+        }
         if nowait {
             let _ = self.conn.busy_timeout(std::time::Duration::ZERO);
         }
         let r = self.conn.execute_batch("begin immediate");
+        if r.is_err() {
+            self.settle_gate();
+        }
         if nowait {
             let _ = self
                 .conn
@@ -392,6 +421,50 @@ impl DbSession {
     /// state in which PRAGMA foreign_keys takes effect.
     pub fn is_autocommit(&self) -> bool {
         !self.pending_begin.get() && self.conn.is_autocommit()
+    }
+
+    /// Takes the write gate before a statement that writes and begins no transaction
+    /// of its own: SQLite's lock is then free of this process's other writers. In a
+    /// transaction SQLite opened without the gate it is not taken, as this
+    /// connection may already hold SQLite's lock that the gate's holder waits for.
+    fn gate_for(&self, sql: &str) -> Result<()> {
+        if self.holds_gate.get() || !self.conn.is_autocommit() || is_read_only(sql) {
+            return Ok(());
+        }
+        if !self
+            .state
+            .write_gate
+            .acquire(std::time::Duration::from_millis(BUSY_TIMEOUT_MS), &|| {
+                self.interrupted()
+            })
+        {
+            return Err(self.gate_refusal());
+        }
+        self.holds_gate.set(true);
+        Ok(())
+    }
+
+    /// Gives the gate back once SQLite's transaction has ended.
+    fn settle_gate(&self) {
+        if self.holds_gate.get() && self.conn.is_autocommit() && !self.pending_begin.get() {
+            self.holds_gate.set(false);
+            self.state.write_gate.release();
+        }
+    }
+
+    /// Whether a CancelRequest interrupted this connection.
+    fn interrupted(&self) -> bool {
+        // SAFETY: the handle is this connection's, open for as long as self is, and
+        // sqlite3_is_interrupted only reads its flag.
+        unsafe { ffi::sqlite3_is_interrupted(self.conn.handle()) != 0 }
+    }
+
+    /// Why the gate was not had: a cancel, or the lock held past busy_timeout.
+    fn gate_refusal(&self) -> Error {
+        if self.interrupted() {
+            return Error::with_state(SqlState::QUERY_CANCELED, "canceling statement due to user request");
+        }
+        Error::with_state(SqlState::LOCK_NOT_AVAILABLE, "canceling statement due to lock timeout")
     }
 
     /// Whether the client is in a transaction, written to or not yet.
@@ -427,8 +500,10 @@ impl DbSession {
             if !self.conn.is_autocommit() {
                 let _ = self.conn.execute_batch("rollback");
             }
+            self.settle_gate();
             return Err(sqlite_error(e));
         }
+        self.settle_gate();
         Ok(())
     }
 
@@ -443,6 +518,7 @@ impl DbSession {
             return Ok(());
         }
         let r = self.conn.execute_batch("rollback").map_err(sqlite_error);
+        self.settle_gate();
         self.forget_schema_objects();
         // A function created or dropped in the transaction is gone again, or back.
         crate::sql_funcs::reload_functions(&self.state, &self.conn);

@@ -27,6 +27,47 @@ pub(crate) struct DbState {
     /// The names, lower-cased, of the LANGUAGE sql functions a call may reach
     /// (sql_funcs): each connection that changes them, or opens, reads them again.
     pub(crate) func_names: RwLock<Arc<HashSet<String>>>,
+    /// The one writer among this process's connections to the database.
+    pub(crate) write_gate: WriteGate,
+}
+
+/// Who of this process's connections writes: SQLite lets one writer in at a time,
+/// and one that finds the lock taken sleeps in its busy handler (a millisecond, then
+/// longer) where the lock is often free again within microseconds. Writers of one
+/// process wait here instead, each woken as the one before is done; SQLite's own
+/// lock still holds the writers of other processes off.
+#[derive(Debug, Default)]
+pub(crate) struct WriteGate {
+    held: Mutex<bool>,
+    freed: std::sync::Condvar,
+}
+
+impl WriteGate {
+    /// Takes the gate: at once, or within wait, false when it was not had. interrupted
+    /// is asked between waits, and gives up the wait when it says so.
+    pub(crate) fn acquire(&self, wait: std::time::Duration, interrupted: &dyn Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        let mut held = self.held.locked();
+        while *held {
+            let now = std::time::Instant::now();
+            if now >= deadline || interrupted() {
+                return false;
+            }
+            let slice = (deadline - now).min(std::time::Duration::from_millis(50));
+            held = match self.freed.wait_timeout(held, slice) {
+                Ok((g, _)) => g,
+                Err(p) => p.into_inner().0,
+            };
+        }
+        *held = true;
+        true
+    }
+
+    /// Lets the next writer in.
+    pub(crate) fn release(&self) {
+        *self.held.locked() = false;
+        self.freed.notify_one();
+    }
 }
 
 static DB_STATES: LazyLock<Mutex<HashMap<String, Arc<DbState>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -48,6 +89,7 @@ pub(crate) fn state_for(path: &str) -> Arc<DbState> {
         table_types: RwLock::new(None),
         table_types_version: AtomicU64::new(0),
         func_names: RwLock::new(Arc::new(HashSet::new())),
+        write_gate: WriteGate::default(),
     });
     states.insert(path.to_string(), st.clone());
     st

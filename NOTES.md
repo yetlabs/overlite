@@ -51,6 +51,19 @@ requires. `cargo bench -p overlite-postgres` times the rewrite; it is not part o
 - mimalloc is the global allocator; SQLite uses the system malloc (glibc on Linux).
 - A CancelRequest calls sqlite3_interrupt directly; nothing runs per statement to
   watch for it.
+- Writers of one database queue on the server's write gate before SQLite's lock
+  (ARCHITECTURE.md, "When a transaction takes the write lock"): in SQLite's busy
+  handler they slept a millisecond and more at each try, which held 8 writers to
+  about one commit at a time with most of their time asleep. Measured on a 16-core
+  macOS machine, 8 clients, pgbench -M prepared, 10s runs alternating the builds:
+  `UPDATE kv SET v = v + 1 WHERE id = :id` from 6.7-14.5k to 16.6-23.3k tps, `INSERT`
+  from 7.0-12.4k to 7.9-22.0k tps (the disk's fsync spreads them); one client and point
+  lookups did not move. Durability is unchanged: each commit still syncs the WAL
+  (synchronous FULL). Group commit (synchronous NORMAL, the client answered after a
+  WAL sync shared by the commits beside it) was tried and dropped: on this disk the
+  sync and the WAL writes of the next commits wait on each other, and it did not beat
+  the gate alone; synchronous NORMAL by itself would lose acknowledged commits at a
+  power failure, which Postgres' default does not.
 - A full-table `LIKE` runs SQLite's own matching on every row, with no Rust in the loop
   (GLOB, over a pattern made once per statement), so only the engine's build can move
   it, and libsqlite3.a is byte-identical across the reorganized workspace. The same file timed run after run spreads by 10%: a lone

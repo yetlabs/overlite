@@ -375,6 +375,16 @@ after another writer committed would then fail at once (SQLITE_BUSY_SNAPSHOT), p
 any busy timeout; an immediate one at BEGIN would hold every other writer off for as
 long as a transaction that only reads stays open.
 
+Before SQLite's lock, a writer takes the database's write gate (`DbState::write_gate`):
+one per database file in the process, taken by `begin_writing` and by a statement
+that writes outside a transaction (`gate_for`), and given back when SQLite's
+transaction ends (`settle_gate`). A writer that finds SQLite's lock taken sleeps in
+its busy handler, a millisecond and then up to 100ms at a time, where the lock is
+usually free again within microseconds; one waiting on the gate is woken at the
+commit. The gate is never taken inside a transaction SQLite opened without it, where
+the connection may hold the lock its holder waits for; there, and against other
+processes, SQLite's busy handler still decides.
+
 ### The fast path contract
 
 `rewrite::fast_path` sends a statement to SQLite as written, without a parse, when
