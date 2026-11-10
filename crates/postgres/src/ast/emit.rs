@@ -3225,6 +3225,22 @@ impl<'a> Emitter<'a> {
                 _ => {}
             }
         }
+        if let NodeEnum::ParamRef(_) = arg {
+            // A parameter is the text of a name (or of an oid), as a literal is, read
+            // when the statement runs: its schema and quotes taken off.
+            self.push("(SELECT oid FROM ");
+            self.push(table);
+            self.push(" WHERE ");
+            self.push(col);
+            self.push(" = trim(substr(");
+            self.expr(arg, Prec::Or)?;
+            self.push(", instr(");
+            self.expr(arg, Prec::Or)?;
+            self.push(", '.') + 1), '\"') COLLATE NOCASE OR CAST(oid AS TEXT) = CAST(");
+            self.expr(arg, Prec::Or)?;
+            self.push(" AS TEXT) LIMIT 1)");
+            return Ok(());
+        }
         self.push("(SELECT ");
         self.push(col);
         self.push(" FROM ");

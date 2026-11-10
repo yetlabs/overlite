@@ -76,3 +76,110 @@ fn virtual_generated_columns() {
         "b=v c=v d=s"
     );
 }
+
+// A table's storage parameters (CREATE TABLE ... WITH (...)) are checked as Postgres'
+// heap checks them and kept in pg_class.reloptions, which pg_dump writes back; an
+// index's too. pgbench's tables are made so.
+#[test]
+fn storage_parameters() {
+    let conn = connect(&start_server());
+    must_exec(
+        &conn,
+        "CREATE TABLE tellers (tid int NOT NULL, filler char(84)) WITH (fillfactor=100, autovacuum_enabled = false)",
+    );
+    must_exec(&conn, "CREATE TABLE plain (a int) WITH (oids = false)");
+    must_exec(
+        &conn,
+        "CREATE INDEX tellers_tid ON tellers (tid) WITH (fillfactor = 70)",
+    );
+    must_exec(&conn, "INSERT INTO tellers VALUES (1, 'x')");
+    for (q, want) in [
+        (
+            "SELECT reloptions FROM pg_class WHERE relname = 'tellers'",
+            "{fillfactor=100,autovacuum_enabled=false}",
+        ),
+        (
+            "SELECT reloptions FROM pg_class WHERE relname = 'tellers_tid'",
+            "{fillfactor=70}",
+        ),
+        (
+            "SELECT coalesce(reloptions::text, '-') FROM pg_class WHERE relname = 'plain'",
+            "-",
+        ),
+        (
+            "SELECT array_to_string(reloptions, ', ') FROM pg_class WHERE relname = 'tellers'",
+            "fillfactor=100, autovacuum_enabled=false",
+        ),
+        ("SELECT count(*) FROM tellers", "1"),
+    ] {
+        assert_eq!(scan_str(&conn, q), want, "{q}");
+    }
+    for (sql, code) in [
+        ("CREATE TABLE bad (a int) WITH (fillfactor = 5)", "22023"),
+        ("CREATE TABLE bad (a int) WITH (fillfactor = 'x')", "22023"),
+        ("CREATE TABLE bad (a int) WITH (nope = 1)", "22023"),
+        ("CREATE TABLE bad (a int) WITH (autovacuum_enabled = maybe)", "22023"),
+        ("CREATE TABLE bad (a int) WITH (oids = true)", "0A000"),
+    ] {
+        let err = conn.exec(sql, &[]).expect_err(sql);
+        assert_eq!(err.code(), code, "{sql}");
+    }
+    // pgbench asks for a table's kind with the name as a parameter, and VACUUMs it.
+    let kind: String = conn
+        .query_row(
+            "SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::pg_catalog.regclass",
+            &[&"tellers"],
+        )
+        .scan()
+        .unwrap();
+    assert_eq!(kind, "r");
+    must_exec(&conn, "VACUUM ANALYZE tellers");
+    must_exec(&conn, "VACUUM tellers, plain");
+}
+
+// pgbench 18 -i makes its tables (WITH (fillfactor=100)), fills them, adds their keys
+// and foreign keys, and a short run of each built-in script then answers.
+#[test]
+fn pgbench_initializes_and_runs() {
+    let Some(bin) = look_path("pgbench") else {
+        skip_test!("pgbench not installed");
+    };
+    let addr = start_server();
+    let port = addr.port().to_string();
+    let base = ["-h", addr.host(), "-p", port.as_str(), "-U", "postgres"];
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(&bin)
+            .args(base)
+            .args(args)
+            .arg("test")
+            .output()
+            .expect("pgbench must start");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "pgbench {args:?} failed:\n{text}");
+        assert!(!text.contains("error"), "pgbench {args:?}:\n{text}");
+        text
+    };
+    run(&["-i", "-s", "1", "-I", "dtgvpf"]);
+    let conn = connect(&addr);
+    for (q, want) in [
+        ("SELECT count(*) FROM pgbench_accounts", "100000"),
+        ("SELECT count(*) FROM pgbench_tellers", "10"),
+        (
+            "SELECT reloptions FROM pg_class WHERE relname = 'pgbench_accounts'",
+            "{fillfactor=100}",
+        ),
+        (
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'pgbench_history_aid_fkey'",
+            "FOREIGN KEY (aid) REFERENCES pgbench_accounts(aid)",
+        ),
+    ] {
+        assert_eq!(scan_str(&conn, q), want, "{q}");
+    }
+    for script in [&["-b", "tpcb-like"][..], &["-S"], &["-N"], &["-S", "-M", "prepared"]] {
+        let mut args = vec!["-n", "-c", "2", "-t", "50"];
+        args.extend_from_slice(script);
+        let text = run(&args);
+        assert!(text.contains("number of failed transactions: 0"), "{text}");
+    }
+    assert_eq!(scan_str(&conn, "SELECT count(*) FROM pgbench_history"), "200");
+}

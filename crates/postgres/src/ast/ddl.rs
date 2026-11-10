@@ -277,6 +277,7 @@ fn create_table(src: &Src, s: &pb::CreateStmt) -> Result<String, Unsupported> {
         edits.remove(src, u, u + 1);
     }
     let mut after = from + 1;
+    let mut list_open = None;
     if let Some(open) = (from..src.toks.len()).find(|&i| src.toks[i].depth == 0 && src.text(i) == "(") {
         let items = src.items(open)?;
         if items.len() != s.table_elts.len() {
@@ -292,15 +293,168 @@ fn create_table(src: &Src, s: &pb::CreateStmt) -> Result<String, Unsupported> {
             }
         }
         after = src.close(open)? + 1;
+        list_open = Some(open);
     } else if !s.table_elts.is_empty() {
         return Err("CREATE TABLE elements");
+    }
+    // WITH (storage parameters) and WITHOUT OIDS: how Postgres lays out the table's
+    // pages, which SQLite does not; the parameters are kept in a comment for
+    // pg_class.reloptions, as Postgres checks and keeps them. SQLite keeps no comment
+    // after a CREATE TABLE's list, so it goes after the table's name.
+    let mut comments = Vec::new();
+    let end = src.body_end();
+    if let Some(w) = (after..end).find(|&i| src.toks[i].depth == 0 && src.is(i, "with") && src.text(i + 1) == "(") {
+        let c = src.close(w + 1)?;
+        edits.remove(src, w, c + 1);
+        let options = table_reloptions(&s.options)?;
+        if !options.is_empty() {
+            comments.push(reloptions_comment(&options));
+        }
+    }
+    if let Some(w) = (after..end).find(|&i| src.toks[i].depth == 0 && src.is(i, "without") && src.is(i + 1, "oids")) {
+        edits.remove(src, w, w + 2);
     }
     if !s.tablespacename.is_empty() {
         // TABLESPACE name: a table lives in its database's file.
         let t = src.find(after, src.toks.len(), 0, "tablespace").ok_or("TABLESPACE")?;
         edits.remove(src, t, t + 2);
     }
-    edits.apply(src.sql)
+    if let Some(open) = list_open.filter(|&o| o > 0 && !comments.is_empty()) {
+        edits.after(src, open - 1, [" ", &comments.join(" ")].concat());
+        return edits.apply(src.sql);
+    }
+    Ok(with_comments(edits.apply(src.sql)?, &comments))
+}
+
+/// The comment pg_class.reloptions reads a relation's storage parameters from.
+fn reloptions_comment(options: &[String]) -> String {
+    ["/*overlite reloptions ", &options.join(",").replace("*/", ""), "*/"].concat()
+}
+
+/// A storage parameter as Postgres keeps it in reloptions: `name=value`, a bare name
+/// being true.
+fn reloption(d: &pb::DefElem) -> Result<(String, String), Unsupported> {
+    let name = if d.defnamespace.is_empty() {
+        d.defname.to_lowercase()
+    } else {
+        [d.defnamespace.as_str(), ".", d.defname.as_str()]
+            .concat()
+            .to_lowercase()
+    };
+    let value = match d.arg.as_deref().and_then(|a| a.node.as_ref()) {
+        None => "true".to_string(),
+        Some(NodeEnum::Integer(i)) => i.ival.to_string(),
+        Some(NodeEnum::Float(f)) => f.fval.clone(),
+        Some(NodeEnum::String(s)) => s.sval.clone(),
+        Some(NodeEnum::Boolean(b)) => b.boolval.to_string(),
+        Some(NodeEnum::TypeName(t)) => t
+            .names
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(NodeEnum::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("."),
+        Some(_) => return Err("storage parameter value"),
+    };
+    Ok((name, value))
+}
+
+/// A table's storage parameters, checked as Postgres' heap checks them (22023 for an
+/// unknown one or a value out of its bounds), as `name=value`. OIDS=false is what a
+/// table is; the TOAST table's own (`toast.`) are taken and not reported.
+fn table_reloptions(options: &[pb::Node]) -> Result<Vec<String>, Unsupported> {
+    use overlite_core::SqlState;
+    const INTEGERS: [(&str, i64, i64); 20] = [
+        ("fillfactor", 10, 100),
+        ("toast_tuple_target", 128, 8160),
+        ("parallel_workers", 0, 1024),
+        ("autovacuum_vacuum_threshold", 0, i32::MAX as i64),
+        ("autovacuum_vacuum_max_threshold", -1, i32::MAX as i64),
+        ("autovacuum_vacuum_insert_threshold", -1, i32::MAX as i64),
+        ("autovacuum_analyze_threshold", 0, i32::MAX as i64),
+        ("autovacuum_vacuum_cost_limit", 1, 10000),
+        ("autovacuum_freeze_min_age", 0, 1_000_000_000),
+        ("autovacuum_freeze_max_age", 100_000, 2_000_000_000),
+        ("autovacuum_freeze_table_age", 0, 2_000_000_000),
+        ("autovacuum_multixact_freeze_min_age", 0, 1_000_000_000),
+        ("autovacuum_multixact_freeze_max_age", 10_000, 2_000_000_000),
+        ("autovacuum_multixact_freeze_table_age", 0, 2_000_000_000),
+        ("log_autovacuum_min_duration", -1, i32::MAX as i64),
+        ("autovacuum_vacuum_scale_factor", 0, 100),
+        ("autovacuum_vacuum_insert_scale_factor", 0, 100),
+        ("autovacuum_analyze_scale_factor", 0, 100),
+        ("autovacuum_vacuum_cost_delay", -1, 100),
+        ("vacuum_max_eager_freeze_failure_rate", 0, 1),
+    ];
+    const BOOLEANS: [&str; 4] = [
+        "autovacuum_enabled",
+        "user_catalog_table",
+        "vacuum_truncate",
+        "vacuum_index_cleanup",
+    ];
+    let refuse = |message: String| {
+        emit::refuse(emit::Refusal {
+            state: SqlState::INVALID_PARAMETER_VALUE,
+            message,
+            hint: None,
+            location: None,
+        })
+    };
+    let mut out = Vec::new();
+    for o in options {
+        let NodeEnum::DefElem(d) = node(o)? else {
+            return Err("storage parameter");
+        };
+        let (name, value) = reloption(d)?;
+        if name == "oids" {
+            if matches!(value.to_lowercase().as_str(), "false" | "off" | "0" | "no") {
+                continue;
+            }
+            return Err(emit::refuse(emit::Refusal {
+                state: SqlState::FEATURE_NOT_SUPPORTED,
+                message: "tables declared WITH OIDS are not supported".to_string(),
+                hint: None,
+                location: None,
+            }));
+        }
+        if let Some(rest) = name.strip_prefix("toast.") {
+            if !rest.starts_with("autovacuum_")
+                && rest != "log_autovacuum_min_duration"
+                && rest != "vacuum_truncate"
+                && rest != "vacuum_index_cleanup"
+            {
+                return Err(refuse(format!("unrecognized parameter \"{name}\"")));
+            }
+            continue;
+        }
+        if let Some((_, lo, hi)) = INTEGERS.iter().find(|(n, ..)| *n == name) {
+            let real = name.ends_with("_factor") || name.ends_with("_delay") || name.ends_with("_rate");
+            let Ok(v) = value.parse::<f64>() else {
+                let kind = if real { "floating point" } else { "integer" };
+                return Err(refuse(format!("invalid value for {kind} option \"{name}\": {value}")));
+            };
+            if !real && value.parse::<i64>().is_err() {
+                return Err(refuse(format!("invalid value for integer option \"{name}\": {value}")));
+            }
+            if v < *lo as f64 || v > *hi as f64 {
+                return Err(refuse(format!("value {value} out of bounds for option \"{name}\"")));
+            }
+        } else if BOOLEANS.contains(&name.as_str()) {
+            let ok = matches!(
+                value.to_lowercase().as_str(),
+                "true" | "false" | "on" | "off" | "yes" | "no" | "1" | "0" | "t" | "f" | "y" | "n"
+            ) || (name == "vacuum_index_cleanup" && value.eq_ignore_ascii_case("auto"));
+            if !ok {
+                return Err(refuse(format!("invalid value for boolean option \"{name}\": {value}")));
+            }
+        } else {
+            return Err(refuse(format!("unrecognized parameter \"{name}\"")));
+        }
+        out.push([name.as_str(), "=", value.as_str()].concat());
+    }
+    Ok(out)
 }
 
 /// What qualifies a column after its type, in the order written.
@@ -765,6 +919,17 @@ fn create_index(src: &Src, s: &pb::IndexStmt) -> Result<String, Unsupported> {
         } else if src.is(i, "with") && src.text(i + 1) == "(" {
             let c = src.close(i + 1)?;
             edits.remove(src, i, c + 1);
+            let options = s
+                .options
+                .iter()
+                .map(|o| match node(o)? {
+                    NodeEnum::DefElem(d) => reloption(d).map(|(n, v)| [n, v].join("=")),
+                    _ => Err("storage parameter"),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !options.is_empty() {
+                comments.push(reloptions_comment(&options));
+            }
             i = c + 1;
         } else if src.is(i, "tablespace") {
             let n = if src.text(i + 2) == "." { 4 } else { 2 };
@@ -1064,7 +1229,7 @@ mod tests {
         for (sql, want) in [
             (
                 "CREATE INDEX CONCURRENTLY \"i\" ON \"t\" USING gin (\"tags\") WITH (fastupdate = off)",
-                "CREATE INDEX \"i\" ON \"t\" (\"tags\") /*overlite using gin*/",
+                "CREATE INDEX \"i\" ON \"t\" (\"tags\") /*overlite reloptions fastupdate=off*/ /*overlite using gin*/",
             ),
             (
                 "CREATE UNIQUE INDEX i ON t (h, w DESC) INCLUDE (x) NULLS NOT DISTINCT WHERE a > 1",

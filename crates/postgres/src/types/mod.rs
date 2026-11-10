@@ -295,6 +295,10 @@ pub(crate) fn oid_for_column(col: &Column, rows: &[Vec<Value>], idx: usize) -> O
     if matches!(col.name.as_str(), "conkey" | "confkey") {
         return OID_INT2_ARR;
     }
+    // pg_class.reloptions (and pg_dump's name for it), text[] held as a JSON array.
+    if matches!(col.name.as_str(), "reloptions" | "indreloptions") {
+        return crate::types::array::OID_TEXT_ARR;
+    }
     // A range, under its own type.
     if let Some(oid) = crate::types::range::range_oid_for_decl(&col.decl_type) {
         return oid;

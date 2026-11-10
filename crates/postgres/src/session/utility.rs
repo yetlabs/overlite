@@ -123,6 +123,42 @@ fn alter_is_noop_node(n: &NodeEnum) -> bool {
     }
 }
 
+impl Session {
+    /// VACUUM [ANALYZE] of named tables that all exist: nothing to do, as SQLite's
+    /// VACUUM rewrites the whole file and names no table, and there are no dead rows
+    /// to reclaim. One naming a table that does not exist goes on to its 42P01.
+    pub(crate) fn vacuum_of_tables(&mut self, sql: &str) -> Option<ResultSet> {
+        if !first_word_upper(sql).eq_ignore_ascii_case("VACUUM") {
+            return None;
+        }
+        let tables = tree::read(sql, |n| match n {
+            NodeEnum::VacuumStmt(v) if !v.rels.is_empty() => Some(
+                v.rels
+                    .iter()
+                    .filter_map(|r| match r.node.as_ref() {
+                        Some(NodeEnum::VacuumRelation(r)) => r.relation.as_ref().map(tree::reference),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })?;
+        for t in &tables {
+            let stored = self.stored_name(t);
+            let q = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND lower(name) = lower(".to_string()
+                + &quote_literal(&stored)
+                + ")";
+            if !self.exec(&q, &[]).is_ok_and(|rs| !rs.rows.is_empty()) {
+                return None;
+            }
+        }
+        Some(ResultSet {
+            command: "VACUUM".into(),
+            ..Default::default()
+        })
+    }
+}
+
 /// The upper-cased second whitespace-delimited word.
 pub(crate) fn second_word_upper(sql: &str) -> String {
     let f = split_words(sql);

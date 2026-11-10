@@ -314,7 +314,7 @@ Only what has work recorded against it:
 - **What the framework test suite found and is not done yet** (NOTES.md): range
   `*` and `+`; `jsonb[]` elements kept as strings; instants past the year 9999
   compared as text; tsquery `&&`, `||` and `!!`; `DISTINCT ON` with `LIMIT` and
-  `OFFSET`; a bytea column default; catalog details (index reloptions and access
+  `OFFSET`; a bytea column default; catalog details (an index's access
   method, collations, serial `column_default`, the sequence of a renamed serial);
   `DATE_TRUNC` and `EXTRACT` in a non-UTC session.
 - **Concurrent writes**: about a quarter of PostgreSQL's throughput today (see the

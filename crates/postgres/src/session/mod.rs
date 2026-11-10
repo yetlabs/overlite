@@ -680,7 +680,7 @@ impl Session {
                 return Some(Route::Explain(text(), columns));
             }
         }
-        if let Some(rs) = intercept_utility(raw) {
+        if let Some(rs) = self.vacuum_of_tables(raw).or_else(|| intercept_utility(raw)) {
             return Some(Route::Utility(rs));
         }
         if is_role_ddl(raw) {

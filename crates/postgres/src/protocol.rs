@@ -619,7 +619,7 @@ impl Session {
             };
         }
 
-        if let Some(rs) = intercept_utility(sql) {
+        if let Some(rs) = self.vacuum_of_tables(sql).or_else(|| intercept_utility(sql)) {
             if rs.is_query {
                 self.c.send_result_set(&rs)?;
             }

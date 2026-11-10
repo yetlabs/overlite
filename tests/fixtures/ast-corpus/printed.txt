@@ -1237,9 +1237,9 @@ ok	CREATE TABLE oc (a varchar(10), b text)
 ok	CREATE INDEX oc_i ON oc (a /*varchar_pattern_ops*/, b DESC)
 ok	SELECT opcname FROM pg_opclass AS oc JOIN pg_index AS i ON oc.oid IN (SELECT value FROM json_each(overlite_array_json(i.indclass))) JOIN pg_class AS c ON c.oid = i.indexrelid WHERE c.relname = 'oc_i' ORDER BY 1 NULLS LAST /*overlite typed*/
 ok	CREATE TABLE im (a int, tags text[])
-ok	CREATE INDEX "im_g" ON "im" ("tags") /*overlite using gin*/
-ok	CREATE INDEX im_b ON im (a) /*overlite using bloom*/
-ok	CREATE INDEX im_f ON im (a)
+ok	CREATE INDEX "im_g" ON "im" ("tags") /*overlite reloptions fastupdate=off*/ /*overlite using gin*/
+ok	CREATE INDEX im_b ON im (a) /*overlite reloptions length=80,col1=4*/ /*overlite using bloom*/
+ok	CREATE INDEX im_f ON im (a) /*overlite reloptions fillfactor=70*/
 ok	SELECT c.relname || ' ' || am.amname AS "?column?" FROM pg_class AS c JOIN pg_am AS am ON am.oid = c.relam WHERE c.relname GLOB overlite_like_glob('im_%', '\\') ORDER BY 1 NULLS LAST /*overlite typed*/
 ok	SELECT indexdef FROM pg_indexes WHERE indexname = 'im_g' /*overlite typed*/
 ok	CREATE INDEX im_g ON public.im (tags) /*overlite using gin*/
@@ -14408,20 +14408,20 @@ ok	UPDATE postgres_tests_nowtestmodel SET "when" = overlite_now(julianday('now')
 ok	INSERT INTO postgres_tests_hstoremodel (field, array_field) VALUES (NULL, overlite_assign(overlite_assign('{"\\"a\\"=>\\"1\\",\\"b\\"=>\\"B\\",\\"2\\"=>\\"c\\",\\"ï\\"=>\\"ê\\"","\\"a\\"=>\\"1\\",\\"b\\"=>\\"B\\",\\"2\\"=>\\"c\\",\\"ï\\"=>\\"ê\\""}', 'hstore[]'), 'hstore[]')) RETURNING postgres_tests_hstoremodel.id /*overlite typed*/
 ok	INSERT INTO postgres_tests_hstoremodel (field, array_field) VALUES (NULL, overlite_assign(NULL, 'hstore[]')) RETURNING postgres_tests_hstoremodel.id /*overlite typed*/
 ok	CREATE INDEX "char_field_model_field_bloom" ON "postgres_tests_charfieldmodel" ("field") /*overlite using bloom*/
-ok	CREATE INDEX "char_field_model_field_bloom_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite using bloom*/
-ok	CREATE INDEX "char_field_model_field_brin" ON "postgres_tests_charfieldmodel" ("field") /*overlite using brin*/
-ok	CREATE INDEX "char_field_brin_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite using brin*/
+ok	CREATE INDEX "char_field_model_field_bloom_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions length=512,col1=3*/ /*overlite using bloom*/
+ok	CREATE INDEX "char_field_model_field_brin" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions pages_per_range=4*/ /*overlite using brin*/
+ok	CREATE INDEX "char_field_brin_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions autosummarize=on*/ /*overlite using brin*/
 ok	CREATE INDEX "char_field_model_field_btree" ON "postgres_tests_charfieldmodel" ("field")
-ok	CREATE INDEX "integer_array_btree_parameters" ON "postgres_tests_charfieldmodel" ("field")
+ok	CREATE INDEX "integer_array_btree_parameters" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions fillfactor=80,deduplicate_items=off*/
 ok	CREATE INDEX "cast_search_vector_gin" ON "postgres_tests_textfieldmodel" ((field)) /*overlite using gin*/
-ok	CREATE INDEX "integer_array_gin_fastupdate" ON "postgres_tests_integerarraymodel" ("field") /*overlite using gin*/
+ok	CREATE INDEX "integer_array_gin_fastupdate" ON "postgres_tests_integerarraymodel" ("field") /*overlite reloptions fastupdate=off*/ /*overlite using gin*/
 ok	CREATE INDEX "integer_array_model_field_gin" ON "postgres_tests_integerarraymodel" ("field") /*overlite using gin*/
-ok	CREATE INDEX "integer_array_gin_params" ON "postgres_tests_integerarraymodel" ("field") /*overlite using gin*/
+ok	CREATE INDEX "integer_array_gin_params" ON "postgres_tests_integerarraymodel" ("field") /*overlite reloptions gin_pending_list_limit=64,fastupdate=on*/ /*overlite using gin*/
 ok	CREATE INDEX "scene_gist_include_setting" ON "postgres_tests_scene" ("scene") /*overlite include "setting"*/ /*overlite using gist*/
 ok	CREATE INDEX "char_field_model_field_gist" ON "postgres_tests_charfieldmodel" ("field") /*overlite using gist*/
-ok	CREATE INDEX "integer_array_gist_buffering" ON "postgres_tests_charfieldmodel" ("field") /*overlite using gist*/
+ok	CREATE INDEX "integer_array_gist_buffering" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions buffering=on,fillfactor=80*/ /*overlite using gist*/
 ok	CREATE INDEX "char_field_model_field_hash" ON "postgres_tests_charfieldmodel" ("field") /*overlite using hash*/
-ok	CREATE INDEX "integer_array_hash_fillfactor" ON "postgres_tests_charfieldmodel" ("field") /*overlite using hash*/
+ok	CREATE INDEX "integer_array_hash_fillfactor" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions fillfactor=80*/ /*overlite using hash*/
 ok	CREATE INDEX "test_op_class" ON "postgres_tests_textfieldmodel" ((LOWER("field")) /*text_pattern_ops*/)
 ok	CREATE INDEX "test_op_class_descending_collation" ON "postgres_tests_textfieldmodel" ((LOWER("field")) COLLATE "sv-x-icu" /*text_pattern_ops*/ DESC NULLS LAST)
 ok	CREATE INDEX "test_op_class_descending_partial" ON "postgres_tests_textfieldmodel" ((LOWER("field")) /*text_pattern_ops*/ DESC)\nWHERE CAST(field AS text) GLOB overlite_like_glob('%China%', '\\')
@@ -14431,7 +14431,7 @@ ok	CREATE INDEX "char_field_gin_partial_idx" ON "postgres_tests_charfieldmodel" 
 ok	CREATE INDEX "test_search_vector" ON "postgres_tests_scene" ((to_tsvector('english', coalesce(CAST(id AS text), '') || ' ' || coalesce(scene, ''))))
 ok	CREATE INDEX "scene_spgist_include_setting" ON "postgres_tests_scene" ("scene") /*overlite include "setting"*/ /*overlite using spgist*/
 ok	CREATE INDEX "text_field_model_field_spgist" ON "postgres_tests_textfieldmodel" ("field") /*overlite using spgist*/
-ok	CREATE INDEX "text_field_model_spgist_fillfactor" ON "postgres_tests_textfieldmodel" ("field") /*overlite using spgist*/
+ok	CREATE INDEX "text_field_model_spgist_fillfactor" ON "postgres_tests_textfieldmodel" ("field") /*overlite reloptions fillfactor=80*/ /*overlite using spgist*/
 ok	CREATE INDEX "trigram_op_class_gin" ON "postgres_tests_scene" ("scene" /*gin_trgm_ops*/) /*overlite using gin*/
 ok	CREATE INDEX "tsvector_op_class_gist" ON "postgres_tests_scene" ((to_tsvector('english', coalesce(scene, '') || ' ' || coalesce(setting, ''))) /*tsvector_ops*/) /*overlite using gist*/
 no	statement kind
@@ -14541,16 +14541,16 @@ ok	ALTER TABLE "test_add_constraint_not_valid_pony" ADD CONSTRAINT "pony_pink_gt
 ok	CREATE INDEX "pony_pink_idx" ON "test_add_concurrently_pony" ("pink")
 ok	DROP INDEX IF EXISTS pony_pink_idx
 ok	CREATE INDEX "pony_pink_brin_idx" ON "test_add_concurrently_pony" ("pink") /*overlite using brin*/
-ok	CREATE INDEX "pony_pink_btree_idx" ON "test_add_concurrently_pony" ("pink")
+ok	CREATE INDEX "pony_pink_btree_idx" ON "test_add_concurrently_pony" ("pink") /*overlite reloptions fillfactor=70*/
 ok	ALTER TABLE "test_validate_constraint_pony" VALIDATE CONSTRAINT "pony_pink_gte_check"
-ok	CREATE INDEX "char_field_model_field_bloom_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite using bloom*/
-ok	CREATE INDEX "char_field_brin_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite using brin*/
-ok	CREATE INDEX "integer_array_btree_parameters" ON "postgres_tests_charfieldmodel" ("field")
+ok	CREATE INDEX "char_field_model_field_bloom_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions length=512,col1=3*/ /*overlite using bloom*/
+ok	CREATE INDEX "char_field_brin_params" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions autosummarize=on*/ /*overlite using brin*/
+ok	CREATE INDEX "integer_array_btree_parameters" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions fillfactor=80,deduplicate_items=off*/
 ok	CREATE INDEX "cast_search_vector_gin" ON "postgres_tests_textfieldmodel" ((field)) /*overlite using gin*/
-ok	CREATE INDEX "integer_array_gin_fastupdate" ON "postgres_tests_integerarraymodel" ("field") /*overlite using gin*/
-ok	CREATE INDEX "integer_array_gin_params" ON "postgres_tests_integerarraymodel" ("field") /*overlite using gin*/
+ok	CREATE INDEX "integer_array_gin_fastupdate" ON "postgres_tests_integerarraymodel" ("field") /*overlite reloptions fastupdate=off*/ /*overlite using gin*/
+ok	CREATE INDEX "integer_array_gin_params" ON "postgres_tests_integerarraymodel" ("field") /*overlite reloptions gin_pending_list_limit=64,fastupdate=on*/ /*overlite using gin*/
 ok	CREATE INDEX "char_field_model_field_hash" ON "postgres_tests_charfieldmodel" ("field") /*overlite using hash*/
-ok	CREATE INDEX "integer_array_hash_fillfactor" ON "postgres_tests_charfieldmodel" ("field") /*overlite using hash*/
+ok	CREATE INDEX "integer_array_hash_fillfactor" ON "postgres_tests_charfieldmodel" ("field") /*overlite reloptions fillfactor=80*/ /*overlite using hash*/
 no	statement kind
 ok	UPDATE queries_jsonfieldnullable SET json_field = (overlite_cast(CASE WHEN queries_jsonfieldnullable.id = 1 THEN (overlite_cast('{"c": 1}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 2 THEN (overlite_cast('{"c": 2}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 3 THEN (overlite_cast('{"c": 3}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 4 THEN (overlite_cast('{"c": 4}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 5 THEN (overlite_cast('{"c": 5}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 6 THEN (overlite_cast('{"c": 6}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 7 THEN (overlite_cast('{"c": 7}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 8 THEN (overlite_cast('{"c": 8}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 9 THEN (overlite_cast('{"c": 9}', 'jsonb') COLLATE JSONB) WHEN queries_jsonfieldnullable.id = 10 THEN (overlite_cast('{"c": 10}', 'jsonb') COLLATE JSONB) ELSE NULL END, 'jsonb') COLLATE JSONB) WHERE queries_jsonfieldnullable.id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10) /*overlite typed*/
 no	statement kind

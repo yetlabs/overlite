@@ -669,11 +669,20 @@ hold:
   as SQLite's own procedure does, and checks the rebuilt table's keys after it
   (23503 when rows break the new one, where it was taken without effect).
 
-Still not done: pgbench 18 -i fails at
-its first table: `CREATE TABLE ... WITH (fillfactor=100)` is a syntax error here (a
-storage parameter of an index is taken, one of a table is not); its point lookups run
-on tables made by hand, at the speed they had.
-psql 18 meta-commands answer but for `\dx` (its query reads a function with a column
+- pgbench 18 -i (client- or server-side) and its built-in scripts run
+  (`pgbench_initializes_and_runs`). A table's storage parameters (`WITH (fillfactor=100)`)
+  are checked as Postgres' heap checks them (22023 for an unknown one or a value out of
+  bounds, 0A000 for OIDS) and kept, as an index's are, in a comment of the DDL after the
+  relation's name, which pg_class.reloptions gives back as a text[] and pg_dump writes
+  as `WITH (fillfactor='100')`. WITHOUT OIDS is taken. A `$1::regclass` reads its
+  parameter as a name (it was taken for an oid: pgbench asks a table's relkind so).
+  VACUUM of named tables answers without doing anything: SQLite's VACUUM rewrites the
+  whole file. A foreign key written without the referenced columns showed no
+  definition in pg_get_constraintdef. ALTER TABLE SET/RESET of storage parameters is
+  still not taken, and psql's `\d+` shows no Options line: it concatenates reloptions
+  with another array, and the typing does not know a catalog column for an array.
+
+Still not done: psql 18 meta-commands answer but for `\dx` (its query reads a function with a column
 list: 0A000), `\dd` (pg_opfamily_is_visible is missing) and `\drds`, which now finds
 pg_db_role_setting; `\dconfig server_version*` lists nothing, as pg_settings does not
 hold server_version; `\dp` shows no table privileges (relacl is NULL); `\da` lists
@@ -879,7 +888,7 @@ to Postgres 17's answers. "Silent" means a wrong answer, not an error.
 - STRICT_WORD_SIMILARITY and `<<<->` are float8, where Postgres gives real (silent in
   the digits past float4's).
 - Catalogs (silent): inet goes out as text, a column's COLLATE "C"
-  is not in pg_attribute, an index's reloptions are NULL, result-column OIDs after ADD COLUMN are int8, the
+  is not in pg_attribute, result-column OIDs after ADD COLUMN are int8, the
   sequence list misses some.
 - In a session whose TimeZone is not UTC: DATE_TRUNC and EXTRACT of a timestamptz the
   typing does not see (see above) go by UTC (silent).

@@ -434,7 +434,7 @@ const PG_CLASS_TMPL: &str = concat!(
  COALESCE((SELECT enabled FROM _overlite_rls rls WHERE lower(rls.tablename)=lower(m.name)),0) AS relrowsecurity,
  COALESCE((SELECT forced FROM _overlite_rls rls WHERE lower(rls.tablename)=lower(m.name)),0) AS relforcerowsecurity,
  1 AS relispopulated, 'd' AS relreplident, 0 AS relispartition,
- NULL AS relacl, NULL AS reloptions, NULL AS relpartbound, 0 AS relrewrite, 0 AS relminmxid
+ NULL AS relacl, overlite_reloptions(m.sql) AS reloptions, NULL AS relpartbound, 0 AS relrewrite, 0 AS relminmxid
 FROM @MASTER@ m
 WHERE m.type IN ('table','view','index') AND m.name NOT LIKE 'sqlite_%' AND m.name NOT GLOB '_overlite_*'
 UNION ALL
@@ -616,7 +616,9 @@ const PG_CONSTRAINT_TMPL: &str = concat!(
     FROM (SELECT "to", seq FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq) k) AS confkey,
  NULL AS conbin,
  (SELECT group_concat(quote_ident("from"), ', ') FROM (SELECT "from" FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq)) AS ov_cols,
- overlite_relation_ref(fk."table", '@FILESCHEMA@') || '(' || (SELECT group_concat(quote_ident("to"), ', ') FROM (SELECT "to" FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq)) || ')' ||
+ overlite_relation_ref(fk."table", '@FILESCHEMA@') || '(' || (SELECT group_concat(quote_ident(COALESCE(k."to",
+     (SELECT ti.name FROM pragma_table_xinfo(fk."table",'@DB@') ti WHERE ti.pk = k.seq + 1))), ', ')
+   FROM (SELECT "to", seq FROM pragma_foreign_key_list(tbl.name,'@DB@') WHERE id = fk.id ORDER BY seq) k) || ')' ||
  CASE fk.on_update WHEN 'NO ACTION' THEN '' ELSE ' ON UPDATE ' || fk.on_update END ||
  CASE fk.on_delete WHEN 'NO ACTION' THEN '' ELSE ' ON DELETE ' || fk.on_delete END ||
  CASE "#,

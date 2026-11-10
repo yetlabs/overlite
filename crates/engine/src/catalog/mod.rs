@@ -1292,6 +1292,21 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             relations.into_iter().map(Json::Str).collect(),
         ))))
     })?;
+    // A relation's storage parameters, which its DDL keeps in a comment, as
+    // pg_class.reloptions gives them: a text[] in its text form, {fillfactor=70}.
+    scalar(conn, "overlite_reloptions", 1, |args| {
+        const MARK: &str = "/*overlite reloptions ";
+        let sql = arg_str(&args[0]);
+        let Some(at) = sql.find(MARK) else {
+            return Ok(Value::Null);
+        };
+        let rest = &sql[at + MARK.len()..];
+        let Some(end) = rest.find("*/") else {
+            return Ok(Value::Null);
+        };
+        let items: Vec<Json> = rest[..end].split(',').map(|o| Json::Str(o.to_string())).collect();
+        Ok(Value::Text(crate::builtins::arrays::pg_array_text(&items)))
+    })?;
     // A relation (as stored, the schema of its file) as a definition names it.
     scalar_nd(conn, "overlite_relation_ref", 2, |args| {
         Ok(Value::Text(visible::relation_ref(
