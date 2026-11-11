@@ -38,7 +38,8 @@ wrong tool.
 | Migration tooling | `migrate deploy`, `migrate status` and introspection (`db pull`) work |
 
 Throughput against PostgreSQL is in the README's [Performance](README.md#performance)
-table: reads keep pace, concurrent writes do not.
+table: lookups come within 10% of it up to 16 clients, and writes from several
+clients keep pace.
 
 ---
 
@@ -59,12 +60,13 @@ table: reads keep pace, concurrent writes do not.
 
 **How it works.** Each client gets its own thread and SQLite connection (100 at
 most). `BEGIN` takes no lock; a transaction's first write takes SQLite's single
-write lock and holds it until commit. A second writer waits, and after the busy
-timeout (30 s) fails with `55P03`, as a PostgreSQL writer waiting on a row lock
+write lock and holds it until commit. A second writer waits in the database's
+queue and goes on at the commit; after the busy timeout (30 s) it fails with `55P03`, as a PostgreSQL writer waiting on a row lock
 would. Write skew cannot happen, because writes are serialized.
 
-**What you lose.** Throughput under many concurrent writers: the benchmark in the
-README shows 29k against PostgreSQL's 117k writes per second. `FOR UPDATE` on one
+**What you lose.** Writes to one database are one at a time: short ones keep pace
+(the README's benchmark), but one long write transaction holds every other writer
+off until it commits. `FOR UPDATE` on one
 row waits for any writer, and `SKIP LOCKED` returns no rows while another
 transaction holds the lock, so job queues built on `SKIP LOCKED` run one consumer at
 a time.
@@ -316,8 +318,6 @@ Only what has work recorded against it:
   `OFFSET`; a bytea column default; catalog details (an index's access
   method, collations, serial `column_default`, the sequence of a renamed serial);
   `DATE_TRUNC` and `EXTRACT` in a non-UTC session.
-- **Concurrent writes**: about a quarter of PostgreSQL's throughput today (see the
-  README's [Performance](README.md#performance)).
 
 PL/pgSQL, PostgreSQL-style triggers, `GROUPING SETS` and the monitoring views are
 not planned.
