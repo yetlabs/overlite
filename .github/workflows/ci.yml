@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # From the Actions tab, to run the checks again on main.
+  workflow_dispatch:
 
 # A tag publishes only a commit this workflow passed on main (release.yml waits
 # for it), so these checks run once per commit.
