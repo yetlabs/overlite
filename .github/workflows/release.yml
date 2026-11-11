@@ -37,8 +37,9 @@ jobs:
   # SQLite and Postgres' parser (pg_query) are C, so each platform builds on its
   # own runner (macOS builds both architectures); one last job uploads
   # everything, so the builds do not race to create the same release.
+  # The builds do not wait for ci-passed: they run beside it, and only what
+  # publishes needs both.
   build:
-    needs: ci-passed
     strategy:
       matrix:
         include:
@@ -80,7 +81,7 @@ jobs:
           path: dist/*
 
   publish:
-    needs: build
+    needs: [ci-passed, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -99,7 +100,7 @@ jobs:
   # The image is the Linux release binaries in an empty image: no second compile.
   # It publishes as ghcr.io/yetlabs/overlite with the workflow's own GITHUB_TOKEN.
   image:
-    needs: build
+    needs: [ci-passed, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
