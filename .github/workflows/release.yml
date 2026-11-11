@@ -8,15 +8,37 @@ permissions:
   contents: write
 
 jobs:
-  # A tag that fails the checks publishes nothing.
-  test:
-    uses: ./.github/workflows/ci.yml
+  # A tag publishes nothing ci.yml has not passed: the tagged commit must be one
+  # pushed to main, whose ci.yml run this waits for instead of running it again.
+  ci-passed:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Up to 30 minutes: the tag may be pushed right behind its commit.
+          for _ in $(seq 90); do
+            state=$(gh run list -R "$REPO" --workflow ci.yml --event push --commit "$SHA" \
+              --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"')
+            case "$state" in
+              "completed success") echo "ci.yml passed on $SHA"; exit 0 ;;
+              completed*) echo "ci.yml on $SHA: $state"; exit 1 ;;
+              "") echo "no ci.yml run for $SHA yet (a tag must point at a commit pushed to main)" ;;
+              *) echo "ci.yml on $SHA: $state" ;;
+            esac
+            sleep 20
+          done
+          exit 1
 
   # SQLite and Postgres' parser (pg_query) are C, so each platform builds on its
   # own runner (macOS builds both architectures); one last job uploads
   # everything, so the builds do not race to create the same release.
   build:
-    needs: test
+    needs: ci-passed
     strategy:
       matrix:
         include:
@@ -73,3 +95,58 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+  # The image is the Linux release binaries in an empty image: no second compile.
+  # It publishes as ghcr.io/yetlabs/overlite with the workflow's own GITHUB_TOKEN.
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: overlite-linux-*
+          path: dist
+          merge-multiple: true
+      # An artifact does not keep the executable bit.
+      - run: chmod +x dist/overlite-linux-*
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        env:
+          # Annotations on the multi-arch index too, not only on each image.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ghcr.io/yetlabs/overlite
+          # v1.2.3 publishes 1.2.3, 1.2, and latest.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+          # The source label is what links the package to this repository on
+          # GitHub, so its page shows the README and inherits the repo's access.
+          labels: |
+            org.opencontainers.image.source=https://github.com/yetlabs/overlite
+            org.opencontainers.image.title=overlite
+          annotations: |
+            org.opencontainers.image.source=https://github.com/yetlabs/overlite
+            org.opencontainers.image.title=overlite
+      - uses: docker/build-push-action@v6
+        with:
+          context: dist
+          file: .github/release.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # A multi-arch push is an index: its annotations, not the per-image
+          # labels, are what ghcr.io reads for the package's source and description.
+          annotations: ${{ steps.meta.outputs.annotations }}

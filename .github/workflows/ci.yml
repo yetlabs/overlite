@@ -4,9 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
-  # release.yml and docker.yml call this workflow, so a tag cannot publish
-  # anything these checks would have caught.
-  workflow_call:
+
+# A tag publishes only a commit this workflow passed on main (release.yml waits
+# for it), so these checks run once per commit.
+
+# The suites build with the release profile, which is what the wire tests time
+# against, but without its LTO: that halves the compile of every test binary and
+# changes nothing a test observes. release.yml builds the shipped binaries with it.
+env:
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   check:

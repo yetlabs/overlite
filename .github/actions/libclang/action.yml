@@ -25,23 +25,39 @@ runs:
     # Windows: libclang.dll has to match the build script's architecture, since the
     # build script loads it: x64 LLVM on windows-latest (the image ships it), the
     # woa64 build of LLVM on windows-11-arm, where an x64 DLL cannot be loaded.
+    # That one is downloaded once and cached, trimmed to what bindgen uses:
+    # libclang.dll, clang.exe and clang's own headers (downloading and installing
+    # the whole of LLVM took over a minute a run).
+    - if: runner.os == 'Windows' && runner.arch == 'ARM64'
+      id: llvm-cache
+      uses: actions/cache@v4
+      with:
+        path: C:\llvm-min
+        key: llvm-min-${{ inputs.llvm-version }}-${{ runner.arch }}
     - if: runner.os == 'Windows'
       shell: pwsh
       env:
         LLVM_VERSION: ${{ inputs.llvm-version }}
+        CACHED: ${{ steps.llvm-cache.outputs.cache-hit }}
       run: |
         $ErrorActionPreference = 'Stop'
         $preinstalled = 'C:\Program Files\LLVM\bin'
         if ($env:RUNNER_ARCH -eq 'X64' -and (Test-Path "$preinstalled\libclang.dll")) {
           $bin = $preinstalled
         } else {
-          $flavor = if ($env:RUNNER_ARCH -eq 'ARM64') { 'woa64' } else { 'win64' }
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-$flavor.exe"
-          # GitHub's release CDN has answered 504 here; retry before failing.
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm.exe" -MaximumRetryCount 5 -RetryIntervalSec 15
-          # NSIS: /S is silent, /D the directory, last and unquoted.
-          Start-Process -Wait -FilePath "$env:RUNNER_TEMP\llvm.exe" -ArgumentList '/S', '/D=C:\llvm'
-          $bin = 'C:\llvm\bin'
+          if ($env:CACHED -ne 'true') {
+            $flavor = if ($env:RUNNER_ARCH -eq 'ARM64') { 'woa64' } else { 'win64' }
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-$flavor.exe"
+            # GitHub's release CDN has answered 504 here; retry before failing.
+            Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm.exe" -MaximumRetryCount 5 -RetryIntervalSec 15
+            # NSIS: /S is silent, /D the directory, last and unquoted.
+            Start-Process -Wait -FilePath "$env:RUNNER_TEMP\llvm.exe" -ArgumentList '/S', '/D=C:\llvm'
+            # clang finds its headers at ..\lib\clang beside its own directory.
+            New-Item -ItemType Directory -Force -Path 'C:\llvm-min\bin', 'C:\llvm-min\lib' | Out-Null
+            Copy-Item 'C:\llvm\bin\libclang.dll', 'C:\llvm\bin\clang.exe' 'C:\llvm-min\bin'
+            Copy-Item -Recurse 'C:\llvm\lib\clang' 'C:\llvm-min\lib\clang'
+          }
+          $bin = 'C:\llvm-min\bin'
         }
         if (-not (Test-Path "$bin\libclang.dll")) { throw "no libclang.dll in $bin" }
         # LIBCLANG_PATH makes clang-sys look there only, so another LLVM on the
@@ -50,6 +66,7 @@ runs:
         "LIBCLANG_PATH=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         "CLANG_PATH=$bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         & "$bin\clang.exe" --version
+        & "$bin\clang.exe" -print-resource-dir
 
     # cc runs cl.exe and bindgen's clang reads the MSVC headers: INCLUDE, LIB and
     # PATH as the Developer Command Prompt of the runner's architecture sets them.
