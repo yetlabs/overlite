@@ -25,24 +25,27 @@ tooling. Overlite puts a PostgreSQL-speaking server in front of it so you get:
 
 ## Performance
 
-Point lookups on a 73.8M-row table, one machine (16 cores). PostgreSQL 14 has
-the table warm in memory; SQLite is the same file opened in-process, with no
-network and the statement prepared once, which is the ceiling a server over it
-can reach.
+Point lookups on a 73.8M-row table, one machine (16 cores), `pgbench` as the
+client. PostgreSQL 14 runs its default configuration with the table warm in
+memory; SQLite is the same file opened in-process, with no network and the
+statement prepared once, which is the ceiling a server over it can reach.
 
 | | Overlite | PostgreSQL | SQLite in-process |
 |---|--:|--:|--:|
-| 1 client | 27k q/s | 23k q/s | 267k q/s |
-| 8 clients | 129k q/s | 126k q/s | 142k q/s |
-| 16 clients | 151k q/s | 163k q/s | 132k q/s |
-| 64 clients | 139k q/s | 170k q/s | 106k q/s |
-| new connection | 7.4 ms | 5.6 ms | 0.24 ms |
-| concurrent writes (8 clients) | 29k q/s | 117k q/s | 124k q/s |
-| `LIKE '%…%'` over every row | 5.3 s | 9.2 s | 6.5 s |
+| 1 client | 23k q/s | 24k q/s | 288k q/s |
+| 8 clients | 118k q/s | 129k q/s | 165k q/s |
+| 16 clients | 149k q/s | 163k q/s | 149k q/s |
+| 64 clients | 138k q/s | 171k q/s | 135k q/s |
+| 8 clients, prepared | 100k q/s | 138k q/s | — |
+| new connection | 9.2 ms | 5.2 ms | 0.2 ms |
+| concurrent writes (8 clients) | 53k q/s | 15k–44k q/s | 135k q/s |
+| `LIKE '%…%'` over every row | 5.2 s | 5.5 s | 5.4 s |
 
 With one client a server pays a network round trip per query that SQLite in a
-process does not. From 8 clients on, Overlite answers about as many lookups as
-SQLite opened directly. Concurrent writes are where it stays behind both.
+process does not. From 16 clients on, Overlite answers as many lookups as SQLite
+opened directly, and within 10% of PostgreSQL up to 16 clients. Writes wait in a
+queue per database and each commit is synced, as SQLite's `synchronous=FULL`
+does; PostgreSQL's write figure varied between runs with its checkpoints.
 
 ## Compatibility
 
