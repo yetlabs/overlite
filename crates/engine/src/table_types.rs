@@ -268,7 +268,8 @@ impl TableTypes {
         let mut narrow_keys: HashMap<(String, String), &'static str> = HashMap::new();
         if let Ok(mut st) = q.prepare(
             "SELECT name, sql FROM sqlite_master WHERE type = 'table' \
-             AND (sql LIKE '%/*overlite int%' OR sql LIKE '%/*overlite identity %int%*/%')",
+             AND (sql LIKE '%/*overlite int%' OR sql LIKE '%/*overlite identity %int%*/%' \
+                  OR sql LIKE '%/*overlite owned sequence*/%')",
         ) && let Ok(it) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         {
             for (table, sql) in it.filter_map(std::result::Result::ok) {

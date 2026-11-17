@@ -492,14 +492,40 @@ pub fn identity_columns(ddl: &str) -> Vec<Identity> {
     out
 }
 
+/// The mark of a serial column's own sequence (ddl/defaults.rs).
+const OWNED_SEQUENCE: &str = "/*overlite owned sequence*/";
+
+/// Whether a column definition's type is `integer` (a serial's), not `bigint` or
+/// `smallint` (a bigserial's or a smallserial's, which SQLite never makes the rowid).
+fn declared_integer(def: &str) -> bool {
+    let t = def.trim_start();
+    let after_name = match t.as_bytes().first() {
+        Some(&q @ (b'"' | b'`')) => t[1..].find(q as char).map_or("", |e| &t[e + 2..]),
+        Some(b'[') => t.find(']').map_or("", |e| &t[e + 1..]),
+        _ => t.find(char::is_whitespace).map_or("", |e| &t[e..]),
+    };
+    after_name
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("integer"))
+}
+
 /// The narrow integer col of a CREATE TABLE is declared, where it is a key that is the
 /// rowid: `integer` for a serial's (`/*overlite int4*/`, which ast::ddl writes after its
 /// AUTOINCREMENT) or an integer identity's, `smallint` for a smallserial's
 /// (`/*overlite int2*/`) or a smallint identity's, `bigint` for a bigserial's
 /// (`/*overlite int8*/`). SQLite declares any rowid INTEGER,
-/// which says nothing of its width.
+/// which says nothing of its width. A serial whose key is a table constraint, as
+/// Prisma writes it (`"id" SERIAL NOT NULL, ..., PRIMARY KEY ("id")`), is made as
+/// a serial that is not the key, `integer` with its own sequence
+/// (`/*overlite owned sequence*/`), and SQLite makes it the rowid all the same:
+/// an integer too.
 pub(crate) fn key_width(ddl: &str, col: &str) -> Option<&'static str> {
-    if !ddl.contains("/*overlite int") && !ddl.contains("int*/") && !ddl.contains("integer*/") {
+    if !ddl.contains("/*overlite int")
+        && !ddl.contains("int*/")
+        && !ddl.contains("integer*/")
+        && !ddl.contains(OWNED_SEQUENCE)
+    {
         return None;
     }
     if let Some(i) = identity_of(ddl, col) {
@@ -516,6 +542,8 @@ pub(crate) fn key_width(ddl: &str, col: &str) -> Option<&'static str> {
         Some("smallint")
     } else if text.contains("/*overlite int8*/") {
         Some("bigint")
+    } else if text.contains(OWNED_SEQUENCE) && declared_integer(text) {
+        Some("integer")
     } else {
         None
     }

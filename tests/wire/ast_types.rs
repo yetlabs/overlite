@@ -188,6 +188,45 @@ fn an_integer_goes_out_at_its_width() {
     }
 }
 
+// A serial whose key is a table constraint, as Prisma writes it, is the rowid as
+// well, and an int4 too: it went out int8, and Prisma, reading a BigInt there and a
+// number in the int column that points at it, joined the two to nothing. A
+// bigserial's and a smallserial's keep their widths.
+#[test]
+fn a_serial_keyed_by_a_constraint_goes_out_int4() {
+    let server = start_server();
+    let conn = connect(&server);
+    must_exec(
+        &conn,
+        r#"CREATE TABLE r ("id" SERIAL NOT NULL, "n" TEXT, CONSTRAINT "r_pkey" PRIMARY KEY ("id"))"#,
+    );
+    must_exec(
+        &conn,
+        r#"CREATE TABLE rb ("id" BIGSERIAL NOT NULL, CONSTRAINT "rb_pkey" PRIMARY KEY ("id"))"#,
+    );
+    must_exec(
+        &conn,
+        r#"CREATE TABLE rs ("id" SMALLSERIAL NOT NULL, CONSTRAINT "rs_pkey" PRIMARY KEY ("id"))"#,
+    );
+    must_exec(&conn, "CREATE TABLE l (r_id integer)");
+    must_exec(&conn, "INSERT INTO r (n) VALUES ('a')");
+    must_exec(&conn, "INSERT INTO rb DEFAULT VALUES");
+    must_exec(&conn, "INSERT INTO rs DEFAULT VALUES");
+    must_exec(&conn, "INSERT INTO l VALUES (1)");
+    for (sql, want) in [
+        ("SELECT id, n FROM r", vec![23, 25]),
+        ("SELECT id FROM r WHERE id IN (SELECT r_id FROM l)", vec![23]),
+        ("SELECT r.id, l.r_id FROM r JOIN l ON l.r_id = r.id", vec![23, 23]),
+        ("INSERT INTO r (n) VALUES ('b') RETURNING id", vec![23]),
+        ("SELECT id FROM rb", vec![20]),
+        ("SELECT id FROM rs", vec![21]),
+    ] {
+        let (simple, described) = oids(&server, sql);
+        assert_eq!(simple, want, "{sql}");
+        assert_eq!(described, want, "{sql} described");
+    }
+}
+
 // date_part of a timestamptz reads its wall clock in the session's zone, as EXTRACT
 // does: the engine's pass knew EXTRACT and DATE_TRUNC only, so date_part read UTC.
 #[test]
