@@ -248,10 +248,8 @@ impl Nat {
     /// Whether any of the low n bits is set.
     fn low_bits_set(&self, n: u64) -> bool {
         let limbs = (n / 64) as usize;
-        for i in 0..limbs.min(self.0.len()) {
-            if self.0[i] != 0 {
-                return true;
-            }
+        if self.0[..limbs.min(self.0.len())].iter().any(|&l| l != 0) {
+            return true;
         }
         limbs < self.0.len() && !n.is_multiple_of(64) && self.0[limbs] << (64 - n % 64) != 0
     }
